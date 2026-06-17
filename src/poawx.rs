@@ -42,6 +42,12 @@ pub const POAWX_WORKER_REWARD_PERMILLE: u64 = 100;
 /// byte-for-byte identical to the Phase 13-A encoding.
 pub const POAWX_RECEIPT_SECTION_MAGIC_V2: &[u8; 8] = b"POAWXR\x02\x00";
 
+/// Phase 20: eight-byte magic for the v3 receipt section. A block uses this only
+/// when at least one receipt carries a `Phase20ReceiptExt`. Blocks with no
+/// extension keep the v1/v2 magic and are byte-for-byte identical to Phase 13-A/18B.
+/// (Data threading only — Step 1 does not enforce the extension.)
+pub const POAWX_RECEIPT_SECTION_MAGIC_V3: &[u8; 8] = b"POAWXR\x03\x00";
+
 /// Phase 18B: domain separator for the one-time miner delegation signature.
 pub const DOMAIN_DELEG: &[u8] = b"irium.poawx.delegation.v1";
 
@@ -593,6 +599,12 @@ pub struct PoawxBlockReceipt {
     /// `worker_pubkey`/`worker_sig` are the pool delegate's signer key, and
     /// `worker_pkh` still belongs to the miner = payout identity).
     pub delegation: Option<Delegation>,
+    /// Phase 20: optional production payout extension (role claims + RoleReward +
+    /// fee terms). `None` => no extension (v1/v2 encoding, byte-identical to
+    /// Phase 13-A/18B). `Some` => the receipt section uses the v3 magic and the
+    /// extension round-trips through wire/persistence/P2P/reorg. NOT enforced in
+    /// Step 1 (data threading only).
+    pub phase20_ext: Option<Phase20ReceiptExt>,
 }
 
 impl PoawxBlockReceipt {
@@ -651,6 +663,52 @@ impl PoawxBlockReceipt {
         }
     }
 
+    /// Phase 20 v3 element: the full v2 element, then a 1-byte flag and (flag=1)
+    /// a u32-LE length-prefixed `Phase20ReceiptExt`. Length-prefixed so parsing
+    /// needs no knowledge of the (variable) extension size. v2 bytes are unchanged.
+    pub fn serialize_v3(&self) -> Vec<u8> {
+        let mut out = self.serialize_v2();
+        match &self.phase20_ext {
+            Some(e) => {
+                let b = e.serialize();
+                out.push(1);
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(&b);
+            }
+            None => out.push(0),
+        }
+        out
+    }
+
+    /// Parse a single v3 element, returning the receipt and bytes consumed.
+    pub fn deserialize_v3(raw: &[u8]) -> Result<(Self, usize), String> {
+        let (mut receipt, mut used) = Self::deserialize_v2(raw)?;
+        if raw.len() < used + 1 {
+            return Err("poawx v3 receipt: missing extension flag".to_string());
+        }
+        let flag = raw[used];
+        used += 1;
+        match flag {
+            0 => receipt.phase20_ext = None,
+            1 => {
+                if raw.len() < used + 4 {
+                    return Err("poawx v3 receipt: missing extension length".to_string());
+                }
+                let len =
+                    u32::from_le_bytes(raw[used..used + 4].try_into().expect("len 4")) as usize;
+                used += 4;
+                if raw.len() < used + len {
+                    return Err("poawx v3 receipt: extension truncated".to_string());
+                }
+                let ext = Phase20ReceiptExt::deserialize(&raw[used..used + len])?;
+                used += len;
+                receipt.phase20_ext = Some(ext);
+            }
+            other => return Err(format!("poawx v3 receipt: bad extension flag {}", other)),
+        }
+        Ok((receipt, used))
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::WIRE_SIZE);
         out.extend_from_slice(&self.height.to_le_bytes());
@@ -699,6 +757,7 @@ impl PoawxBlockReceipt {
             solution,
             commitment_nonce,
             delegation: None,
+            phase20_ext: None,
         })
     }
 }
@@ -1036,6 +1095,7 @@ mod tests {
             solution: [0x44u8; 8],
             commitment_nonce: [0x55u8; 32],
             delegation: None,
+            phase20_ext: None,
         }
     }
 
@@ -1458,6 +1518,40 @@ mod tests {
         let mut ext3 = ext.clone();
         ext3.fee_bps = 151;
         assert_ne!(ext.digest(), ext3.digest());
+    }
+
+    #[test]
+    fn phase20_block_receipt_v3_element_roundtrip() {
+        let prev = [0x44u8; 32];
+        let mk_ext = || Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+        };
+        // no-ext v3 element == v2 element + a single 0 flag byte (present-only).
+        let r = make_test_receipt(9);
+        assert!(r.phase20_ext.is_none());
+        let mut expect = r.serialize_v2();
+        expect.push(0);
+        assert_eq!(r.serialize_v3(), expect);
+        let (r0, used0) = PoawxBlockReceipt::deserialize_v3(&r.serialize_v3()).unwrap();
+        assert_eq!(r0, r);
+        assert_eq!(used0, r.serialize_v3().len());
+        // with-ext v3 element round-trips and preserves the extension.
+        let mut r2 = make_test_receipt(9);
+        r2.phase20_ext = Some(mk_ext());
+        let bytes = r2.serialize_v3();
+        let (r3, used) = PoawxBlockReceipt::deserialize_v3(&bytes).unwrap();
+        assert_eq!(r3, r2);
+        assert_eq!(r3.phase20_ext, Some(mk_ext()));
+        assert_eq!(used, bytes.len());
     }
 
     #[test]

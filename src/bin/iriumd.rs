@@ -1532,6 +1532,12 @@ struct PoawxPendingReceipt {
     /// `skip_serializing_if` keeps mode-0 pending JSON byte-identical.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     delegation: String,
+    /// Phase 20: hex of the serialized `Phase20ReceiptExt` when present. Empty =>
+    /// no extension (byte-identical pre-Phase-20 behaviour). Carried so the
+    /// extension survives pending↔block mapping and reorg restore (Step 1: data
+    /// threading only; not enforced).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    phase20_ext: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2748,6 +2754,17 @@ fn parse_persisted_block_file(
                         delegation: match r.get("delegation").and_then(|v| v.as_str()) {
                             Some(s) if !s.is_empty() => Some(
                                 irium_node_rs::poawx::Delegation::deserialize(
+                                    &hex::decode(s).ok()?,
+                                )
+                                .ok()?,
+                            ),
+                            _ => None,
+                        },
+                        // Phase 20: restore the production extension so a persisted
+                        // Phase 20 block reloads byte-identically. Absent/empty => none.
+                        phase20_ext: match r.get("phase20_ext").and_then(|v| v.as_str()) {
+                            Some(s) if !s.is_empty() => Some(
+                                irium_node_rs::poawx::Phase20ReceiptExt::deserialize(
                                     &hex::decode(s).ok()?,
                                 )
                                 .ok()?,
@@ -13763,6 +13780,18 @@ fn pending_receipt_to_block_receipt(
                     .ok()?,
             )
         },
+        // Phase 20: carry the production extension (Step 1 threading). Empty => None.
+        // Malformed => drop the receipt (fail-closed), consistent with delegation.
+        phase20_ext: if r.phase20_ext.is_empty() {
+            None
+        } else {
+            Some(
+                irium_node_rs::poawx::Phase20ReceiptExt::deserialize(
+                    &hex::decode(&r.phase20_ext).ok()?,
+                )
+                .ok()?,
+            )
+        },
     })
 }
 
@@ -13825,6 +13854,13 @@ fn block_receipt_to_pending(r: &irium_node_rs::poawx::PoawxBlockReceipt) -> Poaw
             .delegation
             .as_ref()
             .map(|d| hex::encode(d.serialize()))
+            .unwrap_or_default(),
+        // Phase 20: preserve the production extension across reorg restore so a
+        // Phase 20 receipt is not stripped when an orphaned block is re-pended.
+        phase20_ext: r
+            .phase20_ext
+            .as_ref()
+            .map(|e| hex::encode(e.serialize()))
             .unwrap_or_default(),
     }
 }
@@ -14284,6 +14320,8 @@ async fn poawx_post_receipt(
         // Manual-seed endpoint is mode-0 only; delegated receipts arrive via the
         // pool's submit_block_extended path.
         delegation: String::new(),
+        // Phase 20: manual-seed receipts carry no production extension.
+        phase20_ext: String::new(),
     };
     let tip_height = state
         .chain
@@ -26995,6 +27033,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let req = SubmitBlockExtendedRequest {
             height: 1,
@@ -27100,6 +27139,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let req = SubmitBlockExtendedRequest {
             height: 1,
@@ -27208,6 +27248,7 @@ mod tests {
             worker_pubkey: hex::encode(pool_pub),
             worker_sig: hex::encode(signer_sig),
             delegation: hex::encode(d.serialize()),
+            phase20_ext: String::new(),
         }
     }
 
@@ -27362,6 +27403,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let req = SubmitBlockExtendedRequest {
             height: 1,
@@ -27405,6 +27447,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         save_poawx_pending_receipts(&[receipt.clone()]);
         let loaded = load_poawx_pending_receipts();
@@ -27483,6 +27526,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         save_poawx_pending_receipts(&[receipt]);
         let exists = tmp.exists();
@@ -27507,6 +27551,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let json = serde_json::to_string(&vec![receipt]).unwrap();
         std::fs::write(&tmp, json).unwrap();
@@ -27537,6 +27582,7 @@ mod tests {
                 worker_pubkey: String::new(),
                 worker_sig: String::new(),
                 delegation: String::new(),
+                phase20_ext: String::new(),
             })
             .collect();
         if receipts.len() > POAWX_MAX_PENDING_RECEIPTS {
@@ -27571,6 +27617,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let mut receipts = vec![make_r(100), make_r(200)];
         save_poawx_pending_receipts(&receipts);
@@ -27604,6 +27651,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         }];
         prune_expired_poawx_receipts(&mut receipts, 100);
         assert_eq!(receipts.len(), 1, "fresh receipt at tip must be retained");
@@ -27620,6 +27668,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         }];
         let tip = 10 + POAWX_RECEIPT_MAX_AGE_BLOCKS + 1;
         prune_expired_poawx_receipts(&mut receipts, tip);
@@ -27640,6 +27689,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let mut receipts = vec![make_r(50), make_r(80), make_r(100)];
         // tip=105: 50+24=74<105 stale, 80+24=104<105 stale, 100+24=124>=105 fresh
@@ -27659,6 +27709,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         }];
         prune_expired_poawx_receipts(&mut receipts, 50);
         assert_eq!(
@@ -27691,6 +27742,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         save_poawx_pending_receipts(&[stale]);
         let mut receipts = load_poawx_pending_receipts();
@@ -27721,6 +27773,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let mut receipts = vec![make_r(1), make_r(500)];
         save_poawx_pending_receipts(&receipts);
@@ -27755,6 +27808,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         save_poawx_pending_receipts(&[receipt]);
         let loaded = load_poawx_pending_receipts();
@@ -27787,6 +27841,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         save_poawx_pending_receipts(&[receipt_on_disk]);
         let (state, _, _, _) = create_test_state(None);
@@ -27836,6 +27891,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         save_poawx_pending_receipts(&[receipt_on_disk.clone()]);
         let (state, _, _, _) = create_test_state(None);
@@ -27965,6 +28021,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         }];
         save_poawx_pending_receipts(&receipts);
         let loaded = load_poawx_pending_receipts();
@@ -28138,6 +28195,7 @@ mod tests {
             worker_pubkey: pubkey_hex.clone(),
             worker_sig: "ef".repeat(64),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         save_poawx_pending_receipts(&[receipt]);
         let loaded = load_poawx_pending_receipts();
@@ -28280,6 +28338,7 @@ mod tests {
                 worker_pubkey: String::new(),
                 worker_sig: String::new(),
                 delegation: String::new(),
+                phase20_ext: String::new(),
             })
             .collect()
     }
@@ -28313,6 +28372,7 @@ mod tests {
             delegation: String::new(),
             solution: "0123456789abcdef".to_string(),
             commitment_nonce: "ff".repeat(32),
+            phase20_ext: String::new(),
         };
         let pending_root = compute_poawx_receipts_root(&[r.clone()]);
         let block_receipt = pending_receipt_to_block_receipt(&r).expect("valid test receipt");
@@ -28590,6 +28650,7 @@ mod tests {
             worker_pubkey: pubkey_hex,
             worker_sig: sig_str,
             delegation: String::new(),
+            phase20_ext: String::new(),
         }
     }
 
@@ -28834,6 +28895,7 @@ mod tests {
             worker_pubkey: pubkey_hex,
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let root = compute_poawx_receipts_root(&[receipt.clone()]);
         let req = SubmitBlockExtendedRequest {
@@ -28880,6 +28942,7 @@ mod tests {
             worker_pubkey: pubkey_hex,
             worker_sig: "dd".repeat(64),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let root = compute_poawx_receipts_root(&[receipt.clone()]);
         let req = SubmitBlockExtendedRequest {
@@ -28925,6 +28988,7 @@ mod tests {
             worker_pubkey: pubkey_hex,
             worker_sig: "dd".repeat(64),
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let root = compute_poawx_receipts_root(&[receipt.clone()]);
         let req = SubmitBlockExtendedRequest {
@@ -28985,6 +29049,7 @@ mod tests {
             worker_pubkey: pubkey_hex,
             worker_sig: sig,
             delegation: String::new(),
+            phase20_ext: String::new(),
         };
         let root = compute_poawx_receipts_root(&[receipt.clone()]);
         let req = SubmitBlockExtendedRequest {
@@ -29152,6 +29217,7 @@ mod tests {
                 worker_pubkey: pubkey_hex,
                 worker_sig: "cc".repeat(64),
                 delegation: String::new(),
+                phase20_ext: String::new(),
             }],
             poawx_receipts_root: "dd".repeat(32),
         };
@@ -29284,6 +29350,7 @@ mod tests {
             solution: [pkh_byte; 8],
             commitment_nonce: [pkh_byte; 32],
             delegation: None,
+            phase20_ext: None,
         }
     }
 
@@ -29355,6 +29422,7 @@ mod tests {
             solution: [0x33u8; 8],
             commitment_nonce: [0x44u8; 32],
             delegation: Some(deleg),
+            phase20_ext: None,
         };
         let root =
             irium_node_rs::poawx::irx1_root_from_block_receipts(std::slice::from_ref(&receipt));
@@ -29508,6 +29576,7 @@ mod tests {
             worker_pubkey: "00".repeat(33),
             worker_sig: "00".repeat(64),
             delegation: String::new(),
+            phase20_ext: String::new(),
         }
     }
 
@@ -29522,6 +29591,53 @@ mod tests {
         assert_eq!(p.commitment_nonce, hex::encode([0xabu8; 32]));
         assert_eq!(p.worker_pubkey, hex::encode([0xabu8; 33]));
         assert_eq!(p.worker_sig, hex::encode([0xabu8; 64]));
+    }
+
+    #[test]
+    fn phase20_reorg_mapper_preserves_extension() {
+        // block_receipt_to_pending -> pending_receipt_to_block_receipt must preserve
+        // a Phase20ReceiptExt across reorg restore (Step 1 threading; no enforcement).
+        let claim = |role_id: u8| irium_node_rs::poawx::PoawxRoleClaim {
+            role_id,
+            lane_id: 0,
+            solver_pkh: [role_id; 20],
+            nonce: [1u8; 32],
+            secret: [2u8; 32],
+            claim_digest: [3u8; 32],
+            commitment_hash: None,
+        };
+        let ext = irium_node_rs::poawx::Phase20ReceiptExt {
+            role_reward: irium_node_rs::poawx::RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: claim(1),
+            verify_claim: claim(2),
+            support_claim: claim(3),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+        };
+        let mut r = make_test_block_receipt_c(90, b'A', 7);
+        r.phase20_ext = Some(ext.clone());
+        // block -> pending preserves the extension as hex.
+        let p = block_receipt_to_pending(&r);
+        assert!(
+            !p.phase20_ext.is_empty(),
+            "pending carries the extension hex"
+        );
+        // pending -> block restores the identical extension.
+        let back = pending_receipt_to_block_receipt(&p).expect("map back");
+        assert_eq!(back.phase20_ext, Some(ext));
+        assert_eq!(back, r);
+        // a receipt without an extension maps back to None (byte-identical behaviour).
+        let plain = make_test_block_receipt_c(91, b'A', 8);
+        let pp = block_receipt_to_pending(&plain);
+        assert!(pp.phase20_ext.is_empty());
+        assert_eq!(
+            pending_receipt_to_block_receipt(&pp).unwrap().phase20_ext,
+            None
+        );
     }
 
     #[test]

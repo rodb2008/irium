@@ -1595,6 +1595,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            phase20_ext: None,
         };
         let node_root =
             irium_node_rs::poawx::irx1_root_from_block_receipts(std::slice::from_ref(&block_rec));

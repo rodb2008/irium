@@ -389,6 +389,11 @@ struct JsonPoawxReceipt {
     /// byte-identical (the field is absent for direct receipts).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     delegation: String,
+    /// Phase 20: hex of the serialized `Phase20ReceiptExt` when present.
+    /// `skip_serializing_if` keeps pre-Phase-20 persisted JSON byte-identical
+    /// (the field is absent for receipts without an extension).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    phase20_ext: String,
 }
 
 #[derive(Serialize)]
@@ -809,6 +814,14 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
                         .delegation
                         .as_ref()
                         .map(|d| hex::encode(d.serialize()))
+                        .unwrap_or_default(),
+                    // Phase 20: persist the production extension when present so a
+                    // P2P-accepted Phase 20 block survives a restart. Empty/omitted
+                    // for receipts without an extension.
+                    phase20_ext: r
+                        .phase20_ext
+                        .as_ref()
+                        .map(|e| hex::encode(e.serialize()))
                         .unwrap_or_default(),
                 })
                 .collect()

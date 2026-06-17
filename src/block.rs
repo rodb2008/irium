@@ -270,8 +270,16 @@ impl Block {
         let mut out = Vec::new();
         if let Some(receipts) = &self.poawx_receipts {
             if !receipts.is_empty() {
+                let has_phase20 = receipts.iter().any(|r| r.phase20_ext.is_some());
                 let has_mode1 = receipts.iter().any(|r| r.delegation.is_some());
-                if has_mode1 {
+                if has_phase20 {
+                    // Phase 20: present-only v3 section (v1/v2 byte-identical when no ext).
+                    out.extend_from_slice(crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V3);
+                    out.push(receipts.len() as u8);
+                    for r in receipts {
+                        out.extend_from_slice(&r.serialize_v3());
+                    }
+                } else if has_mode1 {
                     out.extend_from_slice(crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V2);
                     out.push(receipts.len() as u8);
                     for r in receipts {
@@ -304,7 +312,8 @@ impl Block {
         let magic = &raw[*offset..*offset + 8];
         let is_v1 = magic == crate::poawx::POAWX_RECEIPT_SECTION_MAGIC;
         let is_v2 = magic == crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V2;
-        if !is_v1 && !is_v2 {
+        let is_v3 = magic == crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V3;
+        if !is_v1 && !is_v2 && !is_v3 {
             return Ok(None);
         }
         let mut off = *offset + 8;
@@ -321,8 +330,13 @@ impl Block {
                 }
                 receipts.push(crate::poawx::PoawxBlockReceipt::deserialize(&raw[off..])?);
                 off += crate::poawx::PoawxBlockReceipt::WIRE_SIZE;
-            } else {
+            } else if is_v2 {
                 let (r, used) = crate::poawx::PoawxBlockReceipt::deserialize_v2(&raw[off..])?;
+                receipts.push(r);
+                off += used;
+            } else {
+                // v3 (Phase 20): v2 element + optional length-prefixed extension.
+                let (r, used) = crate::poawx::PoawxBlockReceipt::deserialize_v3(&raw[off..])?;
                 receipts.push(r);
                 off += used;
             }
@@ -722,6 +736,7 @@ mod fix2a_boundary_tests {
             solution: [0xddu8; 8],
             commitment_nonce: [0xeeu8; 32],
             delegation: None,
+            phase20_ext: None,
         }
     }
 
@@ -939,5 +954,76 @@ mod fix2a_boundary_tests {
         let valid = block.serialize_for_height(1);
         let truncated = &valid[..valid.len() - 10];
         assert!(Block::deserialize_for_height(truncated, 1).is_err());
+    }
+
+    #[test]
+    fn phase20_v3_block_with_extension_roundtrips_and_old_blocks_unaffected() {
+        // A receipt carrying a Phase20ReceiptExt makes the block use the v3 magic
+        // and round-trips through the block wire (the P2P / binary-persist path).
+        let claim = |role_id: u8| crate::poawx::PoawxRoleClaim {
+            role_id,
+            lane_id: 0,
+            solver_pkh: [role_id; 20],
+            nonce: [1u8; 32],
+            secret: [2u8; 32],
+            claim_digest: [3u8; 32],
+            commitment_hash: None,
+        };
+        let ext = crate::poawx::Phase20ReceiptExt {
+            role_reward: crate::poawx::RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: claim(1),
+            verify_claim: claim(2),
+            support_claim: claim(3),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+        };
+        let mut r = make_receipt(7);
+        r.phase20_ext = Some(ext);
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![r.clone()]),
+        };
+        let bytes = block.serialize_for_height(1);
+        let v1 = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC;
+        let v2 = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V2;
+        let v3 = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V3;
+        assert!(
+            bytes.windows(8).any(|w| w == v3),
+            "ext block must use v3 magic"
+        );
+        assert!(!bytes.windows(8).any(|w| w == v1), "must NOT use v1 magic");
+        assert!(!bytes.windows(8).any(|w| w == v2), "must NOT use v2 magic");
+        let (decoded, used) = Block::deserialize_for_height(&bytes, 1).expect("decode v3");
+        assert_eq!(used, bytes.len());
+        let receipts = decoded.poawx_receipts.expect("receipts");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0], r,
+            "phase20_ext receipt round-trips byte-for-byte"
+        );
+        assert!(receipts[0].phase20_ext.is_some());
+
+        // An old block (no extension) is byte-identical to before — no v3 magic.
+        let old = Block {
+            header: sample_header(),
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![make_receipt(7)]),
+        };
+        let old_bytes = old.serialize_for_height(1);
+        assert!(
+            !old_bytes.windows(8).any(|w| w == v3),
+            "no-ext block must NOT use v3 magic"
+        );
+        assert!(
+            old_bytes.windows(8).any(|w| w == v1),
+            "no-ext mode-0 block uses v1 magic"
+        );
     }
 }

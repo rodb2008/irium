@@ -6193,6 +6193,7 @@ mod tests {
             solution,
             commitment_nonce: nonce,
             delegation: None,
+            phase20_ext: None,
         }
     }
 
@@ -6500,6 +6501,7 @@ mod tests {
             solution,
             commitment_nonce: nonce,
             delegation: Some(d),
+            phase20_ext: None,
         }
     }
 
