@@ -1457,12 +1457,20 @@ fn build_session_poawx_receipts(
             // attached — the pool does not fake claims; the node then fails closed
             // on the missing extension (no invalid block is produced).
             if crate::delegation::phase20_production_active(ctx.block_height) {
+                // Step 4: layer the pool's third-party fee terms when the fee gate
+                // is active + mode enabled + config valid; otherwise official fee-0.
+                let fee = if crate::delegation::third_party_fee_active(ctx.block_height) {
+                    crate::delegation::pool_third_party_fee_terms()
+                } else {
+                    None
+                };
                 match crate::delegation::build_synthetic_phase20_ext(
                     producer.network_id,
                     ctx.block_height,
                     &job.prev_hash,
                     pkh,
                     &[],
+                    fee,
                 ) {
                     Some(ext) => {
                         receipt.phase20_ext = hex::encode(ext.serialize());
@@ -1699,18 +1707,32 @@ fn build_native_rewardable_coinbase(
         let amts = crate::delegation::multi_role_amounts(snapshot.coinbase_value);
         let root = compute_receipts_root_from_pending_gated(&snapshot.poawx_pending_receipts, true);
         let irx1_script = build_irx1_commitment_script(&root);
-        let role_outs: [(u64, Vec<u8>); 4] = [
-            (amts[0], snapshot.payout_script.clone()),
+        // Step 4: OPTIONAL third-party fee output, taken ONLY from the PRIMARY
+        // allocation (fee = floor(primary_gross * fee_bps / 10000); miner keeps the
+        // remainder). compute/verify/support are never taxed. Official (fee_bps==0)
+        // keeps the 5-output (irx1 + 4 role) shape byte-identical to Step 3.
+        let (fee_bps, fee_pkh) =
+            crate::delegation::fee_terms_from_ext_hex(&first.phase20_ext).unwrap_or((0, [0u8; 20]));
+        let (primary_net, fee_amt) = if fee_bps > 0 {
+            crate::delegation::apply_fee(amts[0], fee_bps)
+        } else {
+            (amts[0], 0)
+        };
+        // Canonical order: irx1, PRIMARY(net), COMPUTE, VERIFY, SUPPORT [, FEE].
+        let mut role_outs: Vec<(u64, Vec<u8>)> = vec![
+            (primary_net, snapshot.payout_script.clone()),
             (amts[1], payout_script_from_pkh(&compute_pkh)),
             (amts[2], payout_script_from_pkh(&verify_pkh)),
             (amts[3], payout_script_from_pkh(&support_pkh)),
         ];
-        tx.push(5); // irx1 + 4 role outputs
+        if fee_bps > 0 {
+            role_outs.push((fee_amt, payout_script_from_pkh(&fee_pkh)));
+        }
+        tx.push((1 + role_outs.len()) as u8); // irx1 + role/fee outputs
         // irx1 OP_RETURN (zero value) first.
         tx.extend_from_slice(&0u64.to_le_bytes());
         tx.push(irx1_script.len() as u8);
         tx.extend_from_slice(&irx1_script);
-        // PRIMARY, COMPUTE, VERIFY, SUPPORT in fixed canonical order.
         for (value, script) in role_outs.iter() {
             tx.extend_from_slice(&value.to_le_bytes());
             tx.push(script.len() as u8);
@@ -4818,6 +4840,7 @@ mod tests {
             &job.prev_hash,
             &primary,
             &[],
+            None,
         )
         .expect("synthetic ext");
         let receipt = PoawxPendingReceipt {
@@ -4877,6 +4900,72 @@ mod tests {
         let marker_cb =
             build_native_rewardable_coinbase(&snapshot, &[0x1c, 0xab, 0xad, 0x1d]).unwrap();
         assert_eq!(rebuilt, marker_cb, "notify split matches validation coinbase");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+    }
+
+    #[test]
+    fn phase20_native_coinbase_third_party_fee() {
+        let _g = crate::delegation::p20_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+
+        let config = test_config(MinerFamilyMode::Asic);
+        let session = test_session(AdapterKind::NativeRewardableReserved);
+        let job = native_test_job();
+        let mut snapshot = build_canonical_job_snapshot(&job, &session, &config).unwrap();
+        let primary = session.pkh.unwrap();
+        let fee_pkh = [0xFEu8; 20];
+
+        // Synthetic ext WITH third-party fee terms (200 bps).
+        let ext = crate::delegation::build_synthetic_phase20_ext(
+            1,
+            snapshot.height,
+            &job.prev_hash,
+            &primary,
+            &[],
+            Some((200, fee_pkh)),
+        )
+        .expect("synthetic fee ext");
+        let receipt = PoawxPendingReceipt {
+            height: snapshot.height,
+            lane: "cpu".to_string(),
+            worker_pkh: hex::encode(primary),
+            solution: "0011223344556677".to_string(),
+            commitment_nonce: "cd".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
+            delegation: String::new(),
+            phase20_ext: hex::encode(ext.serialize()),
+        };
+        snapshot.poawx_pending_receipts = vec![receipt];
+
+        let en2 = vec![0u8; snapshot.extranonce2_size];
+        let cb = build_native_rewardable_coinbase(&snapshot, &en2).unwrap();
+        let outs = parse_coinbase_outputs(&cb);
+
+        // 6 outputs: irx1 + PRIMARY(net) + COMPUTE + VERIFY + SUPPORT + FEE.
+        assert_eq!(outs.len(), 6, "irx1 + 4 role + 1 fee output");
+        let amts = crate::delegation::multi_role_amounts(snapshot.coinbase_value);
+        let (pnet, pfee) = crate::delegation::apply_fee(amts[0], 200);
+        let p2pkh = |pkh: &[u8; 20]| payout_script_from_pkh(pkh);
+        assert_eq!(outs[1], (pnet, p2pkh(&primary)), "PRIMARY net (gross - fee)");
+        assert_eq!(outs[2].0, amts[1], "COMPUTE untaxed");
+        assert_eq!(outs[3].0, amts[2], "VERIFY untaxed");
+        assert_eq!(outs[4].0, amts[3], "SUPPORT untaxed");
+        assert_eq!(outs[5], (pfee, p2pkh(&fee_pkh)), "fee output to fee_pkh at position 6");
+        // Total across the payout outputs is exactly the coinbase value (fee comes
+        // out of PRIMARY, so net+fee == primary gross).
+        let paid: u64 = outs.iter().skip(1).map(|(v, _)| *v).sum();
+        assert_eq!(paid, snapshot.coinbase_value);
+        assert_eq!(pnet + pfee, amts[0], "fee taken only from PRIMARY");
 
         std::env::remove_var("IRIUM_NETWORK");
         std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");

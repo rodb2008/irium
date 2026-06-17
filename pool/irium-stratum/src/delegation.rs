@@ -310,6 +310,11 @@ pub struct StoredDelegation {
     pub network_id: u8,
     pub expiry_height: u64,
     pub fee_bps: u16,
+    /// Phase 20 Step 4: hex of the third-party `fee_pkh` when `fee_bps > 0`; empty
+    /// for OFFICIAL fee-0. `#[serde(default)]` keeps official records unchanged and
+    /// backward-compatible on reload.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fee_pkh: String,
     pub status: String,
     pub received_at_unix: u64,
 }
@@ -404,14 +409,28 @@ impl DelegationStore for JsonDelegationStore {
 
 // ── Pool-identity + verify-and-store core (pure, unit-tested) ─────────────────
 
-pub fn pool_identity_json(pool_pubkey_hex: &str, network_id: u8) -> serde_json::Value {
-    serde_json::json!({
+/// Pool identity JSON. `fee` is the pool's configured third-party fee terms, or
+/// None for OFFICIAL fee-0. Official advertises `fee_bps:0` and no `fee_pkh`
+/// (byte-identical to before). Third-party advertises the exact `fee_bps` +
+/// `fee_pkh` the miner must sign into the delegation.
+pub fn pool_identity_json(
+    pool_pubkey_hex: &str,
+    network_id: u8,
+    fee: Option<(u16, [u8; 20])>,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
         "pool_pubkey": pool_pubkey_hex,
         "network_id": network_id,
-        "fee_bps": 0,
+        "fee_bps": fee.map(|(b, _)| b).unwrap_or(0),
         "deleg_version": Delegation::VERSION,
         "domain": String::from_utf8_lossy(DELEG_DOMAIN),
-    })
+    });
+    if let Some((bps, pkh)) = fee {
+        if bps > 0 {
+            v["fee_pkh"] = serde_json::Value::String(hex::encode(pkh));
+        }
+    }
+    v
 }
 
 #[derive(Debug, PartialEq)]
@@ -425,6 +444,11 @@ pub enum DelegError {
     NetworkMismatch,
     PoolPubkeyMismatch,
     NonZeroFee,
+    /// Third-party mode: delegation fee terms do not match the pool's configured
+    /// terms (fee_bps mismatch, over cap, or config invalid).
+    FeeMismatch,
+    /// Third-party mode: delegation fee_pkh does not match the pool's fee_pkh.
+    FeePkhMismatch,
     Expired,
     Storage(String),
 }
@@ -451,6 +475,12 @@ impl DelegError {
             DelegError::NetworkMismatch => "delegation: network_id mismatch".into(),
             DelegError::PoolPubkeyMismatch => "delegation: pool_pubkey is not this pool".into(),
             DelegError::NonZeroFee => "delegation: fee_bps must be 0 (official pool is 0%)".into(),
+            DelegError::FeeMismatch => {
+                "delegation: fee_bps does not match pool third-party fee terms".into()
+            }
+            DelegError::FeePkhMismatch => {
+                "delegation: fee_pkh does not match pool third-party fee terms".into()
+            }
             DelegError::Expired => "delegation: expiry_height must be in the future".into(),
             DelegError::Storage(e) => format!("delegation: storage error: {e}"),
         }
@@ -469,6 +499,7 @@ pub fn verify_and_store(
     network_id: u8,
     tip_height: u64,
     now_unix: u64,
+    expected_fee: Option<(u16, [u8; 20])>,
 ) -> Result<StoredDelegation, DelegError> {
     if network_id == 0 {
         return Err(DelegError::Mainnet);
@@ -482,8 +513,31 @@ pub fn verify_and_store(
     if &d.pool_pubkey != pool_pubkey {
         return Err(DelegError::PoolPubkeyMismatch);
     }
-    if d.fee_bps != 0 {
-        return Err(DelegError::NonZeroFee);
+    // Fee policy. OFFICIAL (expected_fee None): fee_bps MUST be 0 and fee_pkh zero.
+    // THIRD-PARTY (Some): the signed delegation's fee terms MUST equal the pool's
+    // configured terms (cap-checked). The signature covers fee_bps + fee_pkh, so a
+    // post-signing mutation is caught below as BadSignature.
+    match expected_fee {
+        None => {
+            if d.fee_bps != 0 {
+                return Err(DelegError::NonZeroFee);
+            }
+            if d.fee_pkh != [0u8; 20] {
+                return Err(DelegError::NonZeroFee);
+            }
+        }
+        Some((efb, efp)) => {
+            if efb == 0 || efb > THIRD_PARTY_FEE_CAP_BPS || efp == [0u8; 20] {
+                // Pool config invalid -> never accept a fee.
+                return Err(DelegError::FeeMismatch);
+            }
+            if d.fee_bps != efb {
+                return Err(DelegError::FeeMismatch);
+            }
+            if d.fee_pkh != efp {
+                return Err(DelegError::FeePkhMismatch);
+            }
+        }
     }
     if d.worker_tag != worker_tag(worker) {
         return Err(DelegError::WorkerTagMismatch);
@@ -508,6 +562,11 @@ pub fn verify_and_store(
         network_id: d.network_id,
         expiry_height: d.expiry_height,
         fee_bps: d.fee_bps,
+        fee_pkh: if d.fee_bps > 0 {
+            hex::encode(d.fee_pkh)
+        } else {
+            String::new()
+        },
         status: "active".to_string(),
         received_at_unix: now_unix,
     };
@@ -643,7 +702,12 @@ pub fn build_mode1_pending_receipt(
     if rec.network_id != network_id {
         deny!("rec_network_mismatch");
     }
-    if rec.fee_bps != 0 {
+    // Phase 20 Step 4: a nonzero fee is allowed only in explicit third-party mode
+    // with the fee gate active (mainnet hard-off). The registry already verified
+    // the fee terms match the pool config; the node re-validates authoritatively.
+    let third_party_fee_ok =
+        third_party_fee_active(ctx.block_height) && third_party_pool_mode_enabled();
+    if rec.fee_bps != 0 && !third_party_fee_ok {
         deny!("rec_nonzero_fee");
     }
     if rec.expiry_height < ctx.block_height {
@@ -673,8 +737,11 @@ pub fn build_mode1_pending_receipt(
     if d.network_id != network_id {
         deny!("deleg_network_mismatch");
     }
-    if d.fee_bps != 0 {
+    if d.fee_bps != 0 && !third_party_fee_ok {
         deny!("deleg_nonzero_fee");
+    }
+    if d.fee_bps > THIRD_PARTY_FEE_CAP_BPS {
+        deny!("deleg_fee_over_cap");
     }
     if d.worker_tag != worker_tag(worker) {
         deny!("worker_tag_mismatch");
@@ -751,6 +818,8 @@ pub const ROLE_CLAIM_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_ROLE_CLAIM_V1";
 pub const FAIRNESS_CPU_UPPER: u32 = 3400;
 pub const FAIRNESS_GPU_UPPER: u32 = 6700;
 pub const PHASE20_EXT_VERSION: u8 = 1;
+/// Mirror of `irium_node_rs::poawx::THIRD_PARTY_FEE_CAP_BPS` (2.00%).
+pub const THIRD_PARTY_FEE_CAP_BPS: u16 = 200;
 
 /// Mirror of `irium_node_rs::poawx::multi_role_amounts`: split `total` into
 /// `[primary, compute, verify, support]` (floor; remainder → PRIMARY; exact sum).
@@ -762,6 +831,96 @@ pub fn multi_role_amounts(total: u64) -> [u64; 4] {
     let primary_floor = bps(MULTI_ROLE_PRIMARY_BPS);
     let remainder = total - primary_floor - compute - verify - support;
     [primary_floor + remainder, compute, verify, support]
+}
+
+/// Mirror of `irium_node_rs::poawx::apply_fee`: split a PRIMARY gross into
+/// `(net, fee)` where `fee = floor(gross * fee_bps / 10000)` (miner keeps the
+/// remainder). Only PRIMARY is fee-taxed; compute/verify/support are untouched.
+pub fn apply_fee(gross: u64, fee_bps: u16) -> (u64, u64) {
+    let fee = ((gross as u128 * fee_bps as u128) / 10_000u128) as u64;
+    (gross - fee, fee)
+}
+
+/// Mirror of `irium_node_rs::chain::third_party_pool_mode_enabled`: explicit
+/// third-party opt-in (`IRIUM_POAWX_THIRD_PARTY_POOL_MODE=1`). Mainnet hard-off.
+pub fn third_party_pool_mode_enabled() -> bool {
+    if network_id_from_env() == 0 {
+        return false; // mainnet
+    }
+    env::var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Mirror of `irium_node_rs::chain::third_party_fee_active`: fee activation height
+/// reached. Mainnet hard-off.
+pub fn third_party_fee_active(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false; // mainnet
+    }
+    activation_height_reached("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT", height)
+}
+
+/// The pool's configured third-party fee terms, or None for OFFICIAL fee-0.
+/// `Some((fee_bps, fee_pkh))` ONLY when: not mainnet, explicit third-party mode is
+/// enabled, `IRIUM_POAWX_THIRD_PARTY_FEE_BPS` is in 1..=200, and
+/// `IRIUM_POAWX_THIRD_PARTY_FEE_PKH` is a valid non-zero 20-byte hex. Any invalid
+/// or partial config fails closed to None (official 0%) with a warning — the pool
+/// never advertises/charges an unvalidated fee. Used by both the pool identity and
+/// (with the activation gate) the registry + production path.
+pub fn pool_third_party_fee_terms() -> Option<(u16, [u8; 20])> {
+    if !third_party_pool_mode_enabled() {
+        return None;
+    }
+    let bps: u16 = match env::var("IRIUM_POAWX_THIRD_PARTY_FEE_BPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+    {
+        Some(b) if b >= 1 && b <= THIRD_PARTY_FEE_CAP_BPS => b,
+        Some(b) => {
+            warn!("[poawx-deleg] IRIUM_POAWX_THIRD_PARTY_FEE_BPS={b} out of range 1..=200; fee disabled (official 0%)");
+            return None;
+        }
+        None => return None,
+    };
+    let pkh_hex = match env::var("IRIUM_POAWX_THIRD_PARTY_FEE_PKH") {
+        Ok(v) => v.trim().to_ascii_lowercase(),
+        Err(_) => {
+            warn!("[poawx-deleg] third-party fee_bps set but IRIUM_POAWX_THIRD_PARTY_FEE_PKH missing; fee disabled (official 0%)");
+            return None;
+        }
+    };
+    let pkh = match hex::decode(&pkh_hex) {
+        Ok(b) if b.len() == 20 => {
+            let mut a = [0u8; 20];
+            a.copy_from_slice(&b);
+            a
+        }
+        _ => {
+            warn!("[poawx-deleg] IRIUM_POAWX_THIRD_PARTY_FEE_PKH invalid (need 40 hex); fee disabled");
+            return None;
+        }
+    };
+    if pkh == [0u8; 20] {
+        warn!("[poawx-deleg] IRIUM_POAWX_THIRD_PARTY_FEE_PKH is zero; fee disabled");
+        return None;
+    }
+    Some((bps, pkh))
+}
+
+/// Extract `(fee_bps, fee_pkh)` from a hex-encoded `Phase20ReceiptExt`. The wire
+/// always ends with `fee_bps(2) || fee_pkh(20)`, so they are the last 22 bytes.
+/// Returns None on malformed/short input (fail-closed).
+pub fn fee_terms_from_ext_hex(ext_hex: &str) -> Option<(u16, [u8; 20])> {
+    let b = hex::decode(ext_hex).ok()?;
+    if b.len() < 1 + 60 + 22 {
+        return None;
+    }
+    let n = b.len();
+    let fee_bps = u16::from_le_bytes(b[n - 22..n - 20].try_into().ok()?);
+    let mut fee_pkh = [0u8; 20];
+    fee_pkh.copy_from_slice(&b[n - 20..n]);
+    Some((fee_bps, fee_pkh))
 }
 
 /// Mirror of `irium_node_rs::poawx::fairness_assignment_digest`.
@@ -958,11 +1117,12 @@ fn synth_field(tag: &[u8], network_id: u8, height: u64, prev_hash: &[u8; 32], ro
     h.finalize().into()
 }
 
-/// Build a synthetic OFFICIAL (fee-0) `Phase20ReceiptExtMirror` for pool
-/// production on testnet/devnet. For each role: deterministic nonce/secret, the
-/// assigned lane via `assign_lane_id`, a verifying `role_claim_digest`, and a
-/// solver pkh chosen deterministically from `workers` (if any) else `primary_pkh`
-/// (the MVP single-miner case). `RoleReward` mirrors the validated solver pkhs.
+/// Build a synthetic `Phase20ReceiptExtMirror` for pool production on
+/// testnet/devnet. For each role: deterministic nonce/secret, the assigned lane
+/// via `assign_lane_id`, a verifying `role_claim_digest`, and a solver pkh chosen
+/// deterministically from `workers` (if any) else `primary_pkh` (MVP single-miner).
+/// `RoleReward` mirrors the validated solver pkhs. `fee` carries the OPTIONAL
+/// third-party fee terms (`Some((fee_bps, fee_pkh))`); `None` => OFFICIAL fee-0.
 /// Returns None on mainnet or when synthetic claims are disabled (never fakes).
 pub fn build_synthetic_phase20_ext(
     network_id: u8,
@@ -970,10 +1130,17 @@ pub fn build_synthetic_phase20_ext(
     prev_hash: &[u8; 32],
     primary_pkh: &[u8; 20],
     workers: &[[u8; 20]],
+    fee: Option<(u16, [u8; 20])>,
 ) -> Option<Phase20ReceiptExtMirror> {
     if network_id == 0 || !synthetic_role_claims_enabled() {
         return None;
     }
+    // Fee terms: official (None) => 0/zero; third-party => only when valid (cap +
+    // nonzero pkh), else fail closed to official 0%.
+    let (fee_bps, fee_pkh) = match fee {
+        Some((b, p)) if b >= 1 && b <= THIRD_PARTY_FEE_CAP_BPS && p != [0u8; 20] => (b, p),
+        _ => (0u16, [0u8; 20]),
+    };
     let mk = |role_id: u8, idx: usize| -> PoawxRoleClaimMirror {
         let lane_id = assign_lane_id(network_id, height, prev_hash, role_id, 0);
         let nonce = synth_field(b"nonce", network_id, height, prev_hash, role_id);
@@ -1008,8 +1175,8 @@ pub fn build_synthetic_phase20_ext(
         compute_claim,
         verify_claim,
         support_claim,
-        fee_bps: 0,
-        fee_pkh: [0u8; 20],
+        fee_bps,
+        fee_pkh,
     })
 }
 
@@ -1252,7 +1419,10 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
                 .await
             }
             Some(p) => {
-                let v = pool_identity_json(&p.key.pubkey_hex(), p.network_id);
+                // Advertise the pool's configured third-party fee terms (or fee-0
+                // when official / mode off / mainnet).
+                let v =
+                    pool_identity_json(&p.key.pubkey_hex(), p.network_id, pool_third_party_fee_terms());
                 respond(&mut stream, 200, "OK", &v).await
             }
         },
@@ -1305,6 +1475,13 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
                     return;
                 }
             };
+            // Third-party fee terms accepted only when the fee gate is active at the
+            // current tip AND the pool config is valid; otherwise official (None).
+            let expected_fee = if third_party_fee_active(tip) {
+                pool_third_party_fee_terms()
+            } else {
+                None
+            };
             match verify_and_store(
                 store.as_ref(),
                 delegation_hex,
@@ -1314,6 +1491,7 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
                 ctx.network_id,
                 tip,
                 unix_now(),
+                expected_fee,
             ) {
                 Ok(rec) => {
                     respond(
@@ -1404,6 +1582,33 @@ mod tests {
             expiry_height: expiry,
             fee_bps,
             fee_pkh: [0u8; 20],
+            deleg_nonce: [7u8; 32],
+            delegation_sig: [0u8; 64],
+        };
+        let sig: Signature = miner.sign_prehash(&d.message_hash()).unwrap();
+        d.delegation_sig.copy_from_slice(&sig.to_bytes());
+        d
+    }
+
+    /// Phase 20 Step 4: build a signed delegation carrying third-party fee terms.
+    fn mirror_signed_fee(
+        miner: &SigningKey,
+        pool_pubkey: [u8; 33],
+        network_id: u8,
+        worker: &str,
+        expiry: u64,
+        fee_bps: u16,
+        fee_pkh: [u8; 20],
+    ) -> Delegation {
+        let mut d = Delegation {
+            deleg_version: Delegation::VERSION,
+            network_id,
+            miner_pubkey: pk33(miner),
+            pool_pubkey,
+            worker_tag: worker_tag(worker),
+            expiry_height: expiry,
+            fee_bps,
+            fee_pkh,
             deleg_nonce: [7u8; 32],
             delegation_sig: [0u8; 64],
         };
@@ -1548,6 +1753,7 @@ mod tests {
             network_id: 1,
             expiry_height: 100,
             fee_bps: 0,
+            fee_pkh: String::new(),
             status: "active".into(),
             received_at_unix: 1,
         };
@@ -1583,6 +1789,7 @@ mod tests {
             network_id: 1,
             expiry_height: expiry,
             fee_bps: 0,
+            fee_pkh: String::new(),
             status: "active".into(),
             received_at_unix: 1,
         };
@@ -1644,6 +1851,7 @@ mod tests {
             1,
             10,
             42,
+            None,
         )
         .unwrap();
         assert_eq!(rec.miner_pkh, miner_pkh_hex);
@@ -1674,7 +1882,8 @@ mod tests {
                 &pool_pub,
                 0,
                 10,
-                1
+                1,
+                None
             ),
             Err(DelegError::Mainnet)
         );
@@ -1688,7 +1897,8 @@ mod tests {
                 &pool_pub,
                 1,
                 10,
-                1
+                1,
+                None
             ),
             Err(DelegError::NetworkMismatch)
         );
@@ -1702,7 +1912,8 @@ mod tests {
                 &pool_pub,
                 1,
                 10,
-                1
+                1,
+                None
             ),
             Err(DelegError::PoolPubkeyMismatch)
         );
@@ -1716,7 +1927,8 @@ mod tests {
                 &pool_pub,
                 1,
                 10,
-                1
+                1,
+                None
             ),
             Err(DelegError::NonZeroFee)
         );
@@ -1730,7 +1942,8 @@ mod tests {
                 &pool_pub,
                 1,
                 10,
-                1
+                1,
+                None
             ),
             Err(DelegError::WorkerTagMismatch)
         );
@@ -1738,7 +1951,7 @@ mod tests {
         let mut bad = mirror_signed(&miner, pool_pub, 1, "r", 100, 0);
         bad.delegation_sig[0] ^= 0xff;
         assert_eq!(
-            verify_and_store(&store, &hexd(&bad), "r", "", &pool_pub, 1, 10, 1),
+            verify_and_store(&store, &hexd(&bad), "r", "", &pool_pub, 1, 10, 1, None),
             Err(DelegError::BadSignature)
         );
         // miner_pkh mismatch (claim a different pkh)
@@ -1751,7 +1964,8 @@ mod tests {
                 &pool_pub,
                 1,
                 10,
-                1
+                1,
+                None
             ),
             Err(DelegError::MinerPkhMismatch)
         );
@@ -1765,17 +1979,18 @@ mod tests {
                 &pool_pub,
                 1,
                 10,
-                1
+                1,
+                None
             ),
             Err(DelegError::Expired)
         );
         // bad hex / format
         assert_eq!(
-            verify_and_store(&store, "zz", "r", "", &pool_pub, 1, 10, 1),
+            verify_and_store(&store, "zz", "r", "", &pool_pub, 1, 10, 1, None),
             Err(DelegError::BadHex)
         );
         assert_eq!(
-            verify_and_store(&store, "00", "r", "", &pool_pub, 1, 10, 1),
+            verify_and_store(&store, "00", "r", "", &pool_pub, 1, 10, 1, None),
             Err(DelegError::BadFormat)
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -1801,12 +2016,18 @@ mod tests {
     #[test]
     fn pool_identity_json_shape() {
         let pk = "02".to_string() + &"ab".repeat(32);
-        let v = pool_identity_json(&pk, 1);
+        let v = pool_identity_json(&pk, 1, None);
         assert_eq!(v["pool_pubkey"], pk);
         assert_eq!(v["network_id"], 1);
         assert_eq!(v["fee_bps"], 0);
         assert_eq!(v["deleg_version"], Delegation::VERSION);
         assert_eq!(v["domain"], "irium.poawx.delegation.v1");
+        assert!(v.get("fee_pkh").is_none(), "official identity has no fee_pkh");
+        // Third-party identity advertises exact fee terms.
+        let fp = [0xFEu8; 20];
+        let vt = pool_identity_json(&pk, 1, Some((200, fp)));
+        assert_eq!(vt["fee_bps"], 200);
+        assert_eq!(vt["fee_pkh"], hex::encode(fp));
     }
 
     #[test]
@@ -1858,6 +2079,7 @@ mod tests {
             network_id,
             0,
             1,
+            None,
         )
         .expect("store delegation");
         (key, store, miner_pkh)
@@ -2103,14 +2325,14 @@ mod tests {
         std::env::set_var("IRIUM_NETWORK", "testnet");
         std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
         assert!(
-            build_synthetic_phase20_ext(1, 10, &prev, &[0x11u8; 20], &[]).is_none(),
+            build_synthetic_phase20_ext(1, 10, &prev, &[0x11u8; 20], &[], None).is_none(),
             "synthetic disabled by default"
         );
         // enabled flag but mainnet (network_id 0 passed) -> None.
         std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
         std::env::set_var("IRIUM_NETWORK", "mainnet");
         assert!(
-            build_synthetic_phase20_ext(0, 10, &prev, &[0x11u8; 20], &[]).is_none(),
+            build_synthetic_phase20_ext(0, 10, &prev, &[0x11u8; 20], &[], None).is_none(),
             "mainnet hard-off"
         );
         std::env::remove_var("IRIUM_NETWORK");
@@ -2128,7 +2350,7 @@ mod tests {
         let primary = [0xA1u8; 20];
         let total = 5_000_000_001u64;
 
-        let ext = build_synthetic_phase20_ext(net, height, &prev, &primary, &[]).expect("ext");
+        let ext = build_synthetic_phase20_ext(net, height, &prev, &primary, &[], None).expect("ext");
         // three role claims, expected role ids, solver == primary (MVP single-miner).
         assert_eq!(ext.compute_claim.role_id, ROLE_COMPUTE_CONTRIBUTOR);
         assert_eq!(ext.verify_claim.role_id, ROLE_VERIFY_CONTRIBUTOR);
@@ -2139,7 +2361,7 @@ mod tests {
         assert_eq!(ext.fee_bps, 0, "official fee-0 only");
         assert_eq!(ext.fee_pkh, [0u8; 20]);
         // deterministic / reproducible.
-        let ext2 = build_synthetic_phase20_ext(net, height, &prev, &primary, &[]).unwrap();
+        let ext2 = build_synthetic_phase20_ext(net, height, &prev, &primary, &[], None).unwrap();
         assert_eq!(ext.serialize(), ext2.serialize(), "synthetic builder is deterministic");
 
         // each claim validates via the node consensus primitive.
@@ -2215,6 +2437,139 @@ mod tests {
             &bad, &primary, total, height, &prev, net, &node_ext, false
         )
         .is_err(), "hidden extra output must reject");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+    }
+
+    #[test]
+    fn phase20_registry_third_party_fee() {
+        let dir = temp_dir("tpfee");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.json");
+        let store = JsonDelegationStore::open(&path).unwrap();
+        let pool = SigningKey::from_slice(&[3u8; 32]).unwrap();
+        let pool_pub = pk33(&pool);
+        let miner = SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let fee_pkh = [0xFEu8; 20];
+        let expected = Some((150u16, fee_pkh));
+
+        // Official mode (expected_fee None) rejects a nonzero-fee delegation.
+        let d_fee = mirror_signed_fee(&miner, pool_pub, 1, "rig1", 100, 150, fee_pkh);
+        assert_eq!(
+            verify_and_store(&store, &hex::encode(d_fee.serialize()), "rig1", "", &pool_pub, 1, 10, 1, None),
+            Err(DelegError::NonZeroFee),
+            "official mode rejects nonzero fee"
+        );
+
+        // Third-party mode accepts a valid signed fee that matches pool config.
+        let rec = verify_and_store(
+            &store,
+            &hex::encode(d_fee.serialize()),
+            "rig1",
+            "",
+            &pool_pub,
+            1,
+            10,
+            1,
+            expected,
+        )
+        .expect("third-party fee accepted");
+        assert_eq!(rec.fee_bps, 150);
+        assert_eq!(rec.fee_pkh, hex::encode(fee_pkh));
+        // Reload preserves fee_bps + fee_pkh.
+        let store2 = JsonDelegationStore::open(&path).unwrap();
+        let got = store2.get(&rec.miner_pkh, "rig1").unwrap();
+        assert_eq!(got.fee_bps, 150);
+        assert_eq!(got.fee_pkh, hex::encode(fee_pkh));
+
+        // fee_bps mismatch vs pool config rejects.
+        assert_eq!(
+            verify_and_store(&store, &hex::encode(d_fee.serialize()), "rig1", "", &pool_pub, 1, 10, 1, Some((100, fee_pkh))),
+            Err(DelegError::FeeMismatch)
+        );
+        // fee_pkh mismatch rejects.
+        assert_eq!(
+            verify_and_store(&store, &hex::encode(d_fee.serialize()), "rig1", "", &pool_pub, 1, 10, 1, Some((150, [0xABu8; 20]))),
+            Err(DelegError::FeePkhMismatch)
+        );
+        // Over-cap pool config never accepts a fee.
+        let d_over = mirror_signed_fee(&miner, pool_pub, 1, "rig1", 100, 201, fee_pkh);
+        assert_eq!(
+            verify_and_store(&store, &hex::encode(d_over.serialize()), "rig1", "", &pool_pub, 1, 10, 1, Some((201, fee_pkh))),
+            Err(DelegError::FeeMismatch)
+        );
+        // Post-signing fee mutation breaks the signature.
+        let mut tampered = d_fee.clone();
+        tampered.fee_bps = 100; // not re-signed
+        assert_eq!(
+            verify_and_store(&store, &hex::encode(tampered.serialize()), "rig1", "", &pool_pub, 1, 10, 1, Some((100, fee_pkh))),
+            Err(DelegError::BadSignature)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase20_synthetic_builder_third_party_fee() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        let net = 1u8;
+        let height = 500u64;
+        let prev = [0x55u8; 32];
+        let primary = [0xA1u8; 20];
+        let total = 5_000_000_001u64;
+        let fee_pkh = [0xFEu8; 20];
+
+        // With fee terms, the ext carries them; without, official 0.
+        let ext = build_synthetic_phase20_ext(net, height, &prev, &primary, &[], Some((200, fee_pkh)))
+            .expect("ext");
+        assert_eq!(ext.fee_bps, 200);
+        assert_eq!(ext.fee_pkh, fee_pkh);
+        // fee terms recoverable from the hex tail.
+        assert_eq!(
+            fee_terms_from_ext_hex(&hex::encode(ext.serialize())),
+            Some((200, fee_pkh))
+        );
+        // ext digest changes when fee_bps or fee_pkh change.
+        let ext0 = build_synthetic_phase20_ext(net, height, &prev, &primary, &[], None).unwrap();
+        assert_ne!(ext.digest(), ext0.digest(), "fee changes ext digest");
+        let ext_pkh2 =
+            build_synthetic_phase20_ext(net, height, &prev, &primary, &[], Some((200, [0x11u8; 20])))
+                .unwrap();
+        assert_ne!(ext.digest(), ext_pkh2.digest(), "fee_pkh changes ext digest");
+
+        // The node validator accepts the fee-aware fixture in third-party mode and
+        // rejects it without third-party mode.
+        let node_ext =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        let amts = multi_role_amounts(total);
+        let (pnet, pfee) = apply_fee(amts[0], 200);
+        let p2pkh = |pkh: &[u8; 20]| {
+            let mut s = vec![0x76u8, 0xa9, 0x14];
+            s.extend_from_slice(pkh);
+            s.extend_from_slice(&[0x88, 0xac]);
+            s
+        };
+        let outs = vec![
+            irium_node_rs::tx::TxOutput { value: 0, script_pubkey: vec![0x6a, 0x24, b'i', b'r', b'x', b'1'] },
+            irium_node_rs::tx::TxOutput { value: pnet, script_pubkey: p2pkh(&primary) },
+            irium_node_rs::tx::TxOutput { value: amts[1], script_pubkey: p2pkh(&node_ext.role_reward.compute_contributor_pkh) },
+            irium_node_rs::tx::TxOutput { value: amts[2], script_pubkey: p2pkh(&node_ext.role_reward.verify_contributor_pkh) },
+            irium_node_rs::tx::TxOutput { value: amts[3], script_pubkey: p2pkh(&node_ext.role_reward.support_contributor_pkh) },
+            irium_node_rs::tx::TxOutput { value: pfee, script_pubkey: p2pkh(&fee_pkh) },
+        ];
+        irium_node_rs::chain::validate_phase20_production_payout(
+            &outs, &primary, total, height, &prev, net, &node_ext, true,
+        )
+        .expect("node validator accepts third-party fee fixture");
+        assert!(
+            irium_node_rs::chain::validate_phase20_production_payout(
+                &outs, &primary, total, height, &prev, net, &node_ext, false
+            )
+            .is_err(),
+            "fee rejected without third-party mode"
+        );
 
         std::env::remove_var("IRIUM_NETWORK");
         std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
