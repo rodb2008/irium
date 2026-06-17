@@ -2109,8 +2109,9 @@ fn validate_multi_role_coinbase_outputs(
 ///   PRIMARY(net) [, COMPUTE, VERIFY, SUPPORT if multi-role] [, FEE if bps>0].
 /// Rejects: wrong count/order/amount, value-bearing non-p2pkh (hidden fee), a fee
 /// output in official mode, and any over/underpay. Callers gate by activation/mode
-/// and verify `fee_pkh`/`fee_bps` against the signed delegation.
-fn validate_poawx_coinbase_payout(
+/// and verify `fee_pkh`/`fee_bps` against the signed delegation. Exposed `pub`
+/// for the stratum pool's Step 3 parity dev-tests (see validate_phase20_production_payout).
+pub fn validate_poawx_coinbase_payout(
     outputs: &[crate::tx::TxOutput],
     primary_pkh: &[u8; 20],
     total_reward: u64,
@@ -2208,8 +2209,10 @@ pub fn phase20_production_active(height: u64) -> bool {
 ///   4. the canonical fee-aware multi-role coinbase via `validate_poawx_coinbase_payout`.
 ///
 /// Callers gate by `phase20_production_active(height)` (mainnet-off) before calling.
+/// Exposed `pub` so the stratum pool's dev-tests can validate a pool-produced
+/// Phase 20 fixture against the authoritative node validator (Step 3 parity).
 #[allow(clippy::too_many_arguments)]
-fn validate_phase20_production_payout(
+pub fn validate_phase20_production_payout(
     coinbase_outputs: &[crate::tx::TxOutput],
     primary_pkh: &[u8; 20],
     total_reward: u64,
