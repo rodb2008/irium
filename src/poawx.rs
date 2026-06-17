@@ -484,6 +484,97 @@ pub fn validate_role_claim(
     Ok(())
 }
 
+// ── Phase 20: production receipt extension (carries the role/fee payout data) ──
+//
+// `Phase20ReceiptExt` is the versioned block-receipt extension that travels with a
+// Phase 20 production block after activation. It carries the three revealed role
+// claims, the RoleReward payout pkhs, and the (signed) third-party fee terms. It is
+// a self-contained wire/JSON type with a digest; threading it into the live node
+// pending/storage/reorg/P2P path + the pool producer is the remaining integration
+// step (see the design-gap docs). Encoded only when present, so pre-activation
+// receipt v1/v2 encoding stays byte-identical.
+pub const PHASE20_EXT_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Phase20ReceiptExt {
+    pub role_reward: RoleReward,
+    pub compute_claim: PoawxRoleClaim,
+    pub verify_claim: PoawxRoleClaim,
+    pub support_claim: PoawxRoleClaim,
+    /// Third-party fee terms (must match the signed delegation). `fee_bps==0` => official.
+    pub fee_bps: u16,
+    pub fee_pkh: [u8; 20],
+}
+
+impl Phase20ReceiptExt {
+    /// Wire: version(1) || role_reward(60) || (len_u16 || claim) ×3 || fee_bps(2) || fee_pkh(20).
+    /// Each claim is length-prefixed because a claim carries an optional commitment.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(PHASE20_EXT_VERSION);
+        out.extend_from_slice(&self.role_reward.serialize());
+        for claim in [&self.compute_claim, &self.verify_claim, &self.support_claim] {
+            let b = claim.serialize();
+            out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            out.extend_from_slice(&b);
+        }
+        out.extend_from_slice(&self.fee_bps.to_le_bytes());
+        out.extend_from_slice(&self.fee_pkh);
+        out
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        let mut off = 0usize;
+        let need = |off: usize, n: usize, what: &str| -> Result<(), String> {
+            if raw.len() < off + n {
+                Err(format!("phase20 ext: truncated reading {}", what))
+            } else {
+                Ok(())
+            }
+        };
+        need(off, 1, "version")?;
+        if raw[off] != PHASE20_EXT_VERSION {
+            return Err(format!("phase20 ext: unknown version {}", raw[off]));
+        }
+        off += 1;
+        need(off, RoleReward::WIRE_SIZE, "role_reward")?;
+        let role_reward = RoleReward::deserialize(&raw[off..off + RoleReward::WIRE_SIZE])?;
+        off += RoleReward::WIRE_SIZE;
+        let read_claim = |off: &mut usize| -> Result<PoawxRoleClaim, String> {
+            need(*off, 2, "claim len")?;
+            let len = u16::from_le_bytes(raw[*off..*off + 2].try_into().expect("len 2")) as usize;
+            *off += 2;
+            need(*off, len, "claim body")?;
+            let c = PoawxRoleClaim::deserialize(&raw[*off..*off + len])?;
+            *off += len;
+            Ok(c)
+        };
+        let compute_claim = read_claim(&mut off)?;
+        let verify_claim = read_claim(&mut off)?;
+        let support_claim = read_claim(&mut off)?;
+        need(off, 2, "fee_bps")?;
+        let fee_bps = u16::from_le_bytes(raw[off..off + 2].try_into().expect("len 2"));
+        off += 2;
+        need(off, 20, "fee_pkh")?;
+        let mut fee_pkh = [0u8; 20];
+        fee_pkh.copy_from_slice(&raw[off..off + 20]);
+        Ok(Self {
+            role_reward,
+            compute_claim,
+            verify_claim,
+            support_claim,
+            fee_bps,
+            fee_pkh,
+        })
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(self.serialize());
+        h.finalize().into()
+    }
+}
+
 /// Per-receipt data embedded in the block wire/storage format so that every
 /// node can validate PoAW-X receipts from block-contained data (Phase 13-A).
 /// All multi-byte integers are little-endian.
@@ -1335,6 +1426,38 @@ mod tests {
             m_pkh.verify_signature().is_err(),
             "fee_pkh mutation must break the signature"
         );
+    }
+
+    #[test]
+    fn phase20_receipt_ext_wire_roundtrip() {
+        let prev = [0x33u8; 32];
+        let ext = Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 90, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 90, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 90, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 150,
+            fee_pkh: [0xFEu8; 20],
+        };
+        let bytes = ext.serialize();
+        let ext2 = Phase20ReceiptExt::deserialize(&bytes).expect("deserialize");
+        assert_eq!(ext, ext2);
+        assert_eq!(ext.digest(), ext2.digest());
+        // truncation rejects.
+        assert!(Phase20ReceiptExt::deserialize(&bytes[..bytes.len() - 1]).is_err());
+        assert!(Phase20ReceiptExt::deserialize(&[]).is_err());
+        // unknown version rejects.
+        let mut badver = bytes.clone();
+        badver[0] = 9;
+        assert!(Phase20ReceiptExt::deserialize(&badver).is_err());
+        // a digest change is sensitive to fee terms (binding visible in the ext digest).
+        let mut ext3 = ext.clone();
+        ext3.fee_bps = 151;
+        assert_ne!(ext.digest(), ext3.digest());
     }
 
     #[test]
