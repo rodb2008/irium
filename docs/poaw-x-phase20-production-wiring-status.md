@@ -1,17 +1,63 @@
-# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 + 6A + 6B COMPLETE: extension threaded + consensus-enforced + root-committed + official+third-party-fee production + hidden-precommit root + local/testnet role precommit/reveal collection; public gossip / E2E follow-up)
+# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 + 6A + 6B + 6C COMPLETE: extension threaded + consensus-enforced + root-committed + official+third-party-fee production + hidden-precommit root + local/testnet role precommit/reveal collection + testnet/devnet role gossip plumbing; public live relay / E2E follow-up)
 
 **Status:** **PARTIAL** (advancing). Steps **1** (ext threading), **2** (`connect_block`/`submit_block_extended`
 enforcement + receipts-root), **3** (official fee-0 multi-role coinbase), **4** (third-party-fee
-production), and **6A** (hidden role-precommit commitment root) are COMPLETE; **Step 6B — the
-local/testnet role precommit + reveal COLLECTION protocol (real, non-synthetic role data for
-production) — is now COMPLETE.** Miners submit a hidden precommit (before the target height) and a
-reveal (at the target height) to the pool's **loopback-only** endpoints; the pool collects them,
-selects one canonical reveal per role, and builds the Phase 20 ext from real collected data —
-preferring it over the synthetic fallback. Official pool stays **0%**; third-party fee opt-in/capped
-2%/PRIMARY-only/miner-signed; **mainnet hard-off** for every gate. Still remaining: **public
-role-claim networking/gossip** (Step 6B endpoints are loopback-only, operator-mediated like the
-delegation flow — NOT a public P2P gossip protocol), a public/external miner test, and a live
-loopback E2E. Steps 5A/5B results + remote-cpuminer caveat are unchanged.
+production), **6A** (hidden role-precommit commitment root), and **6B** (local/testnet role precommit +
+reveal COLLECTION protocol) are COMPLETE; **Step 6C — testnet/devnet role precommit/reveal
+gossip/P2P PLUMBING — is now COMPLETE at the payload + validation + in-memory-relay level.** The node
+P2P layer reserves two forward-compatible wire message types (`PoawxRolePrecommit = 26`,
+`PoawxRoleReveal = 27`); old/mainnet peers drop them safely via the `Unknown` sentinel + `_ => {}`
+catch-all (existing block/tx/receipt gossip unaffected). The pool gains a versioned gossip envelope
+(`RolePrecommitGossip`/`RoleRevealGossip`, v1) and a conservative `RoleGossipEngine`
+(validate → dedupe-by-stable-digest → height-window → store in the Step 6B `RoleProtocolStore` →
+rebroadcast **only** when newly accepted), tested with an in-memory multi-node relay and full
+production parity. **Honest scope:** the *live cross-process bridge* (node P2P receive → pool store,
+and pool → node broadcast) is **NOT wired** in this step — the node P2P bus and the pool store live in
+separate crates/processes joined only by RPC; bridging them is the documented follow-up. **No public
+ports were bound, no live E2E was run.** Official pool stays **0%**; third-party fee opt-in/capped
+2%/PRIMARY-only/miner-signed; **mainnet hard-off** for every gate (`role_gossip_enabled()` is false on
+mainnet and unless both `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1` and `IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1`).
+Chain difficulty remains **LWMA-144 automatic** (untouched). The external-miner low-devnet-height PoW
+caveat (Steps 5B / earlier) remains a separate, unrelated item. Steps 5A/5B results unchanged.
+
+### Step 6C (this pass) — testnet/devnet role gossip plumbing: COMPLETE (payload + validation + in-memory relay; live bridge = future)
+- **Node wire envelope** (`src/protocol.rs`): `MessageType::PoawxRolePrecommit = 26` and
+  `PoawxRoleReveal = 27` + `TryFrom<u8>` arms + `PoawxRolePrecommitPayload`/`PoawxRoleRevealPayload`
+  (opaque JSON bytes, same pattern as `OfferBroadcast`/`ProofGossip`). **No receive-dispatch change** —
+  unknown/old peers and mainnet nodes drop these via the existing forward-compat path, so adding the
+  variants is inert until a future step bridges them. Pure gossip, **no consensus effect** (Step 6A
+  enforcement is driven by block contents, not by message receipt).
+- **Pool gossip layer** (`pool/irium-stratum/src/delegation.rs`): `ROLE_GOSSIP_VERSION=1`,
+  `ROLE_GOSSIP_MAX_BYTES=4096`; versioned envelopes `RolePrecommitGossip`/`RoleRevealGossip`
+  (`encode`/`decode`, reject unsupported version / oversize / malformed); `role_gossip_enabled()`
+  (mainnet hard-off; requires `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1` **and**
+  `IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1`; default off).
+- **Engine** (`RoleGossipEngine`): `ingest_precommit` / `ingest_reveal` — validate first (reuses the
+  Step 6B DTO `validate`), enforce height window `[tip, tip+ROLE_PROTOCOL_HEIGHT_WINDOW]` (stale and
+  far-future reject), dedupe by stable digest (precommit = `leaf()`, reveal = domain-tagged hash;
+  any mutation changes it), then store via the **unchanged** Step 6B store. Returns
+  `GossipOutcome::{AcceptedNew, Duplicate, Rejected}`; **only `AcceptedNew` rebroadcasts** — invalid
+  payloads are never stored or relayed. A reveal with no matching precommit is rejected gracefully
+  (no crash), per the Step 6B store policy. The seen-digest set is held separately from the store so
+  6B semantics are untouched; the store is pruned by height via `prune`.
+- **Store/dedupe/prune**: validate → dedupe → store-if-valid-and-in-window → rebroadcast-only-valid →
+  prune old heights. Conservative size bound `ROLE_GOSSIP_SEEN_CAP` on the seen set.
+- **Env (new)**: `IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1` (in addition to `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1`).
+  Both default off; both mainnet-hard-off.
+- Tests (pool): `phase20_role_gossip_envelope_roundtrip_and_versioning` (encode/decode round-trip,
+  precommit hides secret/nonce, reveal reconstructs commitment, mutation changes digest, bad-version /
+  oversize / malformed reject), `phase20_role_gossip_validation_window_dedupe` (wrong-network / stale /
+  far-future / malformed / duplicate-dedupe / reveal-without-precommit-safe / reveal-with-precommit),
+  `phase20_role_gossip_inmemory_relay` (valid precommit stores once across a 3-node flood + converges,
+  duplicate stores once, invalid not stored/relayed, valid reveal stores once, invalid reveal not
+  stored/relayed), `phase20_role_gossip_production_parity` (gossip-collected precommits build the parent
+  root + reveals build the child ext that the node validator accepts; official fee-0 + third-party fee;
+  synthetic fallback only when enabled; mainnet hard-off). Tests (node): `message_type_try_from_role_gossip_26_27`
+  (26/27 map; unknown 200 still errors → graceful drop), payload round-trip + wire serialization for
+  both, wrong-message-type rejection.
+- **NOT done (live bridge, follow-up):** wiring the node P2P receive loop to call `RoleGossipEngine`
+  and feed the pool store, and having the pool emit `MessageType::PoawxRolePrecommit/Reveal` to peers;
+  public/external role-gossip run; two-VPS live role-gossip E2E. No public ports in this step.
 
 ### Step 6B (this pass) — local/testnet role precommit + reveal collection: COMPLETE
 - **Payloads** (`pool/irium-stratum/src/delegation.rs`): `RolePrecommitDto` (hides secret/nonce —

@@ -1,4 +1,4 @@
-# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (hidden-precommit commitment root NOW implemented in Step 6A; live role-claim networking pending)
+# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (hidden-precommit commitment root NOW implemented in Step 6A; role collection in Step 6B; role gossip PLUMBING in Step 6C; public live relay pending)
 
 **Status (updated Step 6A, 2026-06-18):** Deterministic lane assignment, role-claim
 reveal/validation primitives, the 34/33/33 distribution, serialization, and activation gates
@@ -13,9 +13,16 @@ in the leaf). **Step 6B (2026-06-18) adds a local/testnet role precommit + revea
 protocol** (loopback-only pool endpoints `POST /poawx/role-precommit` + `/poawx/role-reveal`, gated
 by `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1`; a height-keyed store with canonical one-per-role selection;
 production prefers collected real role data over the synthetic fallback). So testnet no longer relies
-solely on synthetic claims. **Still pending:** public role-claim networking/**gossip** — Step 6B
-endpoints are loopback-only/operator-mediated (like the delegation flow), NOT public P2P gossip; the
-synthetic builder remains a testnet/devnet-only fallback behind `IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`.
+solely on synthetic claims. **Step 6C (2026-06-18) adds role precommit/reveal GOSSIP PLUMBING for
+testnet/devnet**: forward-compatible node P2P wire types (`PoawxRolePrecommit = 26`,
+`PoawxRoleReveal = 27`; old/mainnet peers drop them safely) + a versioned pool gossip envelope and a
+conservative `RoleGossipEngine` (validate → dedupe → height-window → store in the Step 6B store →
+rebroadcast only-if-newly-accepted), proven with an in-memory multi-node relay + production parity.
+**Still pending:** the **live cross-process bridge** (node P2P receive ⇄ pool store, and pool → P2P
+broadcast) is NOT wired — Step 6C is payload + validation + in-memory-relay only; the public/external
+live role-gossip run is future. The synthetic builder remains a testnet/devnet-only fallback behind
+`IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`; gossip is mainnet-hard-off and needs both
+`IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1` and `IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1`.
 Mainnet hard-off; chain difficulty remains LWMA-144 automatic. Local-only; not pushed. See
 `poaw-x-phase20-production-wiring-status.md` (Steps 6A/6B) for full detail.
 

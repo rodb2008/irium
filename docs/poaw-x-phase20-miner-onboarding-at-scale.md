@@ -26,6 +26,15 @@ flow into a repeatable onboarding runbook for additional trusted miners.
 > testnet/devnet-only synthetic fallback (`IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`). These endpoints are
 > **not public gossip** and are mainnet-hard-off; chain difficulty stays automatic via LWMA-144.
 
+> **Role gossip plumbing (Phase 20 Step 6C, testnet/devnet, opt-in).** Step 6C adds the *plumbing* for
+> propagating role precommits/reveals between nodes: forward-compatible P2P wire message types and a
+> conservative pool-side gossip engine (validate → dedupe → height-window → store → rebroadcast only
+> valid), gated by `IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1` (in addition to
+> `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1`), mainnet hard-off, default off. **This step is payload +
+> validation + in-memory-relay only** — the live cross-process bridge between the node P2P bus and the
+> pool store is a documented follow-up, so operators onboarding miners today still use the
+> loopback-only Step 6B endpoints. **No public ports** are opened by Step 6C.
+
 ## 1. Miner requirements
 - A stock SHA-256d CPU miner (`cpuminer`/`minerd`) — unchanged, no version-rolling needed.
 - The Irium wallet binary with `poawx-register --emit-only` (Phase 19B+).
