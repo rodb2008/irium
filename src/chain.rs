@@ -286,6 +286,11 @@ pub struct ChainState {
     /// Drained by iriumd.rs `submit_block_extended` to restore orphaned
     /// receipts to `poawx_pending_receipts` (Phase 13-C).
     pub reorg_orphaned_blocks: Vec<Block>,
+    /// Phase 21C: persistent, reorg-safe anti-domination reward state.
+    /// Updated in `connect_block` and reverted in `disconnect_tip_block`
+    /// (both gated + mainnet hard-off); deterministically rebuilt by chain
+    /// replay on restart / rebuild-style reorg.
+    pub dominance: crate::poawx_dominance::PersistentDominance,
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +366,7 @@ impl ChainState {
             ltc_tip_height: 0,
             claimed_ltc_outpoints: HashSet::new(),
             reorg_orphaned_blocks: Vec::new(),
+            dominance: crate::poawx_dominance::PersistentDominance::from_env(),
         };
         let genesis = state.params.genesis_block.clone();
         state
@@ -875,6 +881,7 @@ impl ChainState {
         self.cumulative_work.insert(hash, self.total_work.clone());
         self.undo_logs.insert(hash, undo);
         self.best_tip = hash;
+        self.apply_block_dominance(expected_height);
         self.prune_caches();
 
         Ok(())
@@ -960,7 +967,79 @@ impl ChainState {
             .last()
             .map(|b| b.header.hash_for_height(new_tip_height))
             .unwrap_or([0u8; 32]);
+        self.revert_block_dominance(&tip_block, tip_height);
         Ok(tip_block)
+    }
+
+    /// Phase 21C: derive the canonical anti-domination reward events from an
+    /// accepted block's Phase 20 receipt extensions. Role amounts come from the
+    /// block subsidy via the canonical 55/22/13/10 split, so official fee-0 and
+    /// third-party-fee blocks produce IDENTICAL role amounts. The PRIMARY credit
+    /// goes to the receipt `worker_pkh` (the payout identity); the fee output and
+    /// the delegate are NOT credited as worker rewards (they are not role
+    /// allocations). Deterministic across nodes (no env, no ordering effects
+    /// beyond receipt order).
+    fn dominance_events_from_block(
+        block: &Block,
+        height: u64,
+    ) -> Vec<([u8; 20], crate::poawx_dominance::RoleRewardKind, u64)> {
+        use crate::poawx_dominance::RoleRewardKind;
+        let mut events = Vec::new();
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return events,
+        };
+        for r in receipts {
+            let ext = match &r.phase20_ext {
+                Some(e) => e,
+                None => continue,
+            };
+            let amts = crate::poawx::multi_role_amounts(block_reward(height));
+            events.push((r.worker_pkh, RoleRewardKind::Primary, amts[0]));
+            events.push((
+                ext.role_reward.compute_contributor_pkh,
+                RoleRewardKind::Compute,
+                amts[1],
+            ));
+            events.push((
+                ext.role_reward.verify_contributor_pkh,
+                RoleRewardKind::Verify,
+                amts[2],
+            ));
+            events.push((
+                ext.role_reward.support_contributor_pkh,
+                RoleRewardKind::Support,
+                amts[3],
+            ));
+        }
+        events
+    }
+
+    /// Apply the accepted tip block's reward events to the dominance state.
+    /// No-op unless `anti_domination_active(height)` (mainnet hard-off, default
+    /// off, so existing behavior is unchanged when the gate is off).
+    fn apply_block_dominance(&mut self, height: u64) {
+        if !crate::poawx_dominance::anti_domination_active(height) {
+            return;
+        }
+        let events = match self.chain.last() {
+            Some(b) => Self::dominance_events_from_block(b, height),
+            None => return,
+        };
+        for (pkh, kind, amount) in events {
+            self.dominance.apply_event(pkh, kind, amount, height);
+        }
+    }
+
+    /// Reverse the reward events of a disconnected tip block — the EXACT inverse
+    /// of `apply_block_dominance` for that block. Gated identically.
+    fn revert_block_dominance(&mut self, block: &Block, height: u64) {
+        if !crate::poawx_dominance::anti_domination_active(height) {
+            return;
+        }
+        for (pkh, kind, amount) in Self::dominance_events_from_block(block, height) {
+            self.dominance.revert_event(pkh, kind, amount, height);
+        }
     }
 
     fn find_reorg_path(&self, new_tip: [u8; 32]) -> Result<(u64, Vec<Block>), String> {
@@ -1671,6 +1750,7 @@ impl ChainState {
             ltc_tip_height: self.ltc_tip_height,
             claimed_ltc_outpoints: self.claimed_ltc_outpoints.clone(),
             reorg_orphaned_blocks: Vec::new(),
+            dominance: crate::poawx_dominance::PersistentDominance::from_env(),
         };
 
         let branch = self.gather_branch_to_genesis(tip_hash)?;
@@ -7813,6 +7893,145 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
         std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn phase21c_dominance_connect_disconnect_reorg() {
+        use crate::poawx_dominance::RoleRewardKind;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW", "1000");
+        std::env::set_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK", "4");
+
+        let net = crate::activation::network_id_byte();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+
+        // Build a Phase 20 block whose primary miner is keyed by `seed` and whose
+        // role solvers come from `p20_ext` (compute/verify/support = C1/C2/C3).
+        let mk_block = |seed: u8, fee_bps: u16, fee_pkh: [u8; 20], height: u64| -> Block {
+            let sk = signing_key(seed);
+            let ext = p20_ext(net, height, &parent_hash, fee_bps, fee_pkh);
+            let mut receipt = make_test_receipt(height, &sk, parent_hash, 1);
+            receipt.phase20_ext = Some(ext.clone());
+            let total = block_reward(height);
+            let payout = p20_coinbase(&receipt.worker_pkh, &ext, total);
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: 0xffff_ffff,
+                    script_sig: vec![0x01, 0x00],
+                    sequence: 0xffff_ffff,
+                }],
+                outputs: payout,
+                locktime: 0,
+            };
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![coinbase],
+                auxpow: None,
+                poawx_receipts: Some(vec![receipt]),
+            }
+        };
+
+        let amts = crate::poawx::multi_role_amounts(block_reward(1));
+        let key_a = key_hash(&signing_key(0x41));
+        let (c, v, s) = ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]);
+
+        // (C) reward-event derivation: PRIMARY=worker_pkh, roles=ext solvers,
+        // amounts from the canonical split.
+        let a1 = mk_block(0x41, 0, [0u8; 20], 1);
+        let ev = ChainState::dominance_events_from_block(&a1, 1);
+        assert_eq!(
+            ev,
+            vec![
+                (key_a, RoleRewardKind::Primary, amts[0]),
+                (c, RoleRewardKind::Compute, amts[1]),
+                (v, RoleRewardKind::Verify, amts[2]),
+                (s, RoleRewardKind::Support, amts[3]),
+            ]
+        );
+        // third-party fee block => IDENTICAL role amounts (fee/delegate not
+        // credited as worker rewards).
+        let a1_fee = mk_block(0x41, 200, [0xFEu8; 20], 1);
+        assert_eq!(
+            ChainState::dominance_events_from_block(&a1_fee, 1),
+            ev,
+            "fee output must not change role-reward accounting"
+        );
+
+        // Connect chain A = {a1@1, a2@2} through the real gated hook.
+        let mut cs = base_chain(None);
+        let base_dig = cs.dominance.digest();
+        cs.chain.push(a1.clone());
+        cs.apply_block_dominance(1);
+        let a2 = mk_block(0x42, 0, [0u8; 20], 2);
+        cs.chain.push(a2.clone());
+        cs.apply_block_dominance(2);
+        let dig_a = cs.dominance.digest();
+        assert_ne!(dig_a, base_dig, "applying chain A changed dominance state");
+
+        // (D) disconnect tip a2: revert restores the a1-only state exactly.
+        cs.revert_block_dominance(&a2, 2);
+        cs.chain.pop();
+        let dig_after_disc = cs.dominance.digest();
+        assert_ne!(dig_after_disc, base_dig);
+        assert_ne!(dig_after_disc, dig_a);
+
+        // reorg A -> B: reconnect a competing tip b2 at height 2.
+        let b2 = mk_block(0x43, 0, [0u8; 20], 2);
+        cs.chain.push(b2.clone());
+        cs.apply_block_dominance(2);
+        let dig_b = cs.dominance.digest();
+        assert_ne!(
+            dig_b, dig_a,
+            "reorg to a different tip yields different state"
+        );
+
+        // restart/rebuild: replaying {a1,b2} from scratch reproduces dig_b.
+        let mut cs2 = base_chain(None);
+        cs2.chain.push(a1.clone());
+        cs2.apply_block_dominance(1);
+        cs2.chain.push(b2.clone());
+        cs2.apply_block_dominance(2);
+        assert_eq!(
+            cs2.dominance.digest(),
+            dig_b,
+            "reorg A->B equals independently rebuilt B-state"
+        );
+
+        // disconnect-restored state equals an independent rebuild of {a1}.
+        let mut cs3 = base_chain(None);
+        cs3.chain.push(a1.clone());
+        cs3.apply_block_dominance(1);
+        assert_eq!(
+            cs3.dominance.digest(),
+            dig_after_disc,
+            "disconnect restored the exact pre-connect state"
+        );
+
+        // (F) gate OFF => apply is a no-op (old behavior unchanged).
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT");
+        let mut cs4 = base_chain(None);
+        let g = cs4.dominance.digest();
+        cs4.chain.push(a1.clone());
+        cs4.apply_block_dominance(1);
+        assert_eq!(cs4.dominance.digest(), g, "gate off: apply is a no-op");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK");
     }
 
     #[test]
