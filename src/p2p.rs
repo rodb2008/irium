@@ -4058,6 +4058,27 @@ impl P2PNode {
         let _ = broadcast_raw(&self.peers, &serialized).await;
     }
 
+    /// Phase 20 Step 6D: broadcast a PoAW-X role-precommit gossip envelope to all
+    /// peers (best-effort flood; receivers run the role-gossip cache's
+    /// validate/dedupe before re-broadcasting). Testnet/devnet only — callers gate
+    /// on `poawx_gossip::role_gossip_enabled()` (mainnet hard-off).
+    pub async fn broadcast_role_precommit(&self, gossip_json: &[u8]) {
+        let payload = crate::protocol::PoawxRolePrecommitPayload {
+            gossip_json: gossip_json.to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Phase 20 Step 6D: broadcast a PoAW-X role-reveal gossip envelope to all peers.
+    pub async fn broadcast_role_reveal(&self, gossip_json: &[u8]) {
+        let payload = crate::protocol::PoawxRoleRevealPayload {
+            gossip_json: gossip_json.to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
     /// Phase 1A+1B: drain accumulated incoming offer JSON strings. Called
     /// by iriumd offer-watcher, which writes each JSON to
     /// ~/.irium/offers/<id>.json so /offers/feed serves it locally.
@@ -6395,6 +6416,49 @@ impl P2PNode {
                             }
                         }
                     }
+                    // Phase 20 Step 6D: ingest role-gossip into the node cache;
+                    // rebroadcast only newly-accepted payloads (mirror of the
+                    // OfferBroadcast flood). Gated + mainnet-hard-off via
+                    // role_gossip_enabled(); malformed payloads are dropped, never
+                    // rebroadcast. No consensus effect (Step 6A is block-driven).
+                    MessageType::PoawxRolePrecommit => {
+                        if crate::poawx_gossip::role_gossip_enabled() {
+                            if let Ok(p) =
+                                crate::protocol::PoawxRolePrecommitPayload::from_message(&msg)
+                            {
+                                if crate::poawx_gossip::global_cache()
+                                    .ingest_precommit_bytes(&p.gossip_json)
+                                    .should_rebroadcast()
+                                {
+                                    let bytes = crate::protocol::PoawxRolePrecommitPayload {
+                                        gossip_json: p.gossip_json,
+                                    }
+                                    .to_message()
+                                    .serialize();
+                                    let _ = broadcast_raw(&peers_vec, &bytes).await;
+                                }
+                            }
+                        }
+                    }
+                    MessageType::PoawxRoleReveal => {
+                        if crate::poawx_gossip::role_gossip_enabled() {
+                            if let Ok(p) =
+                                crate::protocol::PoawxRoleRevealPayload::from_message(&msg)
+                            {
+                                if crate::poawx_gossip::global_cache()
+                                    .ingest_reveal_bytes(&p.gossip_json)
+                                    .should_rebroadcast()
+                                {
+                                    let bytes = crate::protocol::PoawxRoleRevealPayload {
+                                        gossip_json: p.gossip_json,
+                                    }
+                                    .to_message()
+                                    .serialize();
+                                    let _ = broadcast_raw(&peers_vec, &bytes).await;
+                                }
+                            }
+                        }
+                    }
                     MessageType::DisputeRaisedNotification => {
                         if let Ok(p) =
                             crate::protocol::DisputeRaisedNotificationPayload::from_message(&msg)
@@ -8691,6 +8755,43 @@ async fn handle_incoming_with_sybil(
                         };
                         let bytes = payload.to_message().serialize();
                         let _ = broadcast_raw(&peers, &bytes).await;
+                    }
+                }
+            }
+            // Phase 20 Step 6D: ingest role-gossip into the node cache; rebroadcast
+            // only newly-accepted payloads (mirror of OfferBroadcast). Gated +
+            // mainnet-hard-off; malformed dropped; no consensus effect.
+            MessageType::PoawxRolePrecommit => {
+                if crate::poawx_gossip::role_gossip_enabled() {
+                    if let Ok(p) = crate::protocol::PoawxRolePrecommitPayload::from_message(&msg) {
+                        if crate::poawx_gossip::global_cache()
+                            .ingest_precommit_bytes(&p.gossip_json)
+                            .should_rebroadcast()
+                        {
+                            let bytes = crate::protocol::PoawxRolePrecommitPayload {
+                                gossip_json: p.gossip_json,
+                            }
+                            .to_message()
+                            .serialize();
+                            let _ = broadcast_raw(&peers, &bytes).await;
+                        }
+                    }
+                }
+            }
+            MessageType::PoawxRoleReveal => {
+                if crate::poawx_gossip::role_gossip_enabled() {
+                    if let Ok(p) = crate::protocol::PoawxRoleRevealPayload::from_message(&msg) {
+                        if crate::poawx_gossip::global_cache()
+                            .ingest_reveal_bytes(&p.gossip_json)
+                            .should_rebroadcast()
+                        {
+                            let bytes = crate::protocol::PoawxRoleRevealPayload {
+                                gossip_json: p.gossip_json,
+                            }
+                            .to_message()
+                            .serialize();
+                            let _ = broadcast_raw(&peers, &bytes).await;
+                        }
                     }
                 }
             }
