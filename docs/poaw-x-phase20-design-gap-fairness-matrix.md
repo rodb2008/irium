@@ -14,6 +14,17 @@
 > data-only (persistent/reorg-safe enforcement = Phase 21C). Details:
 > `poaw-x-phase21-blueprint-gap-closure.md`. Chain difficulty remains LWMA-144 automatic.
 
+> **Phase 21D foundation (candidate-set + VRF-style assignment).** Role selection now
+> has a canonical candidate-set foundation (`src/poawx_candidate.rs`): `AssignmentProofV1`
+> (a documented VRF-STYLE PLACEHOLDER — no VRF library in-repo; deterministic,
+> public-key-bound, hash-based, no private key), a `CandidateSet` with deterministic
+> effective-score + tie-break, an optional `CND1` ext section (byte-identical absent),
+> and node validation that the selected role solver is the BEST candidate WITHIN the
+> included set (gated, mainnet hard-off). Limitation: best-within-included-set, not
+> global-network-best (no mandatory candidate admission/gossip yet); placeholder, not
+> true VRF. Details: `poaw-x-phase21d-candidate-set-assignment.md`. No hardware-class
+> assumptions; LWMA-144 untouched.
+
 > **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has
 > been validated live, end-to-end, twice. **Step 6E** (single-VPS loopback) and **Step 6F**
 > (two-VPS, role gossip over real cross-VPS P2P with an observer node validating byte-identical)

@@ -81,6 +81,15 @@ flow into a repeatable onboarding runbook for additional trusted miners.
 > (**no private key**, emit-only). Default off; old behavior unchanged when off. Sybil-work cost
 > (`IRIUM_POAWX_TICKET_SYBIL_BITS`) is an identity cost only — **not chain PoW**; LWMA-144 untouched.
 
+> **Assignment proofs (Phase 21D, testnet/devnet, opt-in, mainnet hard-off).** A miner
+> may emit a VRF-STYLE assignment proof (a documented placeholder, **not** a true VRF —
+> deterministic, public-key-bound, hash-based) for candidate-set selection with
+> `irium-wallet poawx-assignment-proof --network-id <id> --target-height <H> --role <…>
+> --solver <addr> --ticket-digest <64hex> --seed <64hex>` (**no private key**, emit-only).
+> The pool builds the candidate set; the node validates the selected role is the best
+> candidate **within the included set** (gated by
+> `IRIUM_POAWX_CANDIDATE_SET_{ACTIVATION_HEIGHT,REQUIRED}`). Default off; LWMA-144 untouched.
+
 ## 1. Miner requirements
 - A stock SHA-256d CPU miner (`cpuminer`/`minerd`) — unchanged, no version-rolling needed.
 - The Irium wallet binary with `poawx-register --emit-only` (Phase 19B+).

@@ -1,4 +1,4 @@
-# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement)
+# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation)
 
 **Status: Phase 21A implemented the FOUNDATION primitives (data-only); Phase 21B now wires ticket
 + penalty enforcement into the Phase 20 consensus/pool/wallet path behind explicit testnet/devnet
@@ -15,6 +15,22 @@ node re-validates against its persisted state when
 mirror + fairness selection among collected candidates. Global-best-among-unseen-candidate selection
 is **Phase 21D pending** (candidate-set/VRF), not faked. Details:
 `poaw-x-phase21c-anti-domination-enforcement.md`.
+
+**Phase 21D (this pass)** adds the candidate-set + assignment-proof foundation: a new
+`src/poawx_candidate.rs` with `AssignmentProofV1` (a documented **VRF-style placeholder**
+— no VRF lib in-repo — domain-separated, public-key-bound, hash-based, deterministic,
+no private key), a canonical `CandidateSet` (sorted/dedup, stable root, deterministic
+effective-score + tie-break), an optional trailing `CND1` ext section (byte-identical
+when absent), node `validate_block_candidate_sets` (set present/canonical/bound, each
+candidate self-consistent, dominance weights vs persisted state when active, and the
+selected role solver = the BEST candidate within the included set) behind
+`IRIUM_POAWX_CANDIDATE_SET_{ACTIVATION_HEIGHT,REQUIRED}` /
+`IRIUM_POAWX_ASSIGNMENT_PROOF_{ACTIVATION_HEIGHT,REQUIRED}` (mainnet hard-off,
+fail-closed), pool candidate-set production + byte-identical mirror, and a wallet
+`poawx-assignment-proof` emitter (no key, testnet-only). **HONEST LIMITATION:** the node
+validates best WITHIN the included candidate set; it cannot prove unseen miners did not
+exist (no mandatory candidate admission/gossip yet), and the proof is a placeholder not
+a true VRF. Details: `poaw-x-phase21d-candidate-set-assignment.md`.
 
 ## Phase 21B — gated enforcement (this pass)
 - **Ticket proof binding (`src/poawx_ticket.rs` + `src/poawx.rs`):** a compact, self-verifiable
@@ -133,7 +149,7 @@ unaffected. Chain difficulty remains **LWMA-144 automatic**.
 | Anti-domination / recent reward history | **21C** — persistent + reorg-safe per-(miner,window) state, connect/disconnect/reorg/restart, gated ext weight binding + node validation, pool selection weighting (global-best candidate optimality = 21D) |
 | Adaptive mining/security modes | **PARTIAL** — deterministic mode/policy state machine (not yet consumed by node) |
 | Penalty / fraud state | **PARTIAL** — status enum + record/escalation/expiry (slashing placeholder only) |
-| Fuller private assignment / VRF eligibility | **PENDING** — only an `assignment_public_key` placeholder field exists |
+| Fuller private assignment / VRF eligibility | **21D** — candidate-set commitment + AssignmentProofV1 (VRF-STYLE PLACEHOLDER, not true VRF) + node best-within-included-set validation; true VRF + mandatory candidate admission/gossip = future |
 | Puzzle work-mode primitives beyond simplified role path | **PENDING** |
 | Stronger finality-committee integration with the 10% role | **PENDING** — `require_finality` is a placeholder flag |
 
