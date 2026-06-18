@@ -82,6 +82,7 @@ pub mod network_era;
 pub mod p2p;
 pub mod p2p_wire;
 pub mod poawx;
+pub mod poawx_gossip;
 pub mod pow;
 pub mod protocol;
 pub mod qr;
