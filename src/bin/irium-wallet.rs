@@ -2327,6 +2327,7 @@ fn usage() {
     eprintln!("  irium-wallet poawx-role-precommit --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --secret <64hex> --nonce <64hex>");
     eprintln!("  irium-wallet poawx-role-reveal --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --secret <64hex> --nonce <64hex> --prev-hash <64hex>");
     eprintln!("  irium-wallet poawx-ticket-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --epoch <N> --expiry-height <N> [--assignment-pubkey <66hex>] [--sybil-nonce <64hex>] [--penalty-status <0..4>]");
+    eprintln!("  irium-wallet poawx-assignment-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--assignment-pubkey <66hex>]  (VRF-style placeholder; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3774,6 +3775,102 @@ fn cmd_poawx_role_emit(args: &[String], reveal: bool) -> Result<(), String> {
 
 /// Phase 21B: emit a PoAW-X miner work-ticket PROOF bound to a role + height
 /// (testnet/devnet only; mainnet hard-off). Prints JSON only — no private key.
+/// Phase 21D: build the assignment-proof JSON (VRF-style placeholder). Pure +
+/// testable; no private key, no seed phrase. Mainnet hard-off (network_id 0).
+fn assignment_proof_json(args: &[String]) -> Result<serde_json::Value, String> {
+    use irium_node_rs::poawx_candidate::AssignmentProofV1;
+    let mut network_id: Option<u8> = None;
+    let mut target_height: Option<u64> = None;
+    let mut role: Option<u8> = None;
+    let mut solver: Option<[u8; 20]> = None;
+    let mut apk: [u8; 33] = [0x02u8; 33];
+    let mut ticket_digest: [u8; 32] = [0u8; 32];
+    let mut seed: [u8; 32] = [0u8; 32];
+    let hex_into = |s: &str, out: &mut [u8]| -> Result<(), String> {
+        let b = hex::decode(s.trim()).map_err(|_| "invalid hex".to_string())?;
+        if b.len() != out.len() {
+            return Err(format!("expected {} bytes", out.len()));
+        }
+        out.copy_from_slice(&b);
+        Ok(())
+    };
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--network-id" => {
+                network_id = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --network-id".to_string())?,
+                )
+            }
+            "--target-height" => {
+                target_height = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --target-height".to_string())?,
+                )
+            }
+            "--role" => {
+                let r = next_flag_value(args, &mut i)?;
+                role = Some(match r.to_ascii_lowercase().as_str() {
+                    "compute" | "1" => irium_node_rs::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+                    "verify" | "2" => irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR,
+                    "support" | "3" => irium_node_rs::poawx::ROLE_SUPPORT_CONTRIBUTOR,
+                    other => return Err(format!("invalid --role {other}")),
+                });
+            }
+            "--solver" => solver = Some(resolve_fee_pkh_arg(&next_flag_value(args, &mut i)?)?),
+            "--assignment-pubkey" => hex_into(&next_flag_value(args, &mut i)?, &mut apk)?,
+            "--ticket-digest" => hex_into(&next_flag_value(args, &mut i)?, &mut ticket_digest)?,
+            "--seed" | "--prev-hash" => hex_into(&next_flag_value(args, &mut i)?, &mut seed)?,
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    let network_id = network_id.ok_or("--network-id required")?;
+    if network_id == 0 {
+        return Err("assignment proof is mainnet-hard-off (network_id 0)".to_string());
+    }
+    let target_height = target_height.ok_or("--target-height required")?;
+    let role = role.ok_or("--role required")?;
+    let solver = solver.ok_or("--solver <addr|40hex> required")?;
+    let proof = AssignmentProofV1::new(
+        network_id,
+        target_height,
+        role,
+        solver,
+        apk,
+        ticket_digest,
+        seed,
+    );
+    Ok(serde_json::json!({
+        "assignment_proof": {
+            "network_id": proof.network_id,
+            "target_height": proof.target_height,
+            "role_id": proof.role_id,
+            "solver_pkh": hex::encode(proof.solver_pkh),
+            "assignment_public_key": hex::encode(proof.assignment_public_key),
+            "ticket_digest": hex::encode(proof.ticket_digest),
+            "seed": hex::encode(proof.seed),
+        },
+        "assignment_score": proof.score(),
+        "assignment_proof_digest": hex::encode(proof.proof_digest),
+        "note": "VRF-style placeholder (not final cryptographic VRF); testnet/devnet only; no signing key needed",
+    }))
+}
+
+/// Phase 21D: emit a PoAW-X assignment proof (VRF-style placeholder). No private
+/// key, testnet/devnet only, mainnet hard-off.
+fn cmd_poawx_assignment_emit(args: &[String]) -> Result<(), String> {
+    let v = assignment_proof_json(args)?;
+    println!(
+        "{}",
+        serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?
+    );
+    eprintln!("[assignment-proof] VRF-style placeholder, no private key; operator/pool attaches it to the gated Phase 20 candidate set (testnet/devnet only).");
+    Ok(())
+}
+
 fn cmd_poawx_ticket_emit(args: &[String]) -> Result<(), String> {
     use irium_node_rs::poawx_ticket::TicketProof;
     let mut network_id: Option<u8> = None;
@@ -15512,6 +15609,68 @@ fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aproof_args(v: &[&str]) -> Vec<String> {
+        let mut o = vec!["poawx-assignment-proof".to_string()];
+        o.extend(v.iter().map(|s| s.to_string()));
+        o
+    }
+
+    #[test]
+    fn phase21d_assignment_proof_emit_json_no_secret_mainnet_off() {
+        let td = "11".repeat(32);
+        let sd = "22".repeat(32);
+        let sv = "aa".repeat(20);
+        let args = aproof_args(&[
+            "--network-id",
+            "1",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            &sv,
+            "--ticket-digest",
+            &td,
+            "--seed",
+            &sd,
+        ]);
+        let v = assignment_proof_json(&args).expect("json");
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.contains("assignment_proof_digest"), "has digest");
+        assert!(s.contains("assignment_score"), "has score");
+        // no private key / seed-phrase material leaks.
+        assert!(!s.to_lowercase().contains("private"));
+        assert!(!s.to_lowercase().contains("mnemonic"));
+        assert!(!s.to_lowercase().contains("secret"));
+        // digest matches the node-lib recomputation (placeholder is deterministic).
+        let nd = irium_node_rs::poawx_candidate::compute_assignment_proof_digest(
+            1,
+            10,
+            irium_node_rs::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+            &[0xAAu8; 20],
+            &[0x02u8; 33],
+            &[0x11u8; 32],
+            &[0x22u8; 32],
+        );
+        assert_eq!(v["assignment_proof_digest"], hex::encode(nd));
+        // mainnet hard-off (network_id 0).
+        let m = aproof_args(&[
+            "--network-id",
+            "0",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            &sv,
+            "--ticket-digest",
+            &td,
+            "--seed",
+            &sd,
+        ]);
+        assert!(assignment_proof_json(&m).is_err(), "mainnet hard-off");
+    }
     use irium_node_rs::settlement::{
         AgreementDeadlines, AgreementLifecycleState, AgreementParty, AgreementRefundCondition,
         AgreementReleaseCondition,
@@ -25941,6 +26100,12 @@ fn main() {
         }
         "poawx-ticket-proof" => {
             if let Err(e) = cmd_poawx_ticket_emit(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        "poawx-assignment-proof" => {
+            if let Err(e) = cmd_poawx_assignment_emit(&args) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
