@@ -1928,6 +1928,159 @@ impl RoleGossipEngine {
     }
 }
 
+// ── Step 6D: pool↔node loopback RPC bridge ───────────────────────────────────
+// The pool forwards locally-submitted role precommits/reveals to the node's
+// loopback role-gossip endpoints (so the node can P2P-broadcast them), and
+// fetches node-collected gossip before producing a block. All best-effort:
+// failures log/return empty and never crash production. Gated by
+// role_gossip_enabled() (mainnet hard-off). Defaults to the pool's existing node
+// RPC base; override via IRIUM_POAWX_ROLE_GOSSIP_NODE_RPC.
+
+/// Node RPC base for the role-gossip bridge.
+pub fn node_role_gossip_rpc_base(default_rpc_base: &str) -> String {
+    env::var("IRIUM_POAWX_ROLE_GOSSIP_NODE_RPC")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_rpc_base.to_string())
+}
+
+/// Best-effort: POST a validated local precommit (as a gossip envelope) to the
+/// node for P2P broadcast. Never panics; ignores transport/HTTP errors.
+pub async fn forward_precommit_to_node(rpc_base: &str, rpc_token: &str, dto: &RolePrecommitDto) {
+    if !role_gossip_enabled() {
+        return;
+    }
+    let url = format!(
+        "{}/poawx/role-gossip/precommit",
+        rpc_base.trim_end_matches('/')
+    );
+    if let Ok(client) = reqwest::Client::builder().build() {
+        let body = RolePrecommitGossip::new(dto.clone()).encode();
+        let _ = client
+            .post(&url)
+            .bearer_auth(rpc_token)
+            .body(body)
+            .send()
+            .await;
+    }
+}
+
+/// Best-effort: POST a validated local reveal (as a gossip envelope) to the node.
+pub async fn forward_reveal_to_node(rpc_base: &str, rpc_token: &str, dto: &RoleRevealDto) {
+    if !role_gossip_enabled() {
+        return;
+    }
+    let url = format!(
+        "{}/poawx/role-gossip/reveal",
+        rpc_base.trim_end_matches('/')
+    );
+    if let Ok(client) = reqwest::Client::builder().build() {
+        let body = RoleRevealGossip::new(dto.clone()).encode();
+        let _ = client
+            .post(&url)
+            .bearer_auth(rpc_token)
+            .body(body)
+            .send()
+            .await;
+    }
+}
+
+#[derive(Deserialize)]
+struct NodePrecommitsResp {
+    #[serde(default)]
+    precommits: Vec<RolePrecommitGossip>,
+}
+#[derive(Deserialize)]
+struct NodeRevealsResp {
+    #[serde(default)]
+    reveals: Vec<RoleRevealGossip>,
+}
+
+/// Fetch node-collected precommits for `target_height` (best-effort, empty on error).
+pub async fn fetch_node_precommits(
+    rpc_base: &str,
+    rpc_token: &str,
+    target_height: u64,
+) -> Vec<RolePrecommitDto> {
+    if !role_gossip_enabled() {
+        return Vec::new();
+    }
+    let url = format!(
+        "{}/poawx/role-gossip/precommits?target_height={}",
+        rpc_base.trim_end_matches('/'),
+        target_height
+    );
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let resp = match client.get(&url).bearer_auth(rpc_token).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    match resp.json::<NodePrecommitsResp>().await {
+        Ok(r) => r.precommits.into_iter().map(|g| g.precommit).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Fetch node-collected reveals for `target_height` (best-effort, empty on error).
+pub async fn fetch_node_reveals(
+    rpc_base: &str,
+    rpc_token: &str,
+    target_height: u64,
+) -> Vec<RoleRevealDto> {
+    if !role_gossip_enabled() {
+        return Vec::new();
+    }
+    let url = format!(
+        "{}/poawx/role-gossip/reveals?target_height={}",
+        rpc_base.trim_end_matches('/'),
+        target_height
+    );
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let resp = match client.get(&url).bearer_auth(rpc_token).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    match resp.json::<NodeRevealsResp>().await {
+        Ok(r) => r.reveals.into_iter().map(|g| g.reveal).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Fetch node-collected role gossip for the heights needed to produce a block at
+/// `height` (precommits for `height` and `height+1`, reveals for `height`) and
+/// ingest into the local store. Best-effort; validates each before storing.
+pub async fn bridge_fetch_into_store(
+    store: &RoleProtocolStore,
+    network_id: u8,
+    rpc_base: &str,
+    rpc_token: &str,
+    height: u64,
+) {
+    if network_id == 0 || !role_gossip_enabled() {
+        return;
+    }
+    let base = node_role_gossip_rpc_base(rpc_base);
+    for h in [height, height + 1] {
+        for dto in fetch_node_precommits(&base, rpc_token, h).await {
+            if let Ok(v) = dto.validate(network_id) {
+                let _ = store.add_precommit(v);
+            }
+        }
+    }
+    for dto in fetch_node_reveals(&base, rpc_token, height).await {
+        if let Ok(v) = dto.validate(network_id) {
+            let _ = store.add_reveal(v);
+        }
+    }
+}
+
 // ── HTTP server (raw-TCP, loopback-only by config; opt-in) ───────────────────
 
 fn poawx_state_dir() -> PathBuf {
@@ -2296,6 +2449,19 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
             };
             match result {
                 Ok(kind) => {
+                    // Step 6D: best-effort forward to the node's loopback role-gossip
+                    // endpoint so it can P2P-broadcast. Local store already succeeded;
+                    // a node failure here never affects the local store / response.
+                    if role_gossip_enabled() {
+                        let base = node_role_gossip_rpc_base(&ctx.rpc_base);
+                        if kind == "precommit" {
+                            if let Ok(dto) = serde_json::from_slice::<RolePrecommitDto>(&body) {
+                                forward_precommit_to_node(&base, &ctx.rpc_token, &dto).await;
+                            }
+                        } else if let Ok(dto) = serde_json::from_slice::<RoleRevealDto>(&body) {
+                            forward_reveal_to_node(&base, &ctx.rpc_token, &dto).await;
+                        }
+                    }
                     respond(
                         &mut stream,
                         200,
@@ -4253,6 +4419,208 @@ mod tests {
             GossipOutcome::Rejected(_)
         ));
 
+        clear_role_gossip_env();
+    }
+
+    // ── Step 6D: pool↔node loopback RPC bridge ────────────────────────────────
+
+    /// Minimal one-shot HTTP/1.1 mock: serves `body` to the first connection and
+    /// returns the raw request bytes (so a POST test can assert the body).
+    async fn mock_http_serve_once(body: String) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = buf[..n].to_vec();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+                req
+            } else {
+                Vec::new()
+            }
+        });
+        (url, handle)
+    }
+
+    // (20,21,22,23,24) pool fetches node-stored precommits/reveals over real HTTP,
+    // builds the parent root + child ext, and the node validator accepts it.
+    #[test]
+    fn phase20_role_gossip_bridge_fetch_http_and_production_parity() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        enable_role_gossip_env();
+        let net = 1u8;
+        let prev = [0x55u8; 32];
+        let roles = [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ];
+        let solvers = [[0xA1u8; 20], [0xA2u8; 20], [0xA3u8; 20]];
+        let sn = |r: u8| ([r; 32], [r.wrapping_add(70); 32]);
+        let store = RoleProtocolStore::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // node-shaped GET response for precommits @ height 2.
+            let pcs: Vec<RolePrecommitGossip> = roles
+                .iter()
+                .enumerate()
+                .map(|(i, &role)| {
+                    let (s, n) = sn(role);
+                    RolePrecommitGossip::new(mk_precommit_dto(net, 2, role, solvers[i], s, n))
+                })
+                .collect();
+            let body =
+                serde_json::json!({"precommits": serde_json::to_value(&pcs).unwrap()}).to_string();
+            let (url, h) = mock_http_serve_once(body).await;
+            let fetched = fetch_node_precommits(&url, "tok", 2).await;
+            let _ = h.await;
+            assert_eq!(fetched.len(), 3, "fetched precommits over HTTP");
+            for dto in &fetched {
+                store.add_precommit(dto.validate(net).unwrap()).unwrap();
+            }
+            // node-shaped GET response for reveals @ height 2.
+            let rvs: Vec<RoleRevealGossip> = roles
+                .iter()
+                .enumerate()
+                .map(|(i, &role)| {
+                    let (s, n) = sn(role);
+                    RoleRevealGossip::new(mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n))
+                })
+                .collect();
+            let body2 =
+                serde_json::json!({"reveals": serde_json::to_value(&rvs).unwrap()}).to_string();
+            let (url2, h2) = mock_http_serve_once(body2).await;
+            let fr = fetch_node_reveals(&url2, "tok", 2).await;
+            let _ = h2.await;
+            assert_eq!(fr.len(), 3, "fetched reveals over HTTP");
+            for dto in &fr {
+                store.add_reveal(dto.validate(net).unwrap()).unwrap();
+            }
+            // next-height precommits (committed by the child ext's precommit_root).
+            for (i, &role) in roles.iter().enumerate() {
+                let (s, n) = sn(role);
+                store
+                    .add_precommit(
+                        mk_precommit_dto(net, 3, role, solvers[i], s, n)
+                            .validate(net)
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            // build collected ext from the fetched data; node validator accepts.
+            let ext =
+                build_collected_phase20_ext(&store, net, 2, None).expect("collected from fetched");
+            let node_ext =
+                irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+            let mut leaves = Vec::new();
+            for c in [
+                &node_ext.compute_claim,
+                &node_ext.verify_claim,
+                &node_ext.support_claim,
+            ] {
+                irium_node_rs::poawx::validate_role_claim(c, net, 2, &prev, 0)
+                    .expect("claim valid");
+                leaves.push(
+                    irium_node_rs::poawx::role_precommit_leaf_for_claim(c, net, 2).expect("leaf"),
+                );
+            }
+            assert_eq!(
+                irium_node_rs::poawx::role_precommit_root(&leaves),
+                store.precommit_root_for(2).unwrap(),
+                "fetched leaves root == parent committed root"
+            );
+            // (24) third-party fee from bridged data.
+            let ext_fee = build_collected_phase20_ext(&store, net, 2, Some((200, [0x7Fu8; 20])))
+                .expect("fee ext");
+            assert_eq!(ext_fee.fee_bps, 200);
+        });
+        clear_role_gossip_env();
+    }
+
+    // (18) pool local submission reaches the node cache: forward POSTs the envelope.
+    #[test]
+    fn phase20_role_gossip_bridge_forward_http() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        enable_role_gossip_env();
+        let (s, n) = ([0x11u8; 32], [0x12u8; 32]);
+        let solver = [0xC1u8; 20];
+        let dto = mk_precommit_dto(1, 2, ROLE_COMPUTE_CONTRIBUTOR, solver, s, n);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (url, h) = mock_http_serve_once("{\"status\":\"accepted\"}".to_string()).await;
+            forward_precommit_to_node(&url, "tok", &dto).await;
+            let req = h.await.unwrap();
+            let s = String::from_utf8_lossy(&req);
+            assert!(s.contains("POST"), "is a POST");
+            assert!(s.contains("/poawx/role-gossip/precommit"), "to bridge path");
+            assert!(s.contains("gossip_version"), "body carries envelope");
+            assert!(s.contains(&hex::encode(solver)), "body carries solver pkh");
+        });
+        clear_role_gossip_env();
+    }
+
+    // (19,25,26) error-safety + base override + mainnet hard-off + synthetic gating.
+    #[test]
+    fn phase20_role_gossip_bridge_error_safe_and_mainnet_off() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // base override.
+        std::env::set_var("IRIUM_POAWX_ROLE_GOSSIP_NODE_RPC", "http://override:9");
+        assert_eq!(
+            node_role_gossip_rpc_base("http://default:1"),
+            "http://override:9"
+        );
+        std::env::remove_var("IRIUM_POAWX_ROLE_GOSSIP_NODE_RPC");
+        assert_eq!(
+            node_role_gossip_rpc_base("http://default:1"),
+            "http://default:1"
+        );
+
+        enable_role_gossip_env();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // (19) unreachable node -> empty, no crash.
+            assert!(fetch_node_precommits("http://127.0.0.1:1", "t", 2)
+                .await
+                .is_empty());
+            assert!(fetch_node_reveals("http://127.0.0.1:1", "t", 2)
+                .await
+                .is_empty());
+            let dto = mk_precommit_dto(
+                1,
+                2,
+                ROLE_COMPUTE_CONTRIBUTOR,
+                [0xA1u8; 20],
+                [1u8; 32],
+                [2u8; 32],
+            );
+            forward_precommit_to_node("http://127.0.0.1:1", "t", &dto).await; // must not panic
+                                                                              // (26) mainnet hard-off: network 0 -> bridge no-op.
+            let store = RoleProtocolStore::new();
+            bridge_fetch_into_store(&store, 0, "http://127.0.0.1:1", "t", 2).await;
+            assert!(
+                store.precommit_root_for(2).is_none(),
+                "mainnet bridge no-op"
+            );
+        });
+        // (25) synthetic fallback gating unchanged.
+        assert!(
+            build_synthetic_phase20_ext(1, 2, &[0x55u8; 32], &[0x09u8; 20], &[], None).is_none(),
+            "synthetic off by default"
+        );
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        assert!(
+            build_synthetic_phase20_ext(1, 2, &[0x55u8; 32], &[0x09u8; 20], &[], None).is_some(),
+            "synthetic on when enabled"
+        );
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
         clear_role_gossip_env();
     }
 }

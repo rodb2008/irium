@@ -1925,6 +1925,19 @@ async fn template_loop(
                     job.poawx_assignment =
                         crate::delegation::fetch_assignment(&config.rpc_base, &config.rpc_token)
                             .await;
+                    // Step 6D: pull node-collected role gossip (real precommits/
+                    // reveals received via P2P) into the local store before
+                    // production. Best-effort; no-op unless role gossip enabled.
+                    if let Some(producer) = &config.poawx_producer {
+                        crate::delegation::bridge_fetch_into_store(
+                            producer.role_store.as_ref(),
+                            producer.network_id,
+                            &config.rpc_base,
+                            &config.rpc_token,
+                            job.height,
+                        )
+                        .await;
+                    }
                 }
                 // Guardrail: refuse stale pre-fork templates once we've
                 // seen the network at/above the activation height.
