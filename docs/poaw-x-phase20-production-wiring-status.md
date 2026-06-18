@@ -1,17 +1,55 @@
-# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 COMPLETE: extension threaded + consensus-enforced + root-committed + pool official-fee-0 AND third-party-fee production; E2E/live-protocol follow-up)
+# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 + Step 6A COMPLETE: extension threaded + consensus-enforced + root-committed + official+third-party-fee production + hidden-precommit commitment root; live role-claim networking / E2E follow-up)
 
 **Status:** **PARTIAL** (advancing). **Step 1** (threading `Phase20ReceiptExt` through node storage,
 persistence, P2P/block sync, reorg) COMPLETE; **Step 2** (`connect_block` / `submit_block_extended`
 enforcement + receipts-root inclusion) COMPLETE and ENFORCED; **Step 3** (pool canonical multi-role
-coinbase, OFFICIAL fee-0) COMPLETE; **Step 4 — third-party-fee production wiring (wallet CLI + pool
-identity/config + registry relaxation + fee-aware coinbase + fee-aware receipt extension) — is now
-COMPLETE.** Official Irium pool stays **0%**; third-party fee is **explicit opt-in**, capped at **2%**,
-applied **only to PRIMARY_MINER**, **miner-signed** into the delegation and **bound** into the
-production extension; mainnet hard-off. Before activation the Phase 18/19/20-official path is
-byte/logically identical. Still remaining: a live (non-synthetic) hidden-precommit role-claim
-protocol + commitment root, a public/external miner test, and a live loopback E2E.
+coinbase, OFFICIAL fee-0) COMPLETE; **Step 4** (third-party-fee production wiring) COMPLETE;
+**Step 6A — hidden role-precommit commitment root (primitives + block/root enforcement + tests) — is
+now COMPLETE.** A role claim revealed in block H must reconstruct a leaf committed in the parent
+block H-1's `precommit_root`, so claims cannot be invented only at reveal time. Official Irium pool
+stays **0%**; third-party fee is opt-in, capped 2%, PRIMARY-only, miner-signed; mainnet hard-off for
+every gate. Before each activation the prior behavior is byte/logically identical. Still remaining
+(Step 6B / later): the **live public role-claim networking/gossip** (Step 6A uses a gated
+testnet/devnet synthetic precommit/reveal builder, NOT a public protocol), a public/external miner
+test, and a live loopback E2E. Steps 5A/5B results + remote-cpuminer caveat are unchanged.
 
-### Step 4 (this pass) — third-party-fee production wiring: COMPLETE
+### Step 6A (this pass) — hidden role-precommit commitment root: COMPLETE (primitives + enforcement)
+- **Primitives** (`src/poawx.rs`): `role_precommit_commitment(secret,nonce) = H(COMMIT_DOMAIN‖secret‖nonce)`
+  (hides the reveal); `role_precommit_leaf(net,target_height,role,solver_pkh,commitment)`;
+  `role_precommit_root(leaves)` = SHA256 over **sorted** leaves (order-independent, no Merkle proofs
+  needed); `role_precommit_leaf_for_claim` validates `commitment == H(secret‖nonce)` then rebuilds
+  the leaf. **Replay/mutation protection:** changing height/network/role/solver/secret/nonce changes
+  the leaf; a mutated reveal fails the commitment binding.
+- **Lane is intentionally NOT in the leaf** — the lane is `assign_lane(hash(H-1))`, unknowable when the
+  precommit is placed in H-1 (it depends on H-1's own hash). The lane is non-grindable (deterministic
+  from the assignment) and stays enforced at reveal by `validate_role_claim`. (A lane-bound variant
+  would require a grandparent-shifted assignment; deferred.)
+- **Receipt extension** (`Phase20ReceiptExt.precommit_root: Option<[u8;32]>`): trailing-optional wire
+  (None => byte-identical to pre-6A; present appends flag+32). The ext digest — and therefore the
+  gated receipts root — changes when `precommit_root` changes.
+- **Activation gate** `IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT` (mainnet hard-false, default
+  off, testnet/devnet only). Before activation: Steps 5A/5B synthetic claims work unchanged, no
+  parent-root requirement. After activation: every Phase 20 production block must carry a
+  `precommit_root` (committing the next block's leaves) and its role claims must reveal leaves whose
+  sorted root equals the **parent** block's `precommit_root`. **Grace:** exactly one transition block
+  at the activation height (its parent predates activation) skips the parent-root match.
+- **Chain enforcement** (`src/chain.rs`): `hidden_precommit_active(height)` gates
+  `validate_hidden_precommit` inside the Phase 20 production validation path (`validate_phase20_production_block`
+  now takes `previous` to load the parent's committed root). Missing parent root, wrong root, missing
+  own root, and mutated/mismatched commitments all reject. The precommit_root persists/reloads and
+  syncs with the block (it rides inside the already-threaded ext bytes — no new storage path).
+- **Pool synthetic builder** (`pool/irium-stratum/src/delegation.rs`): mirror primitives (parity vs
+  the dev-dep node lib) + `synthetic_precommit_root`; when hidden-precommit is active the builder
+  derives prev-hash-free secret/nonce (so block H-1 can commit block H's root), sets each claim's
+  `commitment_hash`, and sets `precommit_root` for the next height. **Testnet/devnet-only synthetic
+  builder — NOT public role-claim networking.**
+- Tests: poawx `phase20_hidden_precommit_primitives`, `phase20_ext_precommit_root_roundtrip_and_digest`;
+  chain `phase20_hidden_precommit_enforcement` (grace accept; valid parent-root reveal accept; missing
+  parent root / wrong root / missing own root / mutated commitment reject; mainnet hard-off); pool
+  `phase20_hidden_precommit_synthetic_and_node_parity` (pool-committed root == node-reconstructed reveal
+  root; mutation rejected by node; off-path unchanged).
+
+### Step 4 — third-party-fee production wiring: COMPLETE
 Third-party fee is **explicit opt-in only**; the official Irium pool remains **0%** and the entire
 Phase 18/19/20-official path is byte/logically unchanged. Cap is **200 bps (2%)**, applied **only to
 the PRIMARY_MINER allocation** (compute/verify/support are never taxed). Fee terms are **miner-signed**

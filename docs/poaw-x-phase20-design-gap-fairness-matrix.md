@@ -1,11 +1,17 @@
-# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (PARTIAL — primitives complete; live hidden-precommit pending a commitment root)
+# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (hidden-precommit commitment root NOW implemented in Step 6A; live role-claim networking pending)
 
-**Status:** **PARTIAL.** Deterministic lane assignment, role-claim reveal/validation
-primitives, the 34/33/33 distribution, serialization, and the activation gate (mainnet
-hard-off) are **implemented and tested** (testnet/devnet-gated). **Live hidden-precommit
-consensus enforcement is NOT claimed** — it requires a future on-chain / prior-block
-commitment root that does not exist yet (see §"Honest limitation"). No `connect_block`
-wiring. Local-only; not pushed.
+**Status (updated Step 6A, 2026-06-18):** Deterministic lane assignment, role-claim
+reveal/validation primitives, the 34/33/33 distribution, serialization, and activation gates
+(mainnet hard-off) are implemented and tested. **Step 6A now adds the previously-missing
+hidden-precommit commitment root: a role claim revealed in block H must reconstruct a leaf
+committed in the PARENT block H-1's `precommit_root`, enforced in `connect_block` after the
+`IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT` gate** (mainnet hard-off; one transition-block
+grace). Claims can no longer be invented only at reveal time. It uses a prior-block sorted-root
+scheme (no Merkle proofs); the leaf binds height/role/solver/secret-commitment (the lane stays
+enforced separately via `validate_role_claim` — see §"Honest limitation" for why the lane is not
+in the leaf). **Still pending (Step 6B):** the LIVE public role-claim networking/gossip — Step 6A
+uses a gated testnet/devnet **synthetic** precommit/reveal builder, NOT a public protocol.
+Local-only; not pushed. See `poaw-x-phase20-production-wiring-status.md` (Step 6A) for full detail.
 
 ## Core principle (implemented as designed)
 PoAW-X does **not** detect or trust hardware. The chain never asks "is this really a
