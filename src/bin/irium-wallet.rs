@@ -2326,6 +2326,7 @@ fn usage() {
     eprintln!("      (third-party pool, opt-in only) add: --third-party-pool --fee-bps <1..200> --fee-pkh <base58-addr|40hex>");
     eprintln!("  irium-wallet poawx-role-precommit --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --secret <64hex> --nonce <64hex>");
     eprintln!("  irium-wallet poawx-role-reveal --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --secret <64hex> --nonce <64hex> --prev-hash <64hex>");
+    eprintln!("  irium-wallet poawx-ticket-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --epoch <N> --expiry-height <N> [--assignment-pubkey <66hex>] [--sybil-nonce <64hex>] [--penalty-status <0..4>]");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3768,6 +3769,119 @@ fn cmd_poawx_role_emit(args: &[String], reveal: bool) -> Result<(), String> {
     } else {
         eprintln!("[role-precommit] target_height {target_height} role {role}; hides secret/nonce. POST to the operator's loopback /poawx/role-precommit before the target height.");
     }
+    Ok(())
+}
+
+/// Phase 21B: emit a PoAW-X miner work-ticket PROOF bound to a role + height
+/// (testnet/devnet only; mainnet hard-off). Prints JSON only — no private key.
+fn cmd_poawx_ticket_emit(args: &[String]) -> Result<(), String> {
+    use irium_node_rs::poawx_ticket::TicketProof;
+    let mut network_id: Option<u8> = None;
+    let mut target_height: Option<u64> = None;
+    let mut role: Option<u8> = None;
+    let mut solver: Option<[u8; 20]> = None;
+    let mut epoch: u64 = 0;
+    let mut expiry_height: Option<u64> = None;
+    let mut apk: [u8; 33] = [0x02u8; 33];
+    let mut nonce: [u8; 32] = [0u8; 32];
+    let mut penalty_status: u8 = 0;
+    let hex_into = |s: &str, out: &mut [u8]| -> Result<(), String> {
+        let b = hex::decode(s.trim()).map_err(|_| "invalid hex".to_string())?;
+        if b.len() != out.len() {
+            return Err(format!("expected {} bytes", out.len()));
+        }
+        out.copy_from_slice(&b);
+        Ok(())
+    };
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--network-id" => {
+                network_id = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --network-id".to_string())?,
+                )
+            }
+            "--target-height" => {
+                target_height = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --target-height".to_string())?,
+                )
+            }
+            "--role" => {
+                let r = next_flag_value(args, &mut i)?;
+                role = Some(match r.to_ascii_lowercase().as_str() {
+                    "compute" | "1" => irium_node_rs::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+                    "verify" | "2" => irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR,
+                    "support" | "3" => irium_node_rs::poawx::ROLE_SUPPORT_CONTRIBUTOR,
+                    other => return Err(format!("invalid --role {other}")),
+                });
+            }
+            "--solver" => solver = Some(resolve_fee_pkh_arg(&next_flag_value(args, &mut i)?)?),
+            "--epoch" => {
+                epoch = next_flag_value(args, &mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --epoch".to_string())?
+            }
+            "--expiry-height" => {
+                expiry_height = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --expiry-height".to_string())?,
+                )
+            }
+            "--assignment-pubkey" => hex_into(&next_flag_value(args, &mut i)?, &mut apk)?,
+            "--sybil-nonce" => hex_into(&next_flag_value(args, &mut i)?, &mut nonce)?,
+            "--penalty-status" => {
+                penalty_status = next_flag_value(args, &mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --penalty-status".to_string())?
+            }
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    let network_id = network_id.ok_or("--network-id required")?;
+    if network_id == 0 {
+        return Err("ticket proof is mainnet-hard-off (network_id 0)".to_string());
+    }
+    let target_height = target_height.ok_or("--target-height required")?;
+    let role = role.ok_or("--role required")?;
+    let solver = solver.ok_or("--solver <addr|40hex> required")?;
+    let expiry_height = expiry_height.ok_or("--expiry-height required")?;
+    if irium_node_rs::poawx_penalty::PenaltyStatus::from_id(penalty_status).is_none() {
+        return Err("invalid --penalty-status (0..=4)".to_string());
+    }
+    let proof = TicketProof::new(
+        network_id,
+        target_height,
+        role,
+        solver,
+        epoch,
+        expiry_height,
+        apk,
+        nonce,
+        penalty_status,
+    );
+    let body = serde_json::json!({
+        "network_id": proof.network_id,
+        "target_height": proof.target_height,
+        "role_id": proof.role_id,
+        "miner_pkh": hex::encode(proof.miner_pkh),
+        "epoch": proof.epoch,
+        "expiry_height": proof.expiry_height,
+        "assignment_public_key": hex::encode(proof.assignment_public_key),
+        "sybil_work_nonce": hex::encode(proof.sybil_work_nonce),
+        "sybil_work_digest": hex::encode(proof.sybil_work_digest),
+        "penalty_status": proof.penalty_status,
+        "ticket_digest": hex::encode(proof.ticket_digest),
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?
+    );
+    eprintln!("[ticket-proof] target_height {target_height} role {role}; no private key. Operator attaches it to the gated Phase 20 ext (testnet/devnet only).");
     Ok(())
 }
 
@@ -25821,6 +25935,12 @@ fn main() {
         }
         "poawx-role-reveal" => {
             if let Err(e) = cmd_poawx_role_emit(&args, true) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        "poawx-ticket-proof" => {
+            if let Err(e) = cmd_poawx_ticket_emit(&args) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
