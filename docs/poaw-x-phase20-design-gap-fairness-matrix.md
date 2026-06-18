@@ -9,9 +9,15 @@ committed in the PARENT block H-1's `precommit_root`, enforced in `connect_block
 grace). Claims can no longer be invented only at reveal time. It uses a prior-block sorted-root
 scheme (no Merkle proofs); the leaf binds height/role/solver/secret-commitment (the lane stays
 enforced separately via `validate_role_claim` — see §"Honest limitation" for why the lane is not
-in the leaf). **Still pending (Step 6B):** the LIVE public role-claim networking/gossip — Step 6A
-uses a gated testnet/devnet **synthetic** precommit/reveal builder, NOT a public protocol.
-Local-only; not pushed. See `poaw-x-phase20-production-wiring-status.md` (Step 6A) for full detail.
+in the leaf). **Step 6B (2026-06-18) adds a local/testnet role precommit + reveal COLLECTION
+protocol** (loopback-only pool endpoints `POST /poawx/role-precommit` + `/poawx/role-reveal`, gated
+by `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1`; a height-keyed store with canonical one-per-role selection;
+production prefers collected real role data over the synthetic fallback). So testnet no longer relies
+solely on synthetic claims. **Still pending:** public role-claim networking/**gossip** — Step 6B
+endpoints are loopback-only/operator-mediated (like the delegation flow), NOT public P2P gossip; the
+synthetic builder remains a testnet/devnet-only fallback behind `IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`.
+Mainnet hard-off; chain difficulty remains LWMA-144 automatic. Local-only; not pushed. See
+`poaw-x-phase20-production-wiring-status.md` (Steps 6A/6B) for full detail.
 
 ## Core principle (implemented as designed)
 PoAW-X does **not** detect or trust hardware. The chain never asks "is this really a

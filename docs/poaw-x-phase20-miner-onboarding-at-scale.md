@@ -16,6 +16,16 @@ flow into a repeatable onboarding runbook for additional trusted miners.
 > `--fee-pkh`, refuses fees over the cap, and (online) refuses unless the pool advertises the exact
 > same terms. Fees are mainnet-hard-off.
 
+> **Role precommit/reveal protocol (Phase 20 Step 6B, local/testnet, opt-in).** When the operator
+> enables `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1`, the pool collects real (non-synthetic) role data:
+> the miner emits a **precommit** before the target height (hides secret/nonce) and a **reveal** at
+> the target height, via the wallet helpers
+> `irium-wallet poawx-role-precommit …` / `poawx-role-reveal … --prev-hash <h>`. Both are POSTed to
+> the operator's **loopback-only** `/poawx/role-precommit` + `/poawx/role-reveal` endpoints (same
+> loopback delegation server; no public bind). Production prefers collected role data over the
+> testnet/devnet-only synthetic fallback (`IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`). These endpoints are
+> **not public gossip** and are mainnet-hard-off; chain difficulty stays automatic via LWMA-144.
+
 ## 1. Miner requirements
 - A stock SHA-256d CPU miner (`cpuminer`/`minerd`) — unchanged, no version-rolling needed.
 - The Irium wallet binary with `poawx-register --emit-only` (Phase 19B+).

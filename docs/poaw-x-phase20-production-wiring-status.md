@@ -1,17 +1,48 @@
-# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 + Step 6A COMPLETE: extension threaded + consensus-enforced + root-committed + official+third-party-fee production + hidden-precommit commitment root; live role-claim networking / E2E follow-up)
+# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 + 6A + 6B COMPLETE: extension threaded + consensus-enforced + root-committed + official+third-party-fee production + hidden-precommit root + local/testnet role precommit/reveal collection; public gossip / E2E follow-up)
 
-**Status:** **PARTIAL** (advancing). **Step 1** (threading `Phase20ReceiptExt` through node storage,
-persistence, P2P/block sync, reorg) COMPLETE; **Step 2** (`connect_block` / `submit_block_extended`
-enforcement + receipts-root inclusion) COMPLETE and ENFORCED; **Step 3** (pool canonical multi-role
-coinbase, OFFICIAL fee-0) COMPLETE; **Step 4** (third-party-fee production wiring) COMPLETE;
-**Step 6A — hidden role-precommit commitment root (primitives + block/root enforcement + tests) — is
-now COMPLETE.** A role claim revealed in block H must reconstruct a leaf committed in the parent
-block H-1's `precommit_root`, so claims cannot be invented only at reveal time. Official Irium pool
-stays **0%**; third-party fee is opt-in, capped 2%, PRIMARY-only, miner-signed; mainnet hard-off for
-every gate. Before each activation the prior behavior is byte/logically identical. Still remaining
-(Step 6B / later): the **live public role-claim networking/gossip** (Step 6A uses a gated
-testnet/devnet synthetic precommit/reveal builder, NOT a public protocol), a public/external miner
-test, and a live loopback E2E. Steps 5A/5B results + remote-cpuminer caveat are unchanged.
+**Status:** **PARTIAL** (advancing). Steps **1** (ext threading), **2** (`connect_block`/`submit_block_extended`
+enforcement + receipts-root), **3** (official fee-0 multi-role coinbase), **4** (third-party-fee
+production), and **6A** (hidden role-precommit commitment root) are COMPLETE; **Step 6B — the
+local/testnet role precommit + reveal COLLECTION protocol (real, non-synthetic role data for
+production) — is now COMPLETE.** Miners submit a hidden precommit (before the target height) and a
+reveal (at the target height) to the pool's **loopback-only** endpoints; the pool collects them,
+selects one canonical reveal per role, and builds the Phase 20 ext from real collected data —
+preferring it over the synthetic fallback. Official pool stays **0%**; third-party fee opt-in/capped
+2%/PRIMARY-only/miner-signed; **mainnet hard-off** for every gate. Still remaining: **public
+role-claim networking/gossip** (Step 6B endpoints are loopback-only, operator-mediated like the
+delegation flow — NOT a public P2P gossip protocol), a public/external miner test, and a live
+loopback E2E. Steps 5A/5B results + remote-cpuminer caveat are unchanged.
+
+### Step 6B (this pass) — local/testnet role precommit + reveal collection: COMPLETE
+- **Payloads** (`pool/irium-stratum/src/delegation.rs`): `RolePrecommitDto` (hides secret/nonce —
+  only `commitment_hash`) and `RoleRevealDto` (secret + nonce + lane + claim_digest), validated into
+  `ValidatedPrecommit`/`ValidatedReveal` using the **Step 6A primitives** (one hashing model). Reveal
+  validation enforces `commitment_hash == role_precommit_commitment(secret,nonce)` (mutation fails
+  closed). Wrong network/role/solver-hex reject.
+- **Store** (`RoleProtocolStore`): height-keyed in-memory store; `add_precommit` (idempotent on
+  same commitment, rejects a differing duplicate), `add_reveal` (rejects a reveal with no matching
+  precommit), `prune(tip)` (window `ROLE_PROTOCOL_HEIGHT_WINDOW`=64), `canonical_precommit` (one per
+  role, smallest `(solver,commitment)`), `precommit_root_for(h)`, `select_reveals(h)` (one valid
+  reveal per role or None). Shared via `PoawxProducer.role_store`.
+- **Production** (`build_collected_phase20_ext` + stratum `build_session_poawx_receipts`): when
+  hidden-precommit is active, the ext source priority is **(1) collected** (reveals for H → claims +
+  RoleReward; `precommit_root` commits H+1 from collected precommits) → **(2) synthetic** only when
+  `IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1` → **(3) fail closed** (no ext; node rejects after activation).
+- **Endpoints**: `POST /poawx/role-precommit` and `POST /poawx/role-reveal` on the **existing
+  loopback delegation server**, gated by `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1` (403 when off, 503 on
+  mainnet). No new public bind; loopback-only.
+- **Wallet helpers**: `irium-wallet poawx-role-precommit` (emits precommit JSON, no secret/nonce) and
+  `poawx-role-reveal` (emits reveal JSON with secret/nonce + lane + claim_digest; needs `--prev-hash`).
+  No private key printed; same secret/nonce reconstructs the commitment.
+- **Suggested env**: `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1`; endpoints ride `IRIUM_POAWX_DELEGATION_BIND`
+  (loopback-only; non-loopback refused). Synthetic fallback remains behind `IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`.
+- Tests (pool): `phase20_role_protocol_payloads_and_store` (round-trip, hide/reconstruct, mutation,
+  wrong-field, store add/dedup/prune/select) and `phase20_role_protocol_collected_production_and_node_parity`
+  (collected ext → node validates each claim + reveal-leaf root == parent committed root; missing role
+  fails closed; off-path/mainnet → None).
+
+### Step 6A — hidden role-precommit commitment root: COMPLETE (primitives + enforcement)
+- **Primitives** (`src/poawx.rs`): `role_precommit_commitment(secret,nonce) = H(COMMIT_DOMAIN‖secret‖nonce)`
 
 ### Step 6A (this pass) — hidden role-precommit commitment root: COMPLETE (primitives + enforcement)
 - **Primitives** (`src/poawx.rs`): `role_precommit_commitment(secret,nonce) = H(COMMIT_DOMAIN‖secret‖nonce)`
