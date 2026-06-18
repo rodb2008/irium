@@ -1106,6 +1106,109 @@ impl PoawxRoleClaimMirror {
     }
 }
 
+// ── Phase 21B: stratum-local mirror of the node TicketProof (byte-identical) ──
+// MUST match `irium_node_rs::poawx_ticket::TicketProof` byte-for-byte; the parity
+// test below asserts equality + node acceptance. Mainnet hard-off via callers.
+pub const TICKET_PROOF_DOMAIN: &[u8] = b"IRIUM_POAWX_TICKET_PROOF_V1";
+pub const SYBIL_WORK_DOMAIN: &[u8] = b"IRIUM_POAWX_SYBIL_WORK_V1";
+pub const TICKET_PROOF_WIRE: usize = 1 + 8 + 1 + 20 + 8 + 8 + 33 + 32 + 32 + 1 + 32; // 176
+pub const TICKET_SECTION_MAGIC: &[u8; 4] = b"TPK1";
+
+pub fn mirror_compute_sybil_digest(
+    network_id: u8,
+    miner_pkh: &[u8; 20],
+    epoch: u64,
+    apk: &[u8; 33],
+    nonce: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(SYBIL_WORK_DOMAIN);
+    h.update([network_id]);
+    h.update(miner_pkh);
+    h.update(epoch.to_le_bytes());
+    h.update(apk);
+    h.update(nonce);
+    h.finalize().into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketProofMirror {
+    pub network_id: u8,
+    pub target_height: u64,
+    pub role_id: u8,
+    pub miner_pkh: [u8; 20],
+    pub epoch: u64,
+    pub expiry_height: u64,
+    pub assignment_public_key: [u8; 33],
+    pub sybil_work_nonce: [u8; 32],
+    pub sybil_work_digest: [u8; 32],
+    pub penalty_status: u8,
+    pub ticket_digest: [u8; 32],
+}
+
+impl TicketProofMirror {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        network_id: u8,
+        target_height: u64,
+        role_id: u8,
+        miner_pkh: [u8; 20],
+        epoch: u64,
+        expiry_height: u64,
+        assignment_public_key: [u8; 33],
+        sybil_work_nonce: [u8; 32],
+        penalty_status: u8,
+    ) -> Self {
+        let sybil_work_digest = mirror_compute_sybil_digest(
+            network_id,
+            &miner_pkh,
+            epoch,
+            &assignment_public_key,
+            &sybil_work_nonce,
+        );
+        let mut h = Sha256::new();
+        h.update(TICKET_PROOF_DOMAIN);
+        h.update([network_id]);
+        h.update(target_height.to_le_bytes());
+        h.update([role_id]);
+        h.update(miner_pkh);
+        h.update(epoch.to_le_bytes());
+        h.update(expiry_height.to_le_bytes());
+        h.update(assignment_public_key);
+        h.update(sybil_work_digest);
+        let ticket_digest = h.finalize().into();
+        Self {
+            network_id,
+            target_height,
+            role_id,
+            miner_pkh,
+            epoch,
+            expiry_height,
+            assignment_public_key,
+            sybil_work_nonce,
+            sybil_work_digest,
+            penalty_status,
+            ticket_digest,
+        }
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(TICKET_PROOF_WIRE);
+        out.push(self.network_id);
+        out.extend_from_slice(&self.target_height.to_le_bytes());
+        out.push(self.role_id);
+        out.extend_from_slice(&self.miner_pkh);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.expiry_height.to_le_bytes());
+        out.extend_from_slice(&self.assignment_public_key);
+        out.extend_from_slice(&self.sybil_work_nonce);
+        out.extend_from_slice(&self.sybil_work_digest);
+        out.push(self.penalty_status);
+        out.extend_from_slice(&self.ticket_digest);
+        out
+    }
+}
+
 /// Mirror of `irium_node_rs::poawx::Phase20ReceiptExt`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phase20ReceiptExtMirror {
@@ -1118,6 +1221,9 @@ pub struct Phase20ReceiptExtMirror {
     /// Step 6A: optional hidden-precommit root committing the next block's leaves
     /// (trailing-optional; None => byte-identical to pre-6A).
     pub precommit_root: Option<[u8; 32]>,
+    /// Phase 21B: optional per-role ticket proofs (trailing section; None =>
+    /// byte-identical to pre-21B). Attached when the pool ticket gate is enabled.
+    pub role_ticket_proofs: Option<[TicketProofMirror; 3]>,
 }
 
 impl Phase20ReceiptExtMirror {
@@ -1134,9 +1240,26 @@ impl Phase20ReceiptExtMirror {
         }
         out.extend_from_slice(&self.fee_bps.to_le_bytes());
         out.extend_from_slice(&self.fee_pkh);
-        if let Some(root) = &self.precommit_root {
-            out.push(1);
-            out.extend_from_slice(root);
+        // Mirror node poawx::Phase20ReceiptExt::serialize EXACTLY: precommit_root
+        // (present-only) then the Step 21B trailing ticket section (present-only). A
+        // `0` precommit flag is written when tickets are present but precommit is
+        // None, so the reader can skip to the ticket magic. Both absent => nothing.
+        match &self.precommit_root {
+            Some(root) => {
+                out.push(1);
+                out.extend_from_slice(root);
+            }
+            None => {
+                if self.role_ticket_proofs.is_some() {
+                    out.push(0);
+                }
+            }
+        }
+        if let Some(proofs) = &self.role_ticket_proofs {
+            out.extend_from_slice(TICKET_SECTION_MAGIC);
+            for p in proofs.iter() {
+                out.extend_from_slice(&p.serialize());
+            }
         }
         out
     }
@@ -1146,6 +1269,53 @@ impl Phase20ReceiptExtMirror {
         h.update(self.serialize());
         h.finalize().into()
     }
+}
+
+/// Pool-side ticket enforcement gate (mirrors node `tickets_enforced`): active
+/// height + required flag, mainnet hard-off. When on, the pool attaches per-role
+/// ticket proofs to the produced Phase 20 ext (else the node fails closed).
+pub fn pool_tickets_enforced(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false;
+    }
+    let active = match env::var("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    };
+    let required = env::var("IRIUM_POAWX_TICKETS_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    active && required
+}
+
+/// Build the 3 per-role ticket proofs for a produced ext (compute/verify/support),
+/// each bound to that role's solver pkh. Deterministic; clean penalty; expiry a
+/// fixed window ahead. Used when `pool_tickets_enforced(height)`.
+pub fn build_role_ticket_proofs(
+    network_id: u8,
+    height: u64,
+    rr: &RoleRewardMirror,
+) -> [TicketProofMirror; 3] {
+    let epoch = height; // simple per-height epoch (testnet/devnet)
+    let expiry = height + 256;
+    let apk = [0x02u8; 33];
+    let mk = |role_id: u8, pkh: [u8; 20], tag: u8| {
+        let mut nonce = [0u8; 32];
+        nonce[0] = tag;
+        nonce[1] = role_id;
+        nonce[2..10].copy_from_slice(&height.to_le_bytes());
+        TicketProofMirror::new(
+            network_id, height, role_id, pkh, epoch, expiry, apk, nonce, 0,
+        )
+    };
+    [
+        mk(ROLE_COMPUTE_CONTRIBUTOR, rr.compute_contributor_pkh, 1),
+        mk(ROLE_VERIFY_CONTRIBUTOR, rr.verify_contributor_pkh, 2),
+        mk(ROLE_SUPPORT_CONTRIBUTOR, rr.support_contributor_pkh, 3),
+    ]
 }
 
 /// Parse an env activation height (`>= h`), mainnet-off handled by the caller.
@@ -1273,18 +1443,27 @@ pub fn build_synthetic_phase20_ext(
     } else {
         None
     };
+    let role_reward = RoleRewardMirror {
+        compute_contributor_pkh: compute_claim.solver_pkh,
+        verify_contributor_pkh: verify_claim.solver_pkh,
+        support_contributor_pkh: support_claim.solver_pkh,
+    };
+    // Phase 21B: attach per-role ticket proofs when the pool ticket gate is on
+    // (else the node fails closed). Off => None (byte-identical to pre-21B).
+    let role_ticket_proofs = if pool_tickets_enforced(height) {
+        Some(build_role_ticket_proofs(network_id, height, &role_reward))
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
-        role_reward: RoleRewardMirror {
-            compute_contributor_pkh: compute_claim.solver_pkh,
-            verify_contributor_pkh: verify_claim.solver_pkh,
-            support_contributor_pkh: support_claim.solver_pkh,
-        },
+        role_reward,
         compute_claim,
         verify_claim,
         support_claim,
         fee_bps,
         fee_pkh,
         precommit_root,
+        role_ticket_proofs,
     })
 }
 
@@ -1659,18 +1838,26 @@ pub fn build_collected_phase20_ext(
         Some((b, p)) if b >= 1 && b <= THIRD_PARTY_FEE_CAP_BPS && p != [0u8; 20] => (b, p),
         _ => (0u16, [0u8; 20]),
     };
+    let role_reward = RoleRewardMirror {
+        compute_contributor_pkh: reveals[0].claim.solver_pkh,
+        verify_contributor_pkh: reveals[1].claim.solver_pkh,
+        support_contributor_pkh: reveals[2].claim.solver_pkh,
+    };
+    // Phase 21B: attach per-role ticket proofs when the pool ticket gate is on.
+    let role_ticket_proofs = if pool_tickets_enforced(height) {
+        Some(build_role_ticket_proofs(network_id, height, &role_reward))
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
-        role_reward: RoleRewardMirror {
-            compute_contributor_pkh: reveals[0].claim.solver_pkh,
-            verify_contributor_pkh: reveals[1].claim.solver_pkh,
-            support_contributor_pkh: reveals[2].claim.solver_pkh,
-        },
+        role_reward,
         compute_claim: reveals[0].claim.clone(),
         verify_claim: reveals[1].claim.clone(),
         support_claim: reveals[2].claim.clone(),
         fee_bps,
         fee_pkh,
         precommit_root: Some(next_root),
+        role_ticket_proofs,
     })
 }
 
@@ -3280,6 +3467,7 @@ mod tests {
             fee_bps: 0,
             fee_pkh: [0u8; 20],
             precommit_root: None,
+            role_ticket_proofs: None,
         };
         let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
             role_reward: node_rr,
@@ -3289,6 +3477,7 @@ mod tests {
             fee_bps: 0,
             fee_pkh: [0u8; 20],
             precommit_root: None,
+            role_ticket_proofs: None,
         };
         assert_eq!(
             ext.serialize(),
@@ -4669,6 +4858,7 @@ mod tests {
                 fee_bps,
                 fee_pkh,
                 precommit_root: root,
+                role_ticket_proofs: None,
             };
         let fpkh = [0x7Fu8; 20];
         // Pre-6A (no precommit_root): fee parses correctly.
@@ -4690,5 +4880,127 @@ mod tests {
             Some((0, [0u8; 20])),
             "official fee-0 stays fee-0 with precommit_root present"
         );
+    }
+
+    // Phase 21B: pool TicketProofMirror is byte-identical to the node TicketProof,
+    // and a pool ext carrying tickets deserializes via the node lib + each proof
+    // validates against the node validator.
+    #[test]
+    fn phase21b_pool_ticket_mirror_and_ext_parity() {
+        let net = 1u8;
+        let solver = [0xC7u8; 20];
+        let apk = [0x02u8; 33];
+        let nonce = [0x44u8; 32];
+        // (1) ticket proof byte-identity vs node.
+        let pm = TicketProofMirror::new(
+            net,
+            5,
+            ROLE_VERIFY_CONTRIBUTOR,
+            solver,
+            2,
+            100,
+            apk,
+            nonce,
+            0,
+        );
+        let nb = irium_node_rs::poawx_ticket::TicketProof::new(
+            net,
+            5,
+            irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR,
+            solver,
+            2,
+            100,
+            apk,
+            nonce,
+            0,
+        );
+        assert_eq!(
+            pm.serialize(),
+            nb.serialize(),
+            "ticket proof mirror byte-identical"
+        );
+        let parsed =
+            irium_node_rs::poawx_ticket::TicketProof::deserialize(&pm.serialize()).unwrap();
+        assert!(parsed
+            .validate(
+                net,
+                5,
+                irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR,
+                &solver,
+                0,
+                false
+            )
+            .is_ok());
+        // (2) full pool ext WITH ticket proofs -> node deserialize -> proofs present + each validates.
+        let prev = [0x55u8; 32];
+        let h = 5u64;
+        let c = [0xA1u8; 20];
+        let v = [0xA2u8; 20];
+        let s = [0xA3u8; 20];
+        let mk_claim = |role: u8, solver: [u8; 20]| PoawxRoleClaimMirror {
+            role_id: role,
+            lane_id: assign_lane_id(net, h, &prev, role, 0),
+            solver_pkh: solver,
+            nonce: [role; 32],
+            secret: [role.wrapping_add(9); 32],
+            claim_digest: role_claim_digest(
+                net,
+                h,
+                &prev,
+                role,
+                assign_lane_id(net, h, &prev, role, 0),
+                &solver,
+                &[role; 32],
+                &[role.wrapping_add(9); 32],
+            ),
+            commitment_hash: None,
+        };
+        let rr = RoleRewardMirror {
+            compute_contributor_pkh: c,
+            verify_contributor_pkh: v,
+            support_contributor_pkh: s,
+        };
+        let ext = Phase20ReceiptExtMirror {
+            role_reward: rr.clone(),
+            compute_claim: mk_claim(ROLE_COMPUTE_CONTRIBUTOR, c),
+            verify_claim: mk_claim(ROLE_VERIFY_CONTRIBUTOR, v),
+            support_claim: mk_claim(ROLE_SUPPORT_CONTRIBUTOR, s),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: Some(build_role_ticket_proofs(net, h, &rr)),
+        };
+        let node_ext =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        let proofs = node_ext
+            .role_ticket_proofs
+            .expect("node sees ticket proofs from pool ext");
+        let roles = [
+            (irium_node_rs::poawx::ROLE_COMPUTE_CONTRIBUTOR, c),
+            (irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR, v),
+            (irium_node_rs::poawx::ROLE_SUPPORT_CONTRIBUTOR, s),
+        ];
+        for (j, (role_id, pkh)) in roles.iter().enumerate() {
+            assert!(
+                proofs[j].validate(net, h, *role_id, pkh, 0, false).is_ok(),
+                "node validates pool-built ticket proof for role {role_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase21b_pool_tickets_enforced_gate() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TICKETS_REQUIRED", "1");
+        assert!(pool_tickets_enforced(5), "gate on in testnet");
+        std::env::remove_var("IRIUM_POAWX_TICKETS_REQUIRED");
+        assert!(!pool_tickets_enforced(5), "no required flag -> off");
+        std::env::remove_var("IRIUM_NETWORK"); // mainnet
+        std::env::set_var("IRIUM_POAWX_TICKETS_REQUIRED", "1");
+        assert!(!pool_tickets_enforced(5), "mainnet hard-off");
+        std::env::remove_var("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TICKETS_REQUIRED");
     }
 }

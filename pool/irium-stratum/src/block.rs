@@ -457,6 +457,7 @@ mod tests {
             fee_bps: 0,
             fee_pkh: [0u8; 20],
             precommit_root: None,
+            role_ticket_proofs: None,
         };
         let worker_pkh = [0xabu8; 20];
         let sol = [0x01u8; 8];
