@@ -1330,6 +1330,321 @@ pub fn role_reward_pkhs_from_ext_hex(ext_hex: &str) -> Option<([u8; 20], [u8; 20
     Some((c, v, s))
 }
 
+// ── Phase 20 Step 6B: local/testnet role precommit + reveal collection ───────
+//
+// Real (non-synthetic) role data for Phase 20 production. A miner submits a
+// PRECOMMIT before the target height (hides secret/nonce via commitment_hash) and
+// a REVEAL at the target height (carries secret/nonce + claim fields). The pool
+// collects them in a height-keyed store, selects exactly one canonical reveal per
+// role (COMPUTE/VERIFY/SUPPORT), and produces the Phase 20 ext from them. Uses the
+// Step 6A primitives (one hashing model). Loopback-only, testnet/devnet-gated,
+// mainnet hard-off. NOT public networking — submissions arrive on the existing
+// loopback delegation server, operator-mediated like the delegation flow.
+
+/// Window (in heights) beyond which stale precommits/reveals are pruned.
+pub const ROLE_PROTOCOL_HEIGHT_WINDOW: u64 = 64;
+
+/// Whether the local/testnet role precommit+reveal protocol is enabled
+/// (`IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1`). Mainnet hard-off; default off.
+pub fn role_protocol_enabled() -> bool {
+    if network_id_from_env() == 0 {
+        return false; // mainnet
+    }
+    env::var("IRIUM_POAWX_ROLE_PROTOCOL_ENABLED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+fn decode20(s: &str) -> Option<[u8; 20]> {
+    let b = hex::decode(s.trim()).ok()?;
+    if b.len() != 20 {
+        return None;
+    }
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&b);
+    Some(a)
+}
+
+fn is_production_role(role_id: u8) -> bool {
+    matches!(
+        role_id,
+        ROLE_COMPUTE_CONTRIBUTOR | ROLE_VERIFY_CONTRIBUTOR | ROLE_SUPPORT_CONTRIBUTOR
+    )
+}
+
+/// Role precommit wire DTO (loopback JSON). HIDES secret/nonce — only the
+/// `commitment_hash` is carried. `worker` is optional identity metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolePrecommitDto {
+    pub network_id: u8,
+    pub target_height: u64,
+    pub role_id: u8,
+    pub solver_pkh: String,
+    pub commitment_hash: String,
+    #[serde(default)]
+    pub worker: String,
+}
+
+/// Role reveal wire DTO (loopback JSON). Carries secret/nonce + the claim fields
+/// `validate_role_claim` needs; the secret/nonce reconstruct `commitment_hash`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleRevealDto {
+    pub network_id: u8,
+    pub target_height: u64,
+    pub role_id: u8,
+    pub lane_id: u8,
+    pub solver_pkh: String,
+    pub secret: String,
+    pub nonce: String,
+    pub commitment_hash: String,
+    pub claim_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedPrecommit {
+    pub network_id: u8,
+    pub target_height: u64,
+    pub role_id: u8,
+    pub solver_pkh: [u8; 20],
+    pub commitment_hash: [u8; 32],
+}
+
+impl ValidatedPrecommit {
+    pub fn leaf(&self) -> [u8; 32] {
+        role_precommit_leaf(
+            self.network_id,
+            self.target_height,
+            self.role_id,
+            &self.solver_pkh,
+            &self.commitment_hash,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedReveal {
+    pub network_id: u8,
+    pub target_height: u64,
+    pub claim: PoawxRoleClaimMirror,
+}
+
+impl RolePrecommitDto {
+    /// Validate a precommit against the expected network. Checks role id, hex
+    /// fields, and network. Does NOT (cannot) see the secret/nonce.
+    pub fn validate(&self, expected_network: u8) -> Result<ValidatedPrecommit, String> {
+        if expected_network == 0 {
+            return Err("role precommit: mainnet hard-off".to_string());
+        }
+        if self.network_id != expected_network {
+            return Err("role precommit: network_id mismatch".to_string());
+        }
+        if !is_production_role(self.role_id) {
+            return Err(format!("role precommit: bad role_id {}", self.role_id));
+        }
+        let solver_pkh = decode20(&self.solver_pkh).ok_or("role precommit: bad solver_pkh")?;
+        let commitment_hash =
+            decode32(&self.commitment_hash).ok_or("role precommit: bad commitment_hash")?;
+        Ok(ValidatedPrecommit {
+            network_id: self.network_id,
+            target_height: self.target_height,
+            role_id: self.role_id,
+            solver_pkh,
+            commitment_hash,
+        })
+    }
+}
+
+impl RoleRevealDto {
+    /// Validate a reveal: hex fields, role, network, AND the commitment binding —
+    /// `commitment_hash == role_precommit_commitment(secret,nonce)` — so a mutated
+    /// secret/nonce fails closed. Produces a `PoawxRoleClaimMirror`.
+    pub fn validate(&self, expected_network: u8) -> Result<ValidatedReveal, String> {
+        if expected_network == 0 {
+            return Err("role reveal: mainnet hard-off".to_string());
+        }
+        if self.network_id != expected_network {
+            return Err("role reveal: network_id mismatch".to_string());
+        }
+        if !is_production_role(self.role_id) {
+            return Err(format!("role reveal: bad role_id {}", self.role_id));
+        }
+        let solver_pkh = decode20(&self.solver_pkh).ok_or("role reveal: bad solver_pkh")?;
+        let secret = decode32(&self.secret).ok_or("role reveal: bad secret")?;
+        let nonce = decode32(&self.nonce).ok_or("role reveal: bad nonce")?;
+        let commitment_hash =
+            decode32(&self.commitment_hash).ok_or("role reveal: bad commitment_hash")?;
+        let claim_digest = decode32(&self.claim_digest).ok_or("role reveal: bad claim_digest")?;
+        if role_precommit_commitment(&secret, &nonce) != commitment_hash {
+            return Err("role reveal: commitment_hash != H(secret||nonce)".to_string());
+        }
+        Ok(ValidatedReveal {
+            network_id: self.network_id,
+            target_height: self.target_height,
+            claim: PoawxRoleClaimMirror {
+                role_id: self.role_id,
+                lane_id: self.lane_id,
+                solver_pkh,
+                nonce,
+                secret,
+                claim_digest,
+                commitment_hash: Some(commitment_hash),
+            },
+        })
+    }
+}
+
+/// In-memory, height-keyed store of collected precommits + reveals. Loopback-fed.
+#[derive(Default)]
+pub struct RoleProtocolStore {
+    precommits: Mutex<BTreeMap<(u64, u8, [u8; 20]), ValidatedPrecommit>>,
+    reveals: Mutex<BTreeMap<(u64, u8, [u8; 20]), ValidatedReveal>>,
+}
+
+impl RoleProtocolStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accept a validated precommit. Duplicate (same target/role/solver) with the
+    /// SAME commitment is idempotent; with a DIFFERENT commitment is rejected
+    /// (deterministic: first-writer-wins, no silent overwrite).
+    pub fn add_precommit(&self, p: ValidatedPrecommit) -> Result<(), String> {
+        let mut g = self.precommits.lock().unwrap_or_else(|e| e.into_inner());
+        let k = (p.target_height, p.role_id, p.solver_pkh);
+        match g.get(&k) {
+            Some(existing) if existing.commitment_hash != p.commitment_hash => {
+                return Err("role precommit: duplicate with different commitment".to_string());
+            }
+            Some(_) => return Ok(()), // idempotent
+            None => {}
+        }
+        g.insert(k, p);
+        Ok(())
+    }
+
+    /// Accept a validated reveal — ONLY if a matching precommit (same target/role/
+    /// solver and commitment) exists. Duplicate same-claim reveal is idempotent;
+    /// a differing duplicate is rejected.
+    pub fn add_reveal(&self, r: ValidatedReveal) -> Result<(), String> {
+        let k = (r.target_height, r.claim.role_id, r.claim.solver_pkh);
+        {
+            let pg = self.precommits.lock().unwrap_or_else(|e| e.into_inner());
+            match pg.get(&k) {
+                Some(pc) if Some(pc.commitment_hash) == r.claim.commitment_hash => {}
+                _ => return Err("role reveal: no matching precommit".to_string()),
+            }
+        }
+        let mut g = self.reveals.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get(&k) {
+            Some(existing) if existing.claim != r.claim => {
+                return Err("role reveal: duplicate with different claim".to_string());
+            }
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        g.insert(k, r);
+        Ok(())
+    }
+
+    /// Drop precommits/reveals targeting heights at/below `tip - WINDOW`.
+    pub fn prune(&self, tip_height: u64) {
+        let cutoff = tip_height.saturating_sub(ROLE_PROTOCOL_HEIGHT_WINDOW);
+        self.precommits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| k.0 > cutoff);
+        self.reveals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| k.0 > cutoff);
+    }
+
+    /// Deterministic one-per-role precommit selection for `target_height`: the
+    /// precommit with the smallest (solver_pkh, commitment_hash). None if absent.
+    pub fn canonical_precommit(&self, target_height: u64, role_id: u8) -> Option<ValidatedPrecommit> {
+        let g = self.precommits.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter()
+            .filter(|((t, r, _), _)| *t == target_height && *r == role_id)
+            .map(|(_, v)| v.clone())
+            .min_by(|a, b| {
+                (a.solver_pkh, a.commitment_hash).cmp(&(b.solver_pkh, b.commitment_hash))
+            })
+    }
+
+    /// The precommit root committing `target_height`'s canonical leaves (one per
+    /// role). None unless all three roles have a precommit.
+    pub fn precommit_root_for(&self, target_height: u64) -> Option<[u8; 32]> {
+        let roles = [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ];
+        let mut leaves = Vec::with_capacity(3);
+        for r in roles {
+            leaves.push(self.canonical_precommit(target_height, r)?.leaf());
+        }
+        Some(role_precommit_root(&leaves))
+    }
+
+    /// Select exactly one valid reveal per role for `target_height`, each matching
+    /// that role's canonical precommit. Returns [compute, verify, support] or None
+    /// if any role is missing a matching reveal.
+    pub fn select_reveals(&self, target_height: u64) -> Option<[ValidatedReveal; 3]> {
+        let roles = [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ];
+        let mut picked: Vec<ValidatedReveal> = Vec::with_capacity(3);
+        for r in roles {
+            let pc = self.canonical_precommit(target_height, r)?;
+            let g = self.reveals.lock().unwrap_or_else(|e| e.into_inner());
+            let rv = g.get(&(target_height, r, pc.solver_pkh)).cloned()?;
+            if rv.claim.commitment_hash != Some(pc.commitment_hash) {
+                return None;
+            }
+            picked.push(rv);
+        }
+        Some([picked[0].clone(), picked[1].clone(), picked[2].clone()])
+    }
+}
+
+/// Build the Phase 20 reveal-side extension at block `height` from COLLECTED role
+/// data: claims + RoleReward come from the selected reveals; `precommit_root`
+/// commits the NEXT height's collected precommits. Returns None (caller falls back)
+/// unless the role protocol is enabled and BOTH this height's reveals and the next
+/// height's precommits are present. Mainnet hard-off. `fee` layers the (validated)
+/// third-party fee terms; None/invalid => official 0%.
+pub fn build_collected_phase20_ext(
+    store: &RoleProtocolStore,
+    network_id: u8,
+    height: u64,
+    fee: Option<(u16, [u8; 20])>,
+) -> Option<Phase20ReceiptExtMirror> {
+    if network_id == 0 || !role_protocol_enabled() {
+        return None;
+    }
+    let reveals = store.select_reveals(height)?;
+    let next_root = store.precommit_root_for(height + 1)?;
+    let (fee_bps, fee_pkh) = match fee {
+        Some((b, p)) if b >= 1 && b <= THIRD_PARTY_FEE_CAP_BPS && p != [0u8; 20] => (b, p),
+        _ => (0u16, [0u8; 20]),
+    };
+    Some(Phase20ReceiptExtMirror {
+        role_reward: RoleRewardMirror {
+            compute_contributor_pkh: reveals[0].claim.solver_pkh,
+            verify_contributor_pkh: reveals[1].claim.solver_pkh,
+            support_contributor_pkh: reveals[2].claim.solver_pkh,
+        },
+        compute_claim: reveals[0].claim.clone(),
+        verify_claim: reveals[1].claim.clone(),
+        support_claim: reveals[2].claim.clone(),
+        fee_bps,
+        fee_pkh,
+        precommit_root: Some(next_root),
+    })
+}
+
 // ── HTTP server (raw-TCP, loopback-only by config; opt-in) ───────────────────
 
 fn poawx_state_dir() -> PathBuf {
@@ -1370,6 +1685,9 @@ pub struct PoawxProducer {
     pub store: Arc<dyn DelegationStore>,
     pub key: Arc<DelegateKey>,
     pub network_id: u8,
+    /// Step 6B: shared role precommit/reveal store (loopback-fed); read by the
+    /// receipt-producer path to build collected Phase 20 exts.
+    pub role_store: Arc<RoleProtocolStore>,
 }
 
 /// Load the producer (delegate key + delegation store). Returns None on mainnet
@@ -1402,6 +1720,7 @@ pub fn load_producer() -> Option<PoawxProducer> {
         store,
         key: Arc::new(key),
         network_id,
+        role_store: Arc::new(RoleProtocolStore::new()),
     })
 }
 
@@ -1650,6 +1969,48 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
                         &serde_json::json!({"error": e.reason()}),
                     )
                     .await
+                }
+            }
+        }
+        // Step 6B: local/testnet role precommit + reveal collection (loopback-only,
+        // gated). Mainnet (producer None) => 503; gate off => 403.
+        ("POST", "/poawx/role-precommit") | ("POST", "/poawx/role-reveal") => {
+            let producer = match &ctx.producer {
+                Some(p) => p,
+                None => {
+                    respond(&mut stream, 503, "Service Unavailable",
+                        &serde_json::json!({"error":"role protocol unavailable on mainnet"})).await;
+                    return;
+                }
+            };
+            if !role_protocol_enabled() {
+                respond(&mut stream, 403, "Forbidden",
+                    &serde_json::json!({"error":"role protocol disabled (set IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1)"})).await;
+                return;
+            }
+            // Opportunistic pruning of stale heights (best-effort).
+            if let Some(tip) = fetch_tip_height(&ctx.rpc_base, &ctx.rpc_token).await {
+                producer.role_store.prune(tip);
+            }
+            let result: Result<&'static str, String> = if path_only == "/poawx/role-precommit" {
+                serde_json::from_slice::<RolePrecommitDto>(&body)
+                    .map_err(|_| "invalid precommit JSON".to_string())
+                    .and_then(|dto| dto.validate(ctx.network_id))
+                    .and_then(|v| producer.role_store.add_precommit(v).map(|_| "precommit"))
+            } else {
+                serde_json::from_slice::<RoleRevealDto>(&body)
+                    .map_err(|_| "invalid reveal JSON".to_string())
+                    .and_then(|dto| dto.validate(ctx.network_id))
+                    .and_then(|v| producer.role_store.add_reveal(v).map(|_| "reveal"))
+            };
+            match result {
+                Ok(kind) => {
+                    respond(&mut stream, 200, "OK",
+                        &serde_json::json!({"status":"accepted","kind":kind})).await
+                }
+                Err(e) => {
+                    respond(&mut stream, 400, "Bad Request",
+                        &serde_json::json!({"error": e})).await
                 }
             }
         }
@@ -2779,5 +3140,166 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
         std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+    }
+
+    // ── Step 6B: role precommit/reveal protocol payloads + store + production ──
+
+    fn mk_precommit_dto(net: u8, h: u64, role: u8, solver: [u8; 20], secret: [u8; 32], nonce: [u8; 32]) -> RolePrecommitDto {
+        RolePrecommitDto {
+            network_id: net,
+            target_height: h,
+            role_id: role,
+            solver_pkh: hex::encode(solver),
+            commitment_hash: hex::encode(role_precommit_commitment(&secret, &nonce)),
+            worker: String::new(),
+        }
+    }
+    fn mk_reveal_dto(net: u8, h: u64, prev: &[u8; 32], role: u8, solver: [u8; 20], secret: [u8; 32], nonce: [u8; 32]) -> RoleRevealDto {
+        let lane = assign_lane_id(net, h, prev, role, 0);
+        let cd = role_claim_digest(net, h, prev, role, lane, &solver, &nonce, &secret);
+        RoleRevealDto {
+            network_id: net,
+            target_height: h,
+            role_id: role,
+            lane_id: lane,
+            solver_pkh: hex::encode(solver),
+            secret: hex::encode(secret),
+            nonce: hex::encode(nonce),
+            commitment_hash: hex::encode(role_precommit_commitment(&secret, &nonce)),
+            claim_digest: hex::encode(cd),
+        }
+    }
+
+    #[test]
+    fn phase20_role_protocol_payloads_and_store() {
+        let net = 1u8;
+        let prev = [0x77u8; 32];
+        let roles = [ROLE_COMPUTE_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR];
+        let solvers = [[0xA1u8; 20], [0xA2u8; 20], [0xA3u8; 20]];
+        let sn = |role: u8| ([role; 32], [role.wrapping_add(100); 32]);
+
+        // --- payloads ---
+        let (s, n) = sn(ROLE_COMPUTE_CONTRIBUTOR);
+        let pc = mk_precommit_dto(net, 2, ROLE_COMPUTE_CONTRIBUTOR, solvers[0], s, n);
+        // precommit hides secret/nonce (DTO has no such fields).
+        let pc_json = serde_json::to_string(&pc).unwrap();
+        assert!(!pc_json.contains(&hex::encode(s)) && !pc_json.contains(&hex::encode(n)), "precommit hides secret/nonce");
+        // JSON round-trip.
+        let pc2: RolePrecommitDto = serde_json::from_str(&pc_json).unwrap();
+        assert_eq!(pc2.validate(net).unwrap(), pc.validate(net).unwrap());
+        let rv = mk_reveal_dto(net, 2, &prev, ROLE_COMPUTE_CONTRIBUTOR, solvers[0], s, n);
+        let rv2: RoleRevealDto = serde_json::from_str(&serde_json::to_string(&rv).unwrap()).unwrap();
+        // reveal reconstructs commitment_hash from secret/nonce (validate succeeds).
+        let vr = rv2.validate(net).unwrap();
+        assert_eq!(vr.claim.commitment_hash, Some(role_precommit_commitment(&s, &n)));
+        // mutation: a reveal whose commitment doesn't match secret/nonce rejects.
+        let mut bad = rv.clone();
+        bad.commitment_hash = hex::encode([0xEEu8; 32]);
+        assert!(bad.validate(net).is_err(), "mutated commitment rejects");
+        let mut bad2 = rv.clone();
+        bad2.secret = hex::encode([0x00u8; 32]);
+        assert!(bad2.validate(net).is_err(), "mutated secret rejects");
+        // wrong network / role rejects.
+        assert!(pc.validate(2).is_err(), "wrong network");
+        let mut badrole = pc.clone();
+        badrole.role_id = 9;
+        assert!(badrole.validate(net).is_err(), "bad role");
+        // wrong solver hex rejects.
+        let mut badsolver = pc.clone();
+        badsolver.solver_pkh = "zz".to_string();
+        assert!(badsolver.validate(net).is_err(), "bad solver");
+
+        // --- store ---
+        let store = RoleProtocolStore::new();
+        // accept all 3 roles for height 2 + 3 for height 3 (next).
+        for h in [2u64, 3u64] {
+            for (i, &role) in roles.iter().enumerate() {
+                let (s, n) = sn(role);
+                store.add_precommit(mk_precommit_dto(net, h, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+            }
+        }
+        // duplicate same-commitment is idempotent; different-commitment rejects.
+        let (s0, n0) = sn(ROLE_COMPUTE_CONTRIBUTOR);
+        store.add_precommit(mk_precommit_dto(net, 2, ROLE_COMPUTE_CONTRIBUTOR, solvers[0], s0, n0).validate(net).unwrap()).unwrap();
+        let mut diff = mk_precommit_dto(net, 2, ROLE_COMPUTE_CONTRIBUTOR, solvers[0], s0, n0);
+        diff.commitment_hash = hex::encode([0x01u8; 32]);
+        assert!(store.add_precommit(diff.validate(net).unwrap()).is_err(), "dup different commitment rejects");
+        // reveal without precommit rejects (height 2, solver not precommitted).
+        let orphan = mk_reveal_dto(net, 2, &prev, ROLE_COMPUTE_CONTRIBUTOR, [0xBBu8; 20], s0, n0);
+        assert!(store.add_reveal(orphan.validate(net).unwrap()).is_err(), "reveal w/o precommit rejects");
+        // valid reveals for height 2 accepted.
+        for (i, &role) in roles.iter().enumerate() {
+            let (s, n) = sn(role);
+            store.add_reveal(mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+        }
+        // selection: one per role; precommit_root deterministic.
+        let sel = store.select_reveals(2).expect("3 reveals");
+        assert_eq!(sel[0].claim.role_id, ROLE_COMPUTE_CONTRIBUTOR);
+        assert_eq!(sel[2].claim.role_id, ROLE_SUPPORT_CONTRIBUTOR);
+        let root2 = store.precommit_root_for(2).expect("root2");
+        assert_eq!(root2, store.precommit_root_for(2).unwrap(), "deterministic");
+        assert!(store.precommit_root_for(3).is_some(), "next-height root present");
+        // prune drops stale (window 64): targeting tip far ahead removes height 2/3.
+        store.prune(2 + ROLE_PROTOCOL_HEIGHT_WINDOW + 5);
+        assert!(store.precommit_root_for(2).is_none(), "pruned stale");
+    }
+
+    #[test]
+    fn phase20_role_protocol_collected_production_and_node_parity() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_ROLE_PROTOCOL_ENABLED", "1");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", "1");
+        let net = 1u8;
+        let prev = [0x55u8; 32];
+        let roles = [ROLE_COMPUTE_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR];
+        let solvers = [[0xA1u8; 20], [0xA2u8; 20], [0xA3u8; 20]];
+        let sn = |role: u8| ([role; 32], [role.wrapping_add(50); 32]);
+        let store = RoleProtocolStore::new();
+        // precommits+reveals for height 2; precommits for height 3 (next).
+        for (i, &role) in roles.iter().enumerate() {
+            let (s, n) = sn(role);
+            store.add_precommit(mk_precommit_dto(net, 2, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+            store.add_precommit(mk_precommit_dto(net, 3, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+            store.add_reveal(mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+        }
+        // COLLECTED production ext for height 2.
+        let ext = build_collected_phase20_ext(&store, net, 2, None).expect("collected ext");
+        assert_eq!(ext.precommit_root, store.precommit_root_for(3), "commits next-height root");
+        assert_eq!(ext.role_reward.compute_contributor_pkh, solvers[0]);
+
+        // Node parity: each revealed claim validates against fairness + reconstructs
+        // a leaf; the sorted root equals the PARENT's committed root (root_for(2)).
+        let node_ext = irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        let mut leaves = Vec::new();
+        for c in [&node_ext.compute_claim, &node_ext.verify_claim, &node_ext.support_claim] {
+            irium_node_rs::poawx::validate_role_claim(c, net, 2, &prev, 0).expect("claim valid");
+            leaves.push(irium_node_rs::poawx::role_precommit_leaf_for_claim(c, net, 2).expect("leaf"));
+        }
+        assert_eq!(irium_node_rs::poawx::role_precommit_root(&leaves), store.precommit_root_for(2).unwrap(),
+            "reveal leaves root == parent committed root");
+
+        // missing role reveal => fail closed (None) after activation.
+        let store2 = RoleProtocolStore::new();
+        for (i, &role) in roles.iter().enumerate().take(2) {
+            let (s, n) = sn(role);
+            store2.add_precommit(mk_precommit_dto(net, 2, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+            store2.add_reveal(mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+        }
+        assert!(build_collected_phase20_ext(&store2, net, 2, None).is_none(), "missing role => fail closed");
+
+        // off-path: role protocol disabled => None (falls back to synthetic upstream).
+        std::env::remove_var("IRIUM_POAWX_ROLE_PROTOCOL_ENABLED");
+        assert!(build_collected_phase20_ext(&store, net, 2, None).is_none(), "disabled => None");
+        // mainnet hard-off.
+        assert!(build_collected_phase20_ext(&store, 0, 2, None).is_none(), "mainnet hard-off");
+        assert!(!role_protocol_enabled(), "gate off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT");
     }
 }

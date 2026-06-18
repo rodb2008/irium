@@ -1464,27 +1464,53 @@ fn build_session_poawx_receipts(
                 } else {
                     None
                 };
-                match crate::delegation::build_synthetic_phase20_ext(
+                // Step 6B priority: (1) real COLLECTED role data (precommit/reveal
+                // protocol) if enabled + complete; (2) SYNTHETIC fallback only when
+                // IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1; (3) otherwise NO ext (the node
+                // fails closed after activation — never fakes claims).
+                let collected = crate::delegation::build_collected_phase20_ext(
+                    producer.role_store.as_ref(),
                     producer.network_id,
                     ctx.block_height,
-                    &job.prev_hash,
-                    pkh,
-                    &[],
                     fee,
-                ) {
+                );
+                let chosen = match collected {
                     Some(ext) => {
-                        receipt.phase20_ext = hex::encode(ext.serialize());
                         if trace {
                             info!(
-                                "[poawx-trace] phase20 synthetic ext attached block_h={} (official fee-0)",
+                                "[poawx-trace] phase20 COLLECTED role-protocol ext attached block_h={}",
                                 ctx.block_height
                             );
                         }
+                        Some(ext)
+                    }
+                    None => {
+                        let syn = crate::delegation::build_synthetic_phase20_ext(
+                            producer.network_id,
+                            ctx.block_height,
+                            &job.prev_hash,
+                            pkh,
+                            &[],
+                            fee,
+                        );
+                        if trace {
+                            info!(
+                                "[poawx-trace] phase20 ext source block_h={} collected=none synthetic={} ",
+                                ctx.block_height,
+                                syn.is_some()
+                            );
+                        }
+                        syn
+                    }
+                };
+                match chosen {
+                    Some(ext) => {
+                        receipt.phase20_ext = hex::encode(ext.serialize());
                     }
                     None => {
                         if trace {
                             info!(
-                                "[poawx-trace] phase20 production active but synthetic claims disabled block_h={}; no ext attached (node will fail closed)",
+                                "[poawx-trace] phase20 production active but no collected/synthetic claims block_h={}; no ext attached (node will fail closed)",
                                 ctx.block_height
                             );
                         }
