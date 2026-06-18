@@ -1643,6 +1643,51 @@ impl RoleCandidateMirror {
         out
     }
 
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() != ROLE_CANDIDATE_WIRE {
+            return Err("role candidate mirror: bad length".to_string());
+        }
+        let mut p = 0usize;
+        let take = |p: &mut usize, n: usize| -> Vec<u8> {
+            let v = raw[*p..*p + n].to_vec();
+            *p += n;
+            v
+        };
+        let role_id = raw[p];
+        p += 1;
+        let mut solver_pkh = [0u8; 20];
+        solver_pkh.copy_from_slice(&take(&mut p, 20));
+        let mut assignment_public_key = [0u8; 33];
+        assignment_public_key.copy_from_slice(&take(&mut p, 33));
+        let mut ticket_digest = [0u8; 32];
+        ticket_digest.copy_from_slice(&take(&mut p, 32));
+        let penalty_status = raw[p];
+        p += 1;
+        let mut assignment_proof_digest = [0u8; 32];
+        assignment_proof_digest.copy_from_slice(&take(&mut p, 32));
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&take(&mut p, 8));
+        let dominance_weight = u64::from_le_bytes(w);
+        w.copy_from_slice(&take(&mut p, 8));
+        let penalty_weight = u64::from_le_bytes(w);
+        w.copy_from_slice(&take(&mut p, 8));
+        let effective_score = u64::from_le_bytes(w);
+        let mut role_claim_digest = [0u8; 32];
+        role_claim_digest.copy_from_slice(&take(&mut p, 32));
+        Ok(Self {
+            role_id,
+            solver_pkh,
+            assignment_public_key,
+            ticket_digest,
+            penalty_status,
+            assignment_proof_digest,
+            dominance_weight,
+            penalty_weight,
+            effective_score,
+            role_claim_digest,
+        })
+    }
+
     fn sort_key(&self) -> ([u8; 1], [u8; 20], [u8; 32], [u8; 32]) {
         (
             [self.role_id],
@@ -1793,6 +1838,134 @@ pub fn build_pool_candidate_set(
     cs
 }
 
+/// ── Phase 21E: candidate-admission (pool side) ──────────────────────────────
+/// The pool builds its block candidate set strictly from the node's ADMITTED
+/// candidates (fetched via loopback RPC) so it matches what the node validates.
+/// The node remains authoritative; the pool is one interface, not the owner.
+pub const CANDIDATE_ADMISSION_WIRE: usize = 1 + 1 + 8 + 32 + 175 + 32; // 249
+
+/// Pool candidate-admission enforcement gate (mirror node).
+pub fn pool_candidate_admission_enforced(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false;
+    }
+    let active = match env::var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    };
+    let required = env::var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    active && required
+}
+
+/// Decode one admission wire (hex) -> (height, seed, candidate). None on malformed.
+pub fn decode_admission_candidate(hexstr: &str) -> Option<(u64, [u8; 32], RoleCandidateMirror)> {
+    let bytes = hex::decode(hexstr.trim()).ok()?;
+    if bytes.len() != CANDIDATE_ADMISSION_WIRE || bytes[0] != 1 {
+        return None;
+    }
+    let mut hb = [0u8; 8];
+    hb.copy_from_slice(&bytes[2..10]);
+    let height = u64::from_le_bytes(hb);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes[10..42]);
+    let candidate = RoleCandidateMirror::deserialize(&bytes[42..42 + 175]).ok()?;
+    Some((height, seed, candidate))
+}
+
+/// Build the admitted candidate set for (height, seed) from fetched admission
+/// hex strings. None when no admitted candidate matches (caller fails closed).
+pub fn build_admitted_candidate_set(
+    hexes: &[String],
+    network_id: u8,
+    height: u64,
+    seed: &[u8; 32],
+) -> Option<CandidateSetMirror> {
+    let mut cs = CandidateSetMirror::new(network_id, height, *seed);
+    for h in hexes {
+        if let Some((hh, ss, cand)) = decode_admission_candidate(h) {
+            if hh == height && &ss == seed {
+                cs.push(cand);
+            }
+        }
+    }
+    if cs.candidates.is_empty() {
+        return None;
+    }
+    cs.sort_canonical();
+    Some(cs)
+}
+
+/// Process-global pool cache of fetched admission hexes per height.
+pub fn pool_admitted_cache() -> &'static std::sync::Mutex<BTreeMap<u64, Vec<String>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<BTreeMap<u64, Vec<String>>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Build the candidate set for a produced ext from the pool admitted cache.
+pub fn build_pool_candidate_set_for_height(
+    network_id: u8,
+    height: u64,
+    seed: &[u8; 32],
+) -> Option<CandidateSetMirror> {
+    let cache = pool_admitted_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hexes = cache.get(&height).cloned().unwrap_or_default();
+    drop(cache);
+    build_admitted_candidate_set(&hexes, network_id, height, seed)
+}
+
+/// Fetch node-admitted candidate admissions for a height (hex; empty on error).
+pub async fn fetch_node_candidate_admissions(
+    rpc_base: &str,
+    rpc_token: &str,
+    target_height: u64,
+) -> Vec<String> {
+    let url = format!(
+        "{}/poawx/candidate-admissions?target_height={}",
+        rpc_base.trim_end_matches('/'),
+        target_height
+    );
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let resp = match client.get(&url).bearer_auth(rpc_token).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        admissions: Vec<String>,
+    }
+    match resp.json::<Resp>().await {
+        Ok(r) => r.admissions,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Refresh the pool admitted cache for a height from the node (best-effort; no-op
+/// unless candidate-admission is enforced).
+pub async fn refresh_pool_admitted_cache(rpc_base: &str, rpc_token: &str, height: u64) {
+    if !pool_candidate_admission_enforced(height) {
+        return;
+    }
+    let hexes = fetch_node_candidate_admissions(rpc_base, rpc_token, height).await;
+    let mut cache = pool_admitted_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.insert(height, hexes);
+    // bound memory: keep only recent heights.
+    let keep_floor = height.saturating_sub(64);
+    cache.retain(|h, _| *h >= keep_floor);
+}
+
 pub fn build_synthetic_phase20_ext(
     network_id: u8,
     height: u64,
@@ -1879,7 +2052,14 @@ pub fn build_synthetic_phase20_ext(
     };
     // Phase 21D: attach the candidate set when enforcement is on (else None =>
     // byte-identical; node fails closed when required).
-    let candidate_set = if pool_candidate_set_enforced(height) {
+    let candidate_set = if pool_candidate_admission_enforced(height) {
+        // Phase 21E: build strictly from node-ADMITTED candidates; fail closed
+        // if the admitted cache is unavailable/empty (no fake set produced).
+        match build_pool_candidate_set_for_height(network_id, height, prev_hash) {
+            Some(cs) => Some(cs),
+            None => return None,
+        }
+    } else if pool_candidate_set_enforced(height) {
         Some(build_pool_candidate_set(
             network_id,
             height,
@@ -2296,7 +2476,14 @@ pub fn build_collected_phase20_ext(
     };
     // Phase 21D: attach the candidate set when enforcement is on (else None =>
     // byte-identical; node fails closed when required).
-    let candidate_set = if pool_candidate_set_enforced(height) {
+    let candidate_set = if pool_candidate_admission_enforced(height) {
+        // Phase 21E: build strictly from node-ADMITTED candidates; fail closed
+        // if the admitted cache is unavailable/empty (no fake set produced).
+        match build_pool_candidate_set_for_height(network_id, height, prev_hash) {
+            Some(cs) => Some(cs),
+            None => return None,
+        }
+    } else if pool_candidate_set_enforced(height) {
         Some(build_pool_candidate_set(
             network_id,
             height,
@@ -3954,6 +4141,110 @@ mod tests {
         // RoleReward pkhs extractable from the hex without full deserialize.
         let (c, v, s) = role_reward_pkhs_from_ext_hex(&hex::encode(ext.serialize())).unwrap();
         assert_eq!((c, v, s), ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]));
+    }
+
+    #[test]
+    fn phase21e_pool_admitted_candidate_set_parity_and_failclosed() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        let net = network_id_from_env();
+        assert!(pool_candidate_admission_enforced(1), "enforced on testnet");
+
+        let h = 5u64;
+        let seed = [0x44u8; 32];
+        use irium_node_rs::poawx_admission::CandidateAdmissionV1 as NAV;
+        use irium_node_rs::poawx_candidate::RoleCandidate as NRC;
+        let mk = |role: u8, solver: [u8; 20], tag: u8| {
+            NRC::build(
+                net,
+                h,
+                &seed,
+                role,
+                solver,
+                [0x02u8; 33],
+                [tag; 32],
+                0,
+                1000,
+                [tag.wrapping_add(1); 32],
+            )
+        };
+        let cands = [
+            mk(1, [0xC1u8; 20], 0x11),
+            mk(2, [0xC2u8; 20], 0x12),
+            mk(3, [0xC3u8; 20], 0x13),
+        ];
+        let hexes: Vec<String> = cands
+            .iter()
+            .map(|c| hex::encode(NAV::new(net, h, seed, c.clone()).serialize()))
+            .collect();
+
+        // pool builds the admitted set; must byte-match the node admitted set.
+        let pool_cs = build_admitted_candidate_set(&hexes, net, h, &seed).expect("set");
+        let cache = irium_node_rs::poawx_admission::NodeCandidateAdmissionCache::new();
+        cache.set_tip(h);
+        for hx in &hexes {
+            let _ = cache.ingest_bytes(&hex::decode(hx).unwrap());
+        }
+        let node_cs = cache.admitted_candidate_set(net, h, &seed);
+        assert_eq!(
+            pool_cs.serialize(),
+            node_cs.serialize(),
+            "pool admitted set == node admitted set"
+        );
+
+        // decode roundtrip.
+        let (dh, ds, dc) = decode_admission_candidate(&hexes[0]).unwrap();
+        assert_eq!(dh, h);
+        assert_eq!(ds, seed);
+        assert_eq!(
+            dc.serialize(),
+            cands[0].serialize(),
+            "candidate decode parity"
+        );
+
+        // wrong seed => no admitted candidates => None (fail closed).
+        assert!(
+            build_admitted_candidate_set(&hexes, net, h, &[0x99u8; 32]).is_none(),
+            "wrong seed yields empty -> None"
+        );
+
+        // builder fail-closed: admission enforced + empty admitted cache => None ext.
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        assert!(
+            build_synthetic_phase20_ext(net, h, &seed, &[0xA0u8; 20], &[], None).is_none(),
+            "fail closed when admitted cache empty"
+        );
+        // populate cache => builder attaches the admitted set.
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(h, hexes.clone());
+        let ext =
+            build_synthetic_phase20_ext(net, h, &seed, &[0xA0u8; 20], &[], None).expect("ext");
+        assert_eq!(
+            ext.candidate_set.as_ref().unwrap().serialize(),
+            pool_cs.serialize(),
+            "builder attaches the admitted set"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!pool_candidate_admission_enforced(1), "mainnet hard-off");
+
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
     }
 
     #[test]

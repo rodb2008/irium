@@ -1939,6 +1939,15 @@ async fn template_loop(
                             job.height,
                         )
                         .await;
+                        // Phase 21E: pull node-admitted candidates into the pool
+                        // admitted cache before production (best-effort; no-op
+                        // unless candidate-admission enforced).
+                        crate::delegation::refresh_pool_admitted_cache(
+                            &config.rpc_base,
+                            &config.rpc_token,
+                            job.height,
+                        )
+                        .await;
                     }
                 }
                 // Guardrail: refuse stale pre-fork templates once we've
