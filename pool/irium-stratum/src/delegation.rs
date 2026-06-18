@@ -914,14 +914,31 @@ pub fn pool_third_party_fee_terms() -> Option<(u16, [u8; 20])> {
 /// always ends with `fee_bps(2) || fee_pkh(20)`, so they are the last 22 bytes.
 /// Returns None on malformed/short input (fail-closed).
 pub fn fee_terms_from_ext_hex(ext_hex: &str) -> Option<(u16, [u8; 20])> {
+    // Layout: version(1) || role_reward(60) || (len_u16 || claim)×3 || fee_bps(2)
+    //         || fee_pkh(20) || [precommit flag(1) + root(32) IFF Some] (trailing).
+    // Parse from the FRONT, skipping the three variable-length claims, so the
+    // OPTIONAL Step 6A trailing precommit_root is never misread as the fee terms
+    // (the old "last 22 bytes" read broke once precommit_root was appended — it
+    // parsed 32 bytes of the root hash as a spurious fee, adding a bogus 6th
+    // coinbase output that consensus then rejected).
     let b = hex::decode(ext_hex).ok()?;
-    if b.len() < 1 + 60 + 22 {
+    if b.len() < 1 + 60 || b[0] != PHASE20_EXT_VERSION {
         return None;
     }
-    let n = b.len();
-    let fee_bps = u16::from_le_bytes(b[n - 22..n - 20].try_into().ok()?);
+    let mut p = 1 + 60;
+    for _ in 0..3 {
+        if p + 2 > b.len() {
+            return None;
+        }
+        let len = u16::from_le_bytes(b[p..p + 2].try_into().ok()?) as usize;
+        p += 2 + len;
+    }
+    if p + 22 > b.len() {
+        return None;
+    }
+    let fee_bps = u16::from_le_bytes(b[p..p + 2].try_into().ok()?);
     let mut fee_pkh = [0u8; 20];
-    fee_pkh.copy_from_slice(&b[n - 20..n]);
+    fee_pkh.copy_from_slice(&b[p + 2..p + 22]);
     Some((fee_bps, fee_pkh))
 }
 
@@ -4622,5 +4639,56 @@ mod tests {
         );
         std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
         clear_role_gossip_env();
+    }
+
+    // Regression (Step 6E live-E2E finding): fee_terms_from_ext_hex must parse the
+    // fee from the FRONT, not the last 22 bytes — otherwise the OPTIONAL Step 6A
+    // trailing precommit_root is misread as a spurious fee, adding a bogus 6th
+    // coinbase output that consensus rejects ("expected 4 payout outputs, found 5").
+    #[test]
+    fn phase20_fee_terms_from_ext_hex_ignores_trailing_precommit_root() {
+        let claim = PoawxRoleClaimMirror {
+            role_id: ROLE_COMPUTE_CONTRIBUTOR,
+            lane_id: 0,
+            solver_pkh: [9u8; 20],
+            nonce: [1u8; 32],
+            secret: [2u8; 32],
+            claim_digest: [3u8; 32],
+            commitment_hash: Some([4u8; 32]),
+        };
+        let mk =
+            |fee_bps: u16, fee_pkh: [u8; 20], root: Option<[u8; 32]>| Phase20ReceiptExtMirror {
+                role_reward: RoleRewardMirror {
+                    compute_contributor_pkh: [1u8; 20],
+                    verify_contributor_pkh: [2u8; 20],
+                    support_contributor_pkh: [3u8; 20],
+                },
+                compute_claim: claim.clone(),
+                verify_claim: claim.clone(),
+                support_claim: claim.clone(),
+                fee_bps,
+                fee_pkh,
+                precommit_root: root,
+            };
+        let fpkh = [0x7Fu8; 20];
+        // Pre-6A (no precommit_root): fee parses correctly.
+        assert_eq!(
+            fee_terms_from_ext_hex(&hex::encode(mk(200, fpkh, None).serialize())),
+            Some((200, fpkh))
+        );
+        // 6A+ (precommit_root present): trailing root must NOT corrupt the fee parse.
+        assert_eq!(
+            fee_terms_from_ext_hex(&hex::encode(mk(200, fpkh, Some([0xABu8; 32])).serialize())),
+            Some((200, fpkh)),
+            "trailing precommit_root must not be misread as fee"
+        );
+        // Official fee-0 WITH precommit_root stays fee-0 (no spurious fee output).
+        assert_eq!(
+            fee_terms_from_ext_hex(&hex::encode(
+                mk(0, [0u8; 20], Some([0xCDu8; 32])).serialize()
+            )),
+            Some((0, [0u8; 20])),
+            "official fee-0 stays fee-0 with precommit_root present"
+        );
     }
 }
