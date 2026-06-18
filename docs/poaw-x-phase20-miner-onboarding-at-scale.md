@@ -61,6 +61,16 @@ flow into a repeatable onboarding runbook for additional trusted miners.
 > caveat (remote CPU connects/authorizes/receives work but may not land a diff-1 share — an
 > environment limitation, not Phase 20 logic). Mainnet remains disabled; LWMA-144 untouched.
 
+> **External trusted-miner test (Phase 20 Step 7A, PREPARED — not yet run).** The test pack +
+> exact operator preflight for the public/external **non-self-operated** miner test is in
+> `poaw-x-phase20-external-miner-test-plan.md`; the simple miner-facing invite (stock cpuminer +
+> emit-only wallet helpers, **no private key ever shared**) is in
+> `poaw-x-phase20-trusted-miner-invite.md`. Step 7A is docs-only: no endpoints exposed, no ports
+> bound, no firewall changes, no invites sent. Only the **stratum** (and optionally **P2P**) is
+> ever public and only **source-restricted to the miner's IP**; delegation/RPC/status/metrics/role
+> stay loopback-only. Mainnet disabled; official pool 0%; third-party fee explicit-only; LWMA-144
+> automatic.
+
 ## 1. Miner requirements
 - A stock SHA-256d CPU miner (`cpuminer`/`minerd`) — unchanged, no version-rolling needed.
 - The Irium wallet binary with `poawx-register --emit-only` (Phase 19B+).
