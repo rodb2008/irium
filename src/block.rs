@@ -983,6 +983,7 @@ mod fix2a_boundary_tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
         let mut r = make_receipt(7);
         r.phase20_ext = Some(ext);

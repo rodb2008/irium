@@ -3,6 +3,7 @@
 //! Env-var reads are intentionally absent here — callers own activation gating.
 
 use crate::block::Block;
+use crate::poawx_candidate::{CandidateSet, CANDIDATE_SECTION_MAGIC};
 use crate::poawx_dominance::{DOMINANCE_SECTION_MAGIC, DOMINANCE_WEIGHTS_WIRE};
 use crate::poawx_ticket::{TicketProof, TICKET_PROOF_WIRE, TICKET_SECTION_MAGIC};
 use sha2::{Digest, Sha256};
@@ -619,6 +620,12 @@ pub struct Phase20ReceiptExt {
     /// against persisted dominance state in connect_block when the
     /// anti-domination gate is enforced.
     pub role_dominance_weights: Option<[u64; 4]>,
+    /// Phase 21D: optional candidate set (trailing CND1 section; None =>
+    /// byte-identical to pre-21D). Carries the full canonical candidate set so
+    /// the node can validate the selected role solvers are the best candidates;
+    /// required + validated in connect_block when the candidate-set gate is
+    /// enforced.
+    pub candidate_set: Option<CandidateSet>,
 }
 
 impl Phase20ReceiptExt {
@@ -648,7 +655,10 @@ impl Phase20ReceiptExt {
                 out.extend_from_slice(root);
             }
             None => {
-                if self.role_ticket_proofs.is_some() || self.role_dominance_weights.is_some() {
+                if self.role_ticket_proofs.is_some()
+                    || self.role_dominance_weights.is_some()
+                    || self.candidate_set.is_some()
+                {
                     out.push(0);
                 }
             }
@@ -666,6 +676,14 @@ impl Phase20ReceiptExt {
             for w in weights.iter() {
                 out.extend_from_slice(&w.to_le_bytes());
             }
+        }
+        // Phase 21D trailing CND1 candidate-set section (present-only): magic +
+        // u32 length + canonical candidate-set bytes. Absent => byte-identical.
+        if let Some(cs) = &self.candidate_set {
+            let body = cs.serialize();
+            out.extend_from_slice(CANDIDATE_SECTION_MAGIC);
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
         }
         out
     }
@@ -730,6 +748,7 @@ impl Phase20ReceiptExt {
         // strictness as pre-21C). Absent => byte-identical to the pre-section ext.
         let mut role_ticket_proofs: Option<[TicketProof; 3]> = None;
         let mut role_dominance_weights: Option<[u64; 4]> = None;
+        let mut candidate_set: Option<CandidateSet> = None;
         while off < raw.len() {
             need(off, 4, "trailing section magic")?;
             let magic = &raw[off..off + 4];
@@ -762,6 +781,17 @@ impl Phase20ReceiptExt {
                     off += 8;
                 }
                 role_dominance_weights = Some(w);
+            } else if magic == CANDIDATE_SECTION_MAGIC {
+                if candidate_set.is_some() {
+                    return Err("phase20 ext: duplicate candidate section".to_string());
+                }
+                off += 4;
+                need(off, 4, "candidate section length")?;
+                let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("len 4")) as usize;
+                off += 4;
+                need(off, len, "candidate section body")?;
+                candidate_set = Some(CandidateSet::deserialize(&raw[off..off + len])?);
+                off += len;
             } else {
                 return Err("phase20 ext: unknown trailing section magic".to_string());
             }
@@ -776,6 +806,7 @@ impl Phase20ReceiptExt {
             precommit_root,
             role_ticket_proofs,
             role_dominance_weights,
+            candidate_set,
         })
     }
 
@@ -1732,6 +1763,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
         let bytes = ext.serialize();
         let ext2 = Phase20ReceiptExt::deserialize(&bytes).expect("deserialize");
@@ -1843,6 +1875,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
         let none = base();
         let mut some = base();
@@ -1881,6 +1914,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
         let proofs = [
             TicketProof::new(
@@ -1946,6 +1980,77 @@ mod tests {
     }
 
     #[test]
+    fn phase21d_ext_candidate_section_roundtrip_backward_compatible() {
+        use crate::poawx_candidate::{CandidateSet, RoleCandidate, CANDIDATE_SECTION_MAGIC};
+        use crate::poawx_penalty::PenaltyStatus;
+        let prev = [0x44u8; 32];
+        let base = || Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+            candidate_set: None,
+        };
+        let mut cs = CandidateSet::new(1, 60, prev);
+        cs.push(RoleCandidate::build(
+            1,
+            60,
+            &prev,
+            ROLE_COMPUTE_CONTRIBUTOR,
+            [0xC1u8; 20],
+            [0x02u8; 33],
+            [0x11u8; 32],
+            PenaltyStatus::Clean.id(),
+            1000,
+            [0x21u8; 32],
+        ));
+        cs.sort_canonical();
+        // (1) absent => no CND1 magic, byte-identical, round-trips.
+        let none = base();
+        let nb = none.serialize();
+        assert!(
+            nb.windows(4).all(|w| w != &CANDIDATE_SECTION_MAGIC[..]),
+            "no CND1 magic when absent"
+        );
+        assert_eq!(Phase20ReceiptExt::deserialize(&nb).unwrap(), none);
+        // (2) present => round-trips and changes the digest.
+        let mut c = base();
+        c.candidate_set = Some(cs.clone());
+        assert_eq!(Phase20ReceiptExt::deserialize(&c.serialize()).unwrap(), c);
+        assert_ne!(
+            none.digest(),
+            c.digest(),
+            "candidate section changes digest"
+        );
+        // (3) candidate-set mutation changes the ext digest.
+        let mut c2 = base();
+        let mut cs2 = cs.clone();
+        cs2.candidates[0].effective_score ^= 1;
+        c2.candidate_set = Some(cs2);
+        assert_ne!(
+            c.digest(),
+            c2.digest(),
+            "candidate mutation changes ext digest"
+        );
+        // (4) candidate together with dominance weights round-trips.
+        let mut cd = base();
+        cd.role_dominance_weights = Some([1000, 900, 800, 700]);
+        cd.candidate_set = Some(cs.clone());
+        let cdb = cd.serialize();
+        assert!(cdb.windows(4).any(|w| w == &CANDIDATE_SECTION_MAGIC[..]));
+        assert_eq!(Phase20ReceiptExt::deserialize(&cdb).unwrap(), cd);
+    }
+
+    #[test]
     fn phase21c_ext_dominance_section_roundtrip_backward_compatible() {
         let prev = [0x44u8; 32];
         let base = || Phase20ReceiptExt {
@@ -1962,6 +2067,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
         let weights = [1000u64, 800, 900, 950];
         // (1) absent => no DOM1 magic, byte-identical, round-trips.
@@ -2057,6 +2163,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
         // no-ext v3 element == v2 element + a single 0 flag byte (present-only).
         let r = make_test_receipt(9);
@@ -2094,6 +2201,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
 
         // Base mode-0 receipt with a production extension attached.

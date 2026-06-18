@@ -856,6 +856,9 @@ impl ChainState {
         if crate::poawx_dominance::anti_domination_enforced(expected_height) {
             self.validate_block_dominance_weights(&block, expected_height)?;
         }
+        if crate::poawx_candidate::candidate_set_enforced(expected_height) {
+            self.validate_block_candidate_sets(&block, expected_height)?;
+        }
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1016,6 +1019,93 @@ impl ChainState {
             ));
         }
         events
+    }
+
+    /// Phase 21D: when candidate-set enforcement is on, every production
+    /// receipt must include a canonical `CandidateSet` bound to (network,
+    /// height, parent seed); each candidate must be self-consistent (recomputed
+    /// assignment-proof digest + penalty weight + effective score); its
+    /// `dominance_weight` must match the node's persisted state when dominance is
+    /// active; and the SELECTED role solver (`role_reward`) must be the BEST
+    /// candidate for that role under the deterministic effective-score ordering.
+    /// Fails closed on missing/malformed/non-best.
+    ///
+    /// HONEST LIMITATION: the node can only validate the INCLUDED candidate set;
+    /// it cannot prove unseen miners did not exist (no mandatory candidate
+    /// admission / gossip rule yet). Best-within-included-set, NOT global best.
+    fn validate_block_candidate_sets(&self, block: &Block, height: u64) -> Result<(), String> {
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_dominance::{anti_domination_active, DOMINANCE_BASE_WORK_SCORE};
+        let net = crate::activation::network_id_byte();
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let dom_active = anti_domination_active(height);
+        for r in receipts {
+            let ext = match &r.phase20_ext {
+                Some(e) => e,
+                None => continue,
+            };
+            let cs = ext
+                .candidate_set
+                .as_ref()
+                .ok_or_else(|| "phase21d: missing required candidate set".to_string())?;
+            if cs.network_id != net {
+                return Err("phase21d: candidate set wrong network".to_string());
+            }
+            if cs.target_height != height {
+                return Err("phase21d: candidate set wrong height".to_string());
+            }
+            if cs.seed != block.header.prev_hash {
+                return Err("phase21d: candidate set wrong seed".to_string());
+            }
+            if !cs.is_canonical() {
+                return Err("phase21d: candidate set not canonical".to_string());
+            }
+            for cand in &cs.candidates {
+                cand.validate_self(net, height, &cs.seed)?;
+                if dom_active {
+                    let expect =
+                        self.dominance
+                            .weight(DOMINANCE_BASE_WORK_SCORE, &cand.solver_pkh, height);
+                    if cand.dominance_weight != expect {
+                        return Err(format!(
+                            "phase21d: candidate dominance weight mismatch got {} expected {}",
+                            cand.dominance_weight, expect
+                        ));
+                    }
+                }
+            }
+            let selected = [
+                (
+                    ROLE_COMPUTE_CONTRIBUTOR,
+                    ext.role_reward.compute_contributor_pkh,
+                ),
+                (
+                    ROLE_VERIFY_CONTRIBUTOR,
+                    ext.role_reward.verify_contributor_pkh,
+                ),
+                (
+                    ROLE_SUPPORT_CONTRIBUTOR,
+                    ext.role_reward.support_contributor_pkh,
+                ),
+            ];
+            for (role_id, sel) in selected {
+                let best = cs
+                    .best_for_role(role_id)
+                    .ok_or_else(|| format!("phase21d: no candidate for role {}", role_id))?;
+                if best.solver_pkh != sel {
+                    return Err(format!(
+                        "phase21d: selected role {} solver is not the best candidate",
+                        role_id
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Phase 21C: when anti-domination enforcement is on, every production
@@ -7560,6 +7650,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         }
     }
 
@@ -8045,6 +8136,132 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK");
+    }
+
+    #[test]
+    fn phase21d_candidate_set_enforcement() {
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_candidate::{candidate_set_enforced, CandidateSet, RoleCandidate};
+        use crate::poawx_penalty::PenaltyStatus;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT");
+        assert!(candidate_set_enforced(1), "enforced on testnet");
+
+        let net = crate::activation::network_id_byte();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let sk = signing_key(0x41);
+        let base_ext = p20_ext(net, height, &parent_hash, 0, [0u8; 20]);
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        let apk = [0x02u8; 33];
+
+        let mk = |role: u8, solver: [u8; 20], tag: u8| {
+            RoleCandidate::build(
+                net,
+                height,
+                &parent_hash,
+                role,
+                solver,
+                apk,
+                [tag; 32],
+                PenaltyStatus::Clean.id(),
+                1000,
+                [tag.wrapping_add(1); 32],
+            )
+        };
+        let c1 = mk(ROLE_COMPUTE_CONTRIBUTOR, [0xC1u8; 20], 0x11);
+        let cx = mk(ROLE_COMPUTE_CONTRIBUTOR, [0xCEu8; 20], 0x55);
+        let v = mk(ROLE_VERIFY_CONTRIBUTOR, [0xC2u8; 20], 0x12);
+        let s = mk(ROLE_SUPPORT_CONTRIBUTOR, [0xC3u8; 20], 0x13);
+        let mut cs = CandidateSet::new(net, height, parent_hash);
+        for c in [c1.clone(), cx.clone(), v, s] {
+            cs.push(c);
+        }
+        cs.sort_canonical();
+        let best_c = cs
+            .best_for_role(ROLE_COMPUTE_CONTRIBUTOR)
+            .unwrap()
+            .solver_pkh;
+        let non_best = if best_c == c1.solver_pkh {
+            cx.solver_pkh
+        } else {
+            c1.solver_pkh
+        };
+
+        let blk = |compute_sel: [u8; 20], set: Option<CandidateSet>| -> Block {
+            let mut ext = base_ext.clone();
+            ext.role_reward.compute_contributor_pkh = compute_sel;
+            ext.role_reward.verify_contributor_pkh = [0xC2u8; 20];
+            ext.role_reward.support_contributor_pkh = [0xC3u8; 20];
+            ext.candidate_set = set;
+            let mut r = receipt.clone();
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+
+        let st = base_chain(None);
+        // selected == best candidate => accept.
+        assert!(
+            st.validate_block_candidate_sets(&blk(best_c, Some(cs.clone())), height)
+                .is_ok(),
+            "selected best candidate accepts"
+        );
+        // selected != best => reject.
+        assert!(
+            st.validate_block_candidate_sets(&blk(non_best, Some(cs.clone())), height)
+                .is_err(),
+            "non-best selection rejects"
+        );
+        // missing candidate set => reject.
+        assert!(
+            st.validate_block_candidate_sets(&blk(best_c, None), height)
+                .is_err(),
+            "missing candidate set rejects"
+        );
+        // self-inconsistent candidate (mutated score) => reject.
+        let mut bad = cs.clone();
+        bad.candidates[0].effective_score ^= 1;
+        assert!(
+            st.validate_block_candidate_sets(&blk(best_c, Some(bad)), height)
+                .is_err(),
+            "mutated candidate rejects"
+        );
+        // wrong seed => reject.
+        let mut wrong = cs.clone();
+        wrong.seed = [0x99u8; 32];
+        assert!(
+            st.validate_block_candidate_sets(&blk(best_c, Some(wrong)), height)
+                .is_err(),
+            "wrong seed rejects"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!candidate_set_enforced(1), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED");
     }
 
     #[test]
@@ -8553,6 +8770,7 @@ mod tests {
                 precommit_root: next_root,
                 role_ticket_proofs: None,
                 role_dominance_weights: None,
+                candidate_set: None,
             }
         };
         let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {
