@@ -71,6 +71,16 @@ flow into a repeatable onboarding runbook for additional trusted miners.
 > stay loopback-only. Mainnet disabled; official pool 0%; third-party fee explicit-only; LWMA-144
 > automatic.
 
+> **Miner work tickets (Phase 21B, testnet/devnet, opt-in, mainnet hard-off).** When the operator
+> enables the ticket gate (`IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT` + `IRIUM_POAWX_TICKETS_REQUIRED=1`),
+> every rewarded role must carry a valid per-role **ticket proof** bound to its solver pkh; the node
+> rejects blocks with missing/invalid/expired tickets, and (with `…PENALTY_STATE_REQUIRED=1`) blocks
+> suspended/slashed identities from high-trust (VERIFY/SUPPORT) roles. The pool attaches ticket
+> proofs automatically; a miner can also emit one locally with
+> `irium-wallet poawx-ticket-proof --network-id <id> --target-height <H> --role <…> --solver <addr> --epoch <N> --expiry-height <N>`
+> (**no private key**, emit-only). Default off; old behavior unchanged when off. Sybil-work cost
+> (`IRIUM_POAWX_TICKET_SYBIL_BITS`) is an identity cost only — **not chain PoW**; LWMA-144 untouched.
+
 ## 1. Miner requirements
 - A stock SHA-256d CPU miner (`cpuminer`/`minerd`) — unchanged, no version-rolling needed.
 - The Irium wallet binary with `poawx-register --emit-only` (Phase 19B+).

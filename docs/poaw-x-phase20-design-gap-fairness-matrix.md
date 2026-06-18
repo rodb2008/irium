@@ -6,7 +6,12 @@
 > deterministic fixed-point fairness weight (`src/poawx_dominance.rs`), adaptive mining/security
 > modes with **no hardware-class assumptions** (`src/poawx_adaptive.rs`), Miner Work Tickets +
 > Sybil-work cost (`src/poawx_ticket.rs`), and penalty/fraud state (`src/poawx_penalty.rs`).
-> These are **data-only, gated, mainnet hard-off** (Phase 21B may enforce them). Details:
+> These are **data-only, gated, mainnet hard-off**. **Phase 21B now ENFORCES tickets + penalty**
+> in connect_block behind `IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT`+`_REQUIRED` /
+> `…PENALTY_STATE_…` (testnet/devnet, mainnet hard-off; old behavior unchanged when off) — a
+> compact per-role `TicketProof` is bound into `Phase20ReceiptExt` (byte-identical when absent),
+> attached by the pool, emitted by the wallet (`poawx-ticket-proof`). Anti-domination remains
+> data-only (persistent/reorg-safe enforcement = Phase 21C). Details:
 > `poaw-x-phase21-blueprint-gap-closure.md`. Chain difficulty remains LWMA-144 automatic.
 
 > **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has

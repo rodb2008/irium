@@ -1,9 +1,48 @@
-# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives)
+# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated enforcement)
 
-**Status: Phase 21A implements the FOUNDATION layer (primitives + tests), data-only and
-gated.** These primitives are not (yet) wired into live block acceptance — that is Phase 21B.
-Public testnet with outside miners, independent security audit, and community vote are **out of
-scope** and **not** part of Phase 21A. Mainnet remains **hard-off** for all PoAW-X gates.
+**Status: Phase 21A implemented the FOUNDATION primitives (data-only); Phase 21B now wires ticket
++ penalty enforcement into the Phase 20 consensus/pool/wallet path behind explicit testnet/devnet
+gates (mainnet hard-off; old behavior unchanged when gates off).** Public testnet with outside
+miners, independent security audit, and community vote remain **out of scope**.
+
+## Phase 21B — gated enforcement (this pass)
+- **Ticket proof binding (`src/poawx_ticket.rs` + `src/poawx.rs`):** a compact, self-verifiable
+  `TicketProof` (176-byte wire) binds network/height/role/miner-pkh, carries the sybil-work
+  (nonce + digest, independently recomputable + threshold-checkable) and a deterministic
+  `ticket_digest`. `Phase20ReceiptExt` gains an OPTIONAL trailing `role_ticket_proofs: [3]` section
+  (magic-prefixed, present-only) — **byte-identical to pre-21B when absent**, so all existing
+  Phase 20 exts/blocks/tests stay valid. The ticket proofs are bound into the ext digest →
+  receipts-root → irx1 commitment automatically.
+- **Node consensus enforcement (`src/chain.rs`):** `validate_phase20_production_block` calls
+  `validate_phase20_ticket_proofs` only when `poawx_ticket::tickets_enforced(height)`
+  (`IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT` + `IRIUM_POAWX_TICKETS_REQUIRED=1`, mainnet-off). It
+  requires every rewarded role to carry a valid proof bound to the role solver pkh; rejects
+  missing/malformed/wrong-network/expired/future/wrong-pkh/wrong-role/bad-sybil/bad-digest. When
+  `poawx_penalty::penalty_state_enforced(height)` (`…PENALTY_STATE_ACTIVATION_HEIGHT` +
+  `…PENALTY_STATE_REQUIRED=1`), suspended/slashed identities are rejected from **high-trust roles**
+  (VERIFY/SUPPORT); expired penalties no longer reject. **Gate off ⇒ ticket proofs ignored
+  (old Phase 20 behavior unchanged).**
+- **Pool production (`pool/irium-stratum/src/delegation.rs`):** a byte-identical `TicketProofMirror`
+  + `Phase20ReceiptExtMirror.role_ticket_proofs`; `build_collected_phase20_ext` /
+  `build_synthetic_phase20_ext` attach per-role proofs when `pool_tickets_enforced(height)`; a
+  parity test proves the pool ext deserializes via the node lib and the node validator accepts each
+  proof. Official fee-0 and third-party fee paths both carry tickets when enforced. If a required
+  input is missing the builder returns None ⇒ the node fails closed.
+- **Wallet (`src/bin/irium-wallet.rs`):** `poawx-ticket-proof` emits a ticket-proof JSON bound to
+  role/height (testnet/devnet only, mainnet rejected, **no private key**, emit-only).
+- **Dominance: still data-only (deterministic helper + Phase 20 reward-event feed, tested). Full
+  persistent + reorg-safe dominance enforcement is deferred to Phase 21C** (not faked): it requires
+  persistent chain state + reorg handling beyond this step.
+- **Tests:** node `ticket_proof_roundtrip_and_validate`, `phase20_ext_ticket_section_roundtrip_backward_compatible`,
+  chain `phase21b_ticket_penalty_enforcement` (gate off accepts; on rejects missing; valid accepts;
+  expired rejects; penalty suspended high-trust rejects; penalty-off accepts); pool
+  `phase21b_pool_ticket_mirror_and_ext_parity` + `phase21b_pool_tickets_enforced_gate`; wallet
+  ticket emit. All Phase 20 / hidden-precommit / role-gossip tests still green.
+
+---
+
+**Phase 21A (foundation) — original status:** primitives + tests, data-only and gated. Mainnet
+remains **hard-off** for all PoAW-X gates.
 
 > **PoAW-X is consensus / network-level, not pool-owned.** The pool/stratum is only **one miner
 > interface** to PoAW-X; it is not the owner or authority of the protocol. These Phase 21
