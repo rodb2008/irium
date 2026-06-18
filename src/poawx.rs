@@ -5,6 +5,7 @@
 use crate::block::Block;
 use crate::poawx_candidate::{CandidateSet, CANDIDATE_SECTION_MAGIC};
 use crate::poawx_dominance::{DOMINANCE_SECTION_MAGIC, DOMINANCE_WEIGHTS_WIRE};
+use crate::poawx_puzzle::{PuzzleSolutionV1, PUZZLE_SECTION_MAGIC, PUZZLE_SOLUTION_WIRE};
 use crate::poawx_ticket::{TicketProof, TICKET_PROOF_WIRE, TICKET_SECTION_MAGIC};
 use sha2::{Digest, Sha256};
 
@@ -626,6 +627,11 @@ pub struct Phase20ReceiptExt {
     /// required + validated in connect_block when the candidate-set gate is
     /// enforced.
     pub candidate_set: Option<CandidateSet>,
+    /// Phase 21F: optional per-role assigned puzzle-work solutions
+    /// [compute, verify, support] (trailing PZL1 section; None => byte-identical
+    /// to pre-21F). Required + validated in connect_block when the puzzle-work
+    /// gate is enforced. Assigned-work proofs only; NOT chain PoW.
+    pub role_puzzle_proofs: Option<[PuzzleSolutionV1; 3]>,
 }
 
 impl Phase20ReceiptExt {
@@ -658,6 +664,7 @@ impl Phase20ReceiptExt {
                 if self.role_ticket_proofs.is_some()
                     || self.role_dominance_weights.is_some()
                     || self.candidate_set.is_some()
+                    || self.role_puzzle_proofs.is_some()
                 {
                     out.push(0);
                 }
@@ -684,6 +691,14 @@ impl Phase20ReceiptExt {
             out.extend_from_slice(CANDIDATE_SECTION_MAGIC);
             out.extend_from_slice(&(body.len() as u32).to_le_bytes());
             out.extend_from_slice(&body);
+        }
+        // Phase 21F trailing PZL1 puzzle-solution section (present-only): magic +
+        // 3 fixed solutions. Absent => byte-identical to pre-21F exts.
+        if let Some(sols) = &self.role_puzzle_proofs {
+            out.extend_from_slice(PUZZLE_SECTION_MAGIC);
+            for sol in sols.iter() {
+                out.extend_from_slice(&sol.serialize());
+            }
         }
         out
     }
@@ -749,6 +764,7 @@ impl Phase20ReceiptExt {
         let mut role_ticket_proofs: Option<[TicketProof; 3]> = None;
         let mut role_dominance_weights: Option<[u64; 4]> = None;
         let mut candidate_set: Option<CandidateSet> = None;
+        let mut role_puzzle_proofs: Option<[PuzzleSolutionV1; 3]> = None;
         while off < raw.len() {
             need(off, 4, "trailing section magic")?;
             let magic = &raw[off..off + 4];
@@ -792,6 +808,20 @@ impl Phase20ReceiptExt {
                 need(off, len, "candidate section body")?;
                 candidate_set = Some(CandidateSet::deserialize(&raw[off..off + len])?);
                 off += len;
+            } else if magic == PUZZLE_SECTION_MAGIC {
+                if role_puzzle_proofs.is_some() {
+                    return Err("phase20 ext: duplicate puzzle section".to_string());
+                }
+                off += 4;
+                let mut sols: Vec<PuzzleSolutionV1> = Vec::with_capacity(3);
+                for _ in 0..3 {
+                    need(off, PUZZLE_SOLUTION_WIRE, "puzzle solution")?;
+                    sols.push(PuzzleSolutionV1::deserialize(
+                        &raw[off..off + PUZZLE_SOLUTION_WIRE],
+                    )?);
+                    off += PUZZLE_SOLUTION_WIRE;
+                }
+                role_puzzle_proofs = Some([sols[0], sols[1], sols[2]]);
             } else {
                 return Err("phase20 ext: unknown trailing section magic".to_string());
             }
@@ -807,6 +837,7 @@ impl Phase20ReceiptExt {
             role_ticket_proofs,
             role_dominance_weights,
             candidate_set,
+            role_puzzle_proofs,
         })
     }
 
@@ -1764,6 +1795,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         let bytes = ext.serialize();
         let ext2 = Phase20ReceiptExt::deserialize(&bytes).expect("deserialize");
@@ -1876,6 +1908,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         let none = base();
         let mut some = base();
@@ -1915,6 +1948,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         let proofs = [
             TicketProof::new(
@@ -1980,6 +2014,69 @@ mod tests {
     }
 
     #[test]
+    fn phase21f_ext_puzzle_section_roundtrip_backward_compatible() {
+        use crate::poawx_puzzle::{PuzzleSolutionV1, PUZZLE_SECTION_MAGIC};
+        let prev = [0x44u8; 32];
+        let base = || Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+            candidate_set: None,
+            role_puzzle_proofs: None,
+        };
+        let sol = |m: u8, n: u64, t: u8| PuzzleSolutionV1 {
+            mode: m,
+            nonce: n,
+            proof_digest: [t; 32],
+        };
+        let proofs = [sol(0, 1, 0x10), sol(1, 2, 0x20), sol(2, 3, 0x30)];
+        // (1) absent => no PZL1 magic, byte-identical, round-trips.
+        let none = base();
+        let nb = none.serialize();
+        assert!(
+            nb.windows(4).all(|w| w != &PUZZLE_SECTION_MAGIC[..]),
+            "no PZL1 magic when absent"
+        );
+        assert_eq!(Phase20ReceiptExt::deserialize(&nb).unwrap(), none);
+        // (2) present => round-trips and changes the digest (bound into ext digest).
+        let mut p = base();
+        p.role_puzzle_proofs = Some(proofs);
+        assert_eq!(Phase20ReceiptExt::deserialize(&p.serialize()).unwrap(), p);
+        assert_ne!(
+            none.digest(),
+            p.digest(),
+            "puzzle section changes ext digest"
+        );
+        // (3) mutation changes the ext digest.
+        let mut p2 = base();
+        let mut m = proofs;
+        m[0].nonce ^= 1;
+        p2.role_puzzle_proofs = Some(m);
+        assert_ne!(
+            p.digest(),
+            p2.digest(),
+            "puzzle mutation changes ext digest"
+        );
+        // (4) puzzle together with candidate set round-trips.
+        let mut cd = base();
+        cd.role_dominance_weights = Some([1000, 900, 800, 700]);
+        cd.role_puzzle_proofs = Some(proofs);
+        let cdb = cd.serialize();
+        assert!(cdb.windows(4).any(|w| w == &PUZZLE_SECTION_MAGIC[..]));
+        assert_eq!(Phase20ReceiptExt::deserialize(&cdb).unwrap(), cd);
+    }
+
+    #[test]
     fn phase21d_ext_candidate_section_roundtrip_backward_compatible() {
         use crate::poawx_candidate::{CandidateSet, RoleCandidate, CANDIDATE_SECTION_MAGIC};
         use crate::poawx_penalty::PenaltyStatus;
@@ -1999,6 +2096,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         let mut cs = CandidateSet::new(1, 60, prev);
         cs.push(RoleCandidate::build(
@@ -2068,6 +2166,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         let weights = [1000u64, 800, 900, 950];
         // (1) absent => no DOM1 magic, byte-identical, round-trips.
@@ -2164,6 +2263,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         // no-ext v3 element == v2 element + a single 0 flag byte (present-only).
         let r = make_test_receipt(9);
@@ -2202,6 +2302,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
 
         // Base mode-0 receipt with a production extension attached.

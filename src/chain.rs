@@ -861,6 +861,9 @@ impl ChainState {
         {
             self.validate_block_candidate_sets(&block, expected_height)?;
         }
+        if crate::poawx_puzzle::puzzle_work_enforced(expected_height) {
+            self.validate_block_puzzle_proofs(&block, expected_height)?;
+        }
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1021,6 +1024,77 @@ impl ChainState {
             ));
         }
         events
+    }
+
+    /// Phase 21F: when puzzle-work enforcement is on, every production receipt
+    /// must carry per-role `role_puzzle_proofs` whose solution verifies against
+    /// the node-recomputed challenge for that role's selected candidate. The
+    /// challenge binds (network, height, role, solver, ticket digest, assignment
+    /// proof digest, candidate digest, parent seed); the mode is assigned
+    /// deterministically. Requires the candidate set (the per-role challenge is
+    /// derived from the selected candidate). Assigned-work proofs only -- this
+    /// NEVER affects chain PoW / LWMA. Fails closed.
+    fn validate_block_puzzle_proofs(&self, block: &Block, height: u64) -> Result<(), String> {
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_puzzle::{default_profile, verify_solution, PuzzleChallengeV1};
+        use sha2::{Digest, Sha256};
+        let net = crate::activation::network_id_byte();
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let profile = default_profile();
+        for r in receipts {
+            let ext = match &r.phase20_ext {
+                Some(e) => e,
+                None => continue,
+            };
+            let sols = ext
+                .role_puzzle_proofs
+                .as_ref()
+                .ok_or_else(|| "phase21f: missing required puzzle proofs".to_string())?;
+            let cs = ext
+                .candidate_set
+                .as_ref()
+                .ok_or_else(|| "phase21f: puzzle enforcement requires candidate set".to_string())?;
+            let roles = [
+                ROLE_COMPUTE_CONTRIBUTOR,
+                ROLE_VERIFY_CONTRIBUTOR,
+                ROLE_SUPPORT_CONTRIBUTOR,
+            ];
+            for (i, role) in roles.iter().enumerate() {
+                let cand = cs
+                    .best_for_role(*role)
+                    .ok_or_else(|| format!("phase21f: no candidate for role {}", role))?;
+                let candidate_digest: [u8; 32] = {
+                    let mut h = Sha256::new();
+                    h.update(cand.serialize());
+                    h.finalize().into()
+                };
+                let challenge = PuzzleChallengeV1::build(
+                    net,
+                    height,
+                    *role,
+                    cand.solver_pkh,
+                    cand.ticket_digest,
+                    cand.assignment_proof_digest,
+                    candidate_digest,
+                    block.header.prev_hash,
+                    profile,
+                );
+                if let crate::poawx_puzzle::PuzzleVerificationResult::Invalid(e) =
+                    verify_solution(&challenge, &sols[i])
+                {
+                    return Err(format!(
+                        "phase21f: puzzle proof role {} invalid: {}",
+                        role, e
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Phase 21D: when candidate-set enforcement is on, every production
@@ -7675,6 +7749,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         }
     }
 
@@ -8160,6 +8235,157 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK");
+    }
+
+    #[test]
+    fn phase21f_puzzle_enforcement() {
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_candidate::{CandidateSet, RoleCandidate};
+        use crate::poawx_penalty::PenaltyStatus;
+        use crate::poawx_puzzle::{
+            default_profile, puzzle_work_enforced, solve_dev, PuzzleChallengeV1, PuzzleSolutionV1,
+        };
+        use sha2::{Digest, Sha256};
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_BITS", "4");
+        assert!(puzzle_work_enforced(1), "enforced on testnet");
+
+        let net = crate::activation::network_id_byte();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let sk = signing_key(0x41);
+        let base_ext = p20_ext(net, height, &parent_hash, 0, [0u8; 20]);
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        let profile = default_profile();
+
+        let mk = |role: u8, solver: [u8; 20], tag: u8| {
+            RoleCandidate::build(
+                net,
+                height,
+                &parent_hash,
+                role,
+                solver,
+                [0x02u8; 33],
+                [tag; 32],
+                PenaltyStatus::Clean.id(),
+                1000,
+                [tag.wrapping_add(1); 32],
+            )
+        };
+        let cands = [
+            mk(ROLE_COMPUTE_CONTRIBUTOR, [0xC1u8; 20], 0x11),
+            mk(ROLE_VERIFY_CONTRIBUTOR, [0xC2u8; 20], 0x12),
+            mk(ROLE_SUPPORT_CONTRIBUTOR, [0xC3u8; 20], 0x13),
+        ];
+        let mut cs = CandidateSet::new(net, height, parent_hash);
+        for c in cands.iter() {
+            cs.push(c.clone());
+        }
+        cs.sort_canonical();
+
+        // solve the assigned puzzle for each selected role (from its candidate).
+        let roles = [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ];
+        let mut sols: Vec<PuzzleSolutionV1> = Vec::new();
+        for role in roles {
+            let cand = cs.best_for_role(role).unwrap();
+            let cdg: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(cand.serialize());
+                h.finalize().into()
+            };
+            let challenge = PuzzleChallengeV1::build(
+                net,
+                height,
+                role,
+                cand.solver_pkh,
+                cand.ticket_digest,
+                cand.assignment_proof_digest,
+                cdg,
+                parent_hash,
+                profile,
+            );
+            sols.push(solve_dev(&challenge).expect("solve"));
+        }
+        let proofs = [sols[0], sols[1], sols[2]];
+
+        let blk = |puzzle: Option<[PuzzleSolutionV1; 3]>, with_cs: bool| -> Block {
+            let mut ext = base_ext.clone();
+            ext.role_reward.compute_contributor_pkh = [0xC1u8; 20];
+            ext.role_reward.verify_contributor_pkh = [0xC2u8; 20];
+            ext.role_reward.support_contributor_pkh = [0xC3u8; 20];
+            ext.candidate_set = if with_cs { Some(cs.clone()) } else { None };
+            ext.role_puzzle_proofs = puzzle;
+            let mut r = receipt.clone();
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+
+        let st = base_chain(None);
+        // valid puzzle proofs accept.
+        assert!(
+            st.validate_block_puzzle_proofs(&blk(Some(proofs), true), height)
+                .is_ok(),
+            "valid puzzle proofs accept"
+        );
+        // missing puzzle proofs reject.
+        assert!(
+            st.validate_block_puzzle_proofs(&blk(None, true), height)
+                .is_err(),
+            "missing puzzle proofs reject"
+        );
+        // missing candidate set reject (puzzle binds to candidate).
+        assert!(
+            st.validate_block_puzzle_proofs(&blk(Some(proofs), false), height)
+                .is_err(),
+            "missing candidate set rejects"
+        );
+        // tampered solution reject.
+        let mut bad = proofs;
+        bad[0].proof_digest[0] ^= 1;
+        assert!(
+            st.validate_block_puzzle_proofs(&blk(Some(bad), true), height)
+                .is_err(),
+            "tampered puzzle solution rejects"
+        );
+        // wrong height => recomputed challenge differs => reject.
+        assert!(
+            st.validate_block_puzzle_proofs(&blk(Some(proofs), true), height + 1)
+                .is_err(),
+            "wrong height rejects"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!puzzle_work_enforced(1), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_WORK_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_BITS");
     }
 
     #[test]
@@ -8937,6 +9163,7 @@ mod tests {
                 role_ticket_proofs: None,
                 role_dominance_weights: None,
                 candidate_set: None,
+                role_puzzle_proofs: None,
             }
         };
         let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {
