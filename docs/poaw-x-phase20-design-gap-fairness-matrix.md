@@ -1,4 +1,13 @@
-# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (Step 6A hidden-precommit root; 6B role collection; 6C role gossip plumbing; 6D live node↔pool bridge; 6E loopback live E2E PASS; 6F two-VPS live E2E PASS; only public/external miner test remains)
+# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (Step 6A hidden-precommit root; 6B role collection; 6C role gossip plumbing; 6D live node↔pool bridge; 6E loopback live E2E PASS; 6F two-VPS live E2E PASS; Phase 21A anti-domination/adaptive/ticket/penalty foundation primitives added)
+
+> **Phase 21A foundation primitives (2026-06-18).** The fairness track is extended with
+> blueprint-gap foundation primitives in the **node library** (consensus/network-level, **not**
+> pool-owned — the pool is only one miner interface): anti-domination recent-reward tracking +
+> deterministic fixed-point fairness weight (`src/poawx_dominance.rs`), adaptive mining/security
+> modes with **no hardware-class assumptions** (`src/poawx_adaptive.rs`), Miner Work Tickets +
+> Sybil-work cost (`src/poawx_ticket.rs`), and penalty/fraud state (`src/poawx_penalty.rs`).
+> These are **data-only, gated, mainnet hard-off** (Phase 21B may enforce them). Details:
+> `poaw-x-phase21-blueprint-gap-closure.md`. Chain difficulty remains LWMA-144 automatic.
 
 > **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has
 > been validated live, end-to-end, twice. **Step 6E** (single-VPS loopback) and **Step 6F**
