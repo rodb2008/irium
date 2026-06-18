@@ -986,6 +986,57 @@ pub fn role_claim_digest(
     h.finalize().into()
 }
 
+// ── Phase 20 Step 6A: hidden role-precommit mirror primitives ────────────────
+pub const ROLE_PRECOMMIT_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_ROLE_PRECOMMIT_V1";
+pub const ROLE_PRECOMMIT_COMMIT_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_ROLE_PRECOMMIT_COMMIT_V1";
+
+/// Mirror of `irium_node_rs::poawx::role_precommit_commitment`.
+pub fn role_precommit_commitment(secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ROLE_PRECOMMIT_COMMIT_DOMAIN_V1);
+    h.update(secret);
+    h.update(nonce);
+    h.finalize().into()
+}
+
+/// Mirror of `irium_node_rs::poawx::role_precommit_leaf`.
+pub fn role_precommit_leaf(
+    network_id: u8,
+    target_height: u64,
+    role_id: u8,
+    solver_pkh: &[u8; 20],
+    commitment_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ROLE_PRECOMMIT_DOMAIN_V1);
+    h.update([network_id]);
+    h.update(target_height.to_le_bytes());
+    h.update([role_id]);
+    h.update(solver_pkh);
+    h.update(commitment_hash);
+    h.finalize().into()
+}
+
+/// Mirror of `irium_node_rs::poawx::role_precommit_root` (SHA256 over sorted leaves).
+pub fn role_precommit_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    let mut sorted: Vec<[u8; 32]> = leaves.to_vec();
+    sorted.sort_unstable();
+    let mut h = Sha256::new();
+    for l in &sorted {
+        h.update(l);
+    }
+    h.finalize().into()
+}
+
+/// Mirror of `irium_node_rs::chain::hidden_precommit_active`: gate on
+/// `IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT`. Mainnet hard-off.
+pub fn hidden_precommit_active(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false; // mainnet
+    }
+    activation_height_reached("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", height)
+}
+
 /// Mirror of `irium_node_rs::poawx::RoleReward` (60-byte wire).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleRewardMirror {
@@ -1045,10 +1096,14 @@ pub struct Phase20ReceiptExtMirror {
     pub support_claim: PoawxRoleClaimMirror,
     pub fee_bps: u16,
     pub fee_pkh: [u8; 20],
+    /// Step 6A: optional hidden-precommit root committing the next block's leaves
+    /// (trailing-optional; None => byte-identical to pre-6A).
+    pub precommit_root: Option<[u8; 32]>,
 }
 
 impl Phase20ReceiptExtMirror {
-    /// Wire: version(1) || role_reward(60) || (len_u16 || claim)×3 || fee_bps(2) || fee_pkh(20).
+    /// Wire: version(1) || role_reward(60) || (len_u16 || claim)×3 || fee_bps(2) ||
+    /// fee_pkh(20) || [precommit flag(1) + root(32) IFF Some] (trailing optional).
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(PHASE20_EXT_VERSION);
@@ -1060,6 +1115,10 @@ impl Phase20ReceiptExtMirror {
         }
         out.extend_from_slice(&self.fee_bps.to_le_bytes());
         out.extend_from_slice(&self.fee_pkh);
+        if let Some(root) = &self.precommit_root {
+            out.push(1);
+            out.extend_from_slice(root);
+        }
         out
     }
 
@@ -1141,18 +1200,30 @@ pub fn build_synthetic_phase20_ext(
         Some((b, p)) if b >= 1 && b <= THIRD_PARTY_FEE_CAP_BPS && p != [0u8; 20] => (b, p),
         _ => (0u16, [0u8; 20]),
     };
+    // Step 6A: when hidden-precommit is active, derive secret/nonce WITHOUT prev_hash
+    // (so block H-1 can compute block H's commitments) and set commitment_hash; the
+    // claim still binds prev_hash via claim_digest. When inactive, keep the prior
+    // prev-hash-derived secret/nonce + no commitment (Steps 5A/5B unchanged).
+    let hp = hidden_precommit_active(height);
     let mk = |role_id: u8, idx: usize| -> PoawxRoleClaimMirror {
         let lane_id = assign_lane_id(network_id, height, prev_hash, role_id, 0);
-        let nonce = synth_field(b"nonce", network_id, height, prev_hash, role_id);
-        let secret = synth_field(b"secret", network_id, height, prev_hash, role_id);
-        let solver = if workers.is_empty() {
-            *primary_pkh
+        let solver = synth_role_solver(primary_pkh, workers, idx);
+        let (secret, nonce) = if hp {
+            synth_role_secret_nonce(network_id, height, role_id)
         } else {
-            workers[idx % workers.len()]
+            (
+                synth_field(b"secret", network_id, height, prev_hash, role_id),
+                synth_field(b"nonce", network_id, height, prev_hash, role_id),
+            )
         };
         let claim_digest = role_claim_digest(
             network_id, height, prev_hash, role_id, lane_id, &solver, &nonce, &secret,
         );
+        let commitment_hash = if hp {
+            Some(role_precommit_commitment(&secret, &nonce))
+        } else {
+            None
+        };
         PoawxRoleClaimMirror {
             role_id,
             lane_id,
@@ -1160,12 +1231,23 @@ pub fn build_synthetic_phase20_ext(
             nonce,
             secret,
             claim_digest,
-            commitment_hash: None,
+            commitment_hash,
         }
     };
     let compute_claim = mk(ROLE_COMPUTE_CONTRIBUTOR, 0);
     let verify_claim = mk(ROLE_VERIFY_CONTRIBUTOR, 1);
     let support_claim = mk(ROLE_SUPPORT_CONTRIBUTOR, 2);
+    // Commit the NEXT block's leaves (this block H commits height H+1).
+    let precommit_root = if hp {
+        Some(synthetic_precommit_root(
+            network_id,
+            height + 1,
+            primary_pkh,
+            workers,
+        ))
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward: RoleRewardMirror {
             compute_contributor_pkh: compute_claim.solver_pkh,
@@ -1177,7 +1259,58 @@ pub fn build_synthetic_phase20_ext(
         support_claim,
         fee_bps,
         fee_pkh,
+        precommit_root,
     })
+}
+
+/// Deterministic synthetic secret/nonce for (net, height, role) — prev-hash-free so
+/// a precommit built at block H-1 and the reveal at block H agree. Testnet/devnet.
+fn synth_role_secret_nonce(network_id: u8, height: u64, role_id: u8) -> ([u8; 32], [u8; 32]) {
+    let mk = |tag: &[u8]| -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"IRIUM_POAWX_SYNTHETIC_HP_V1");
+        h.update(tag);
+        h.update([network_id]);
+        h.update(height.to_le_bytes());
+        h.update([role_id]);
+        h.finalize().into()
+    };
+    (mk(b"secret"), mk(b"nonce"))
+}
+
+/// Deterministic synthetic solver pkh for role index `idx`.
+fn synth_role_solver(primary_pkh: &[u8; 20], workers: &[[u8; 20]], idx: usize) -> [u8; 20] {
+    if workers.is_empty() {
+        *primary_pkh
+    } else {
+        workers[idx % workers.len()]
+    }
+}
+
+/// Synthetic hidden-precommit root committing `target_height`'s 3 role-claim leaves
+/// (matches what the reveal at `target_height` reconstructs).
+pub fn synthetic_precommit_root(
+    network_id: u8,
+    target_height: u64,
+    primary_pkh: &[u8; 20],
+    workers: &[[u8; 20]],
+) -> [u8; 32] {
+    let roles = [
+        ROLE_COMPUTE_CONTRIBUTOR,
+        ROLE_VERIFY_CONTRIBUTOR,
+        ROLE_SUPPORT_CONTRIBUTOR,
+    ];
+    let leaves: Vec<[u8; 32]> = roles
+        .iter()
+        .enumerate()
+        .map(|(i, &role)| {
+            let (s, n) = synth_role_secret_nonce(network_id, target_height, role);
+            let c = role_precommit_commitment(&s, &n);
+            let solver = synth_role_solver(primary_pkh, workers, i);
+            role_precommit_leaf(network_id, target_height, role, &solver, &c)
+        })
+        .collect();
+    role_precommit_root(&leaves)
 }
 
 /// Extract the three RoleReward pkhs from a hex-encoded `Phase20ReceiptExt`
@@ -2281,6 +2414,7 @@ mod tests {
             support_claim: mk_pool(3),
             fee_bps: 0,
             fee_pkh: [0u8; 20],
+            precommit_root: None,
         };
         let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
             role_reward: node_rr,
@@ -2289,6 +2423,7 @@ mod tests {
             support_claim: mk_node(3),
             fee_bps: 0,
             fee_pkh: [0u8; 20],
+            precommit_root: None,
         };
         assert_eq!(ext.serialize(), node_ext.serialize(), "Phase20ReceiptExt wire parity");
         assert_eq!(ext.digest(), node_ext.digest(), "ext digest parity");
@@ -2573,5 +2708,76 @@ mod tests {
 
         std::env::remove_var("IRIUM_NETWORK");
         std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+    }
+
+    #[test]
+    fn phase20_hidden_precommit_synthetic_and_node_parity() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", "1");
+        let net = 1u8;
+        let prev1 = [0x11u8; 32];
+        let prev2 = [0x22u8; 32];
+        let primary = [0xA1u8; 20];
+
+        // Block H-1 (height 1) ext commits height-2's root; block H (height 2) ext
+        // reveals height-2's claims.
+        let ext1 = build_synthetic_phase20_ext(net, 1, &prev1, &primary, &[], None).expect("ext1");
+        let ext2 = build_synthetic_phase20_ext(net, 2, &prev2, &primary, &[], None).expect("ext2");
+        assert!(ext1.precommit_root.is_some(), "producer commits next-height root");
+        assert!(ext2.compute_claim.commitment_hash.is_some(), "reveal carries commitment");
+        // The committed root equals the pool's deterministic height-2 root.
+        assert_eq!(
+            ext1.precommit_root.unwrap(),
+            synthetic_precommit_root(net, 2, &primary, &[])
+        );
+
+        // Node-side independent reconstruction: deserialize the reveal via the node
+        // lib, reconstruct each leaf (validating the commitment binds secret/nonce),
+        // and the sorted root MUST equal the parent's committed root.
+        let node_ext2 =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext2.serialize()).unwrap();
+        let mut leaves = Vec::new();
+        for c in [
+            &node_ext2.compute_claim,
+            &node_ext2.verify_claim,
+            &node_ext2.support_claim,
+        ] {
+            leaves.push(
+                irium_node_rs::poawx::role_precommit_leaf_for_claim(c, net, 2)
+                    .expect("valid reveal leaf"),
+            );
+        }
+        let node_root = irium_node_rs::poawx::role_precommit_root(&leaves);
+        assert_eq!(
+            node_root,
+            ext1.precommit_root.unwrap(),
+            "node-reconstructed reveal root == pool-committed parent root"
+        );
+        // pool primitive == node primitive.
+        assert_eq!(synthetic_precommit_root(net, 2, &primary, &[]), node_root);
+
+        // Mutation: a tampered revealed secret fails the node commitment binding.
+        let mut bad = node_ext2.compute_claim.clone();
+        bad.secret = [0xFFu8; 32];
+        assert!(
+            irium_node_rs::poawx::role_precommit_leaf_for_claim(&bad, net, 2).is_err(),
+            "mutated reveal rejected by node"
+        );
+
+        // Off-path: hidden-precommit inactive => no precommit_root / no commitment
+        // (Steps 5A/5B behavior unchanged).
+        std::env::remove_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT");
+        let ext_off = build_synthetic_phase20_ext(net, 2, &prev2, &primary, &[], None).unwrap();
+        assert!(ext_off.precommit_root.is_none());
+        assert!(ext_off.compute_claim.commitment_hash.is_none());
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
     }
 }

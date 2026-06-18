@@ -28469,6 +28469,7 @@ mod tests {
             support_claim: mk_claim(ROLE_SUPPORT_CONTRIBUTOR),
             fee_bps: 0,
             fee_pkh: [0u8; 20],
+            precommit_root: None,
         };
         let pubk = "02".to_string() + &"cd".repeat(32);
         let r = PoawxPendingReceipt {
@@ -29740,6 +29741,7 @@ mod tests {
             support_claim: claim(3),
             fee_bps: 0,
             fee_pkh: [0u8; 20],
+            precommit_root: None,
         };
         let mut r = make_test_block_receipt_c(90, b'A', 7);
         r.phase20_ext = Some(ext.clone());

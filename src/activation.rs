@@ -283,6 +283,16 @@ pub fn poawx_third_party_fee_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
+/// Phase 20 Step 6A: activation height for the hidden role-precommit commitment
+/// root. `None` => not active. Read from `IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT`.
+/// Testnet/devnet only — mainnet is hard-off (the `chain` gate returns false on
+/// mainnet) until an explicit future governance activation.
+pub fn poawx_hidden_precommit_activation_height() -> Option<u64> {
+    env::var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 pub fn runtime_htlcv1_env_override() -> Option<u64> {
     env::var("IRIUM_HTLCV1_ACTIVATION_HEIGHT")
         .ok()

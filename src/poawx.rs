@@ -490,15 +490,106 @@ pub fn validate_role_claim(
     Ok(())
 }
 
+// ── Phase 20 Step 6A: hidden role-precommit commitment root ──────────────────
+//
+// Anti-fabrication for fairness role claims: a claim revealed in block H must have
+// been pre-committed in block H-1. Block H-1's `Phase20ReceiptExt.precommit_root`
+// is the SHA256-over-sorted-leaves root committing block H's role-claim leaves.
+// Each leaf binds (network, target_height, role, solver_pkh, commitment_hash),
+// where `commitment_hash = H(COMMIT_DOMAIN || secret || nonce)` HIDES the revealed
+// secret/nonce until block H. At reveal, the secret/nonce reconstruct the
+// commitment, the leaf reconstructs, and the sorted root must equal the parent's
+// committed root — so a miner cannot invent a claim only at reveal time.
+//
+// The lane is deliberately NOT in the leaf: the lane is `assign_lane(hash(H-1))`,
+// which is unknowable when the precommit is placed in H-1 (it depends on H-1's own
+// hash). The lane is non-grindable (deterministic from the assignment) and is
+// enforced at reveal by `validate_role_claim`, so binding height/role/solver/secret
+// in the precommit is the meaningful anti-fabrication property. (A lane-bound
+// variant would need a grandparent-shifted assignment; deferred.)
+pub const ROLE_PRECOMMIT_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_ROLE_PRECOMMIT_V1";
+pub const ROLE_PRECOMMIT_COMMIT_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_ROLE_PRECOMMIT_COMMIT_V1";
+
+/// Hiding commitment to a role claim's revealed secret + nonce:
+/// `H(COMMIT_DOMAIN || secret || nonce)`. Stored in `PoawxRoleClaim.commitment_hash`
+/// before reveal; recomputed from the revealed `secret`/`nonce` at reveal time.
+pub fn role_precommit_commitment(secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ROLE_PRECOMMIT_COMMIT_DOMAIN_V1);
+    h.update(secret);
+    h.update(nonce);
+    h.finalize().into()
+}
+
+/// Deterministic precommit leaf binding the pre-committable claim identity:
+/// `H(PRECOMMIT_DOMAIN || network_id || target_height_le8 || role_id || solver_pkh
+///    || commitment_hash)`. Replaying to another height/network/role/solver, or a
+/// different `commitment_hash` (different secret/nonce), yields a different leaf.
+pub fn role_precommit_leaf(
+    network_id: u8,
+    target_height: u64,
+    role_id: u8,
+    solver_pkh: &[u8; 20],
+    commitment_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ROLE_PRECOMMIT_DOMAIN_V1);
+    h.update([network_id]);
+    h.update(target_height.to_le_bytes());
+    h.update([role_id]);
+    h.update(solver_pkh);
+    h.update(commitment_hash);
+    h.finalize().into()
+}
+
+/// SHA256 over the canonically-sorted leaves (order-independent), matching the
+/// receipts-root style used elsewhere. Empty leaf set => SHA256 of nothing.
+pub fn role_precommit_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    let mut sorted: Vec<[u8; 32]> = leaves.to_vec();
+    sorted.sort_unstable();
+    let mut h = Sha256::new();
+    for l in &sorted {
+        h.update(l);
+    }
+    h.finalize().into()
+}
+
+/// Validate a revealed claim's hidden-precommit binding and return its leaf:
+/// the claim MUST carry `commitment_hash == role_precommit_commitment(secret,nonce)`
+/// (so a mutated secret/nonce fails closed), then the leaf is reconstructed for
+/// `(network_id, target_height, role_id, solver_pkh, commitment_hash)`.
+pub fn role_precommit_leaf_for_claim(
+    claim: &PoawxRoleClaim,
+    network_id: u8,
+    target_height: u64,
+) -> Result<[u8; 32], String> {
+    let commitment = claim
+        .commitment_hash
+        .ok_or_else(|| "role precommit: claim missing commitment_hash".to_string())?;
+    let expect = role_precommit_commitment(&claim.secret, &claim.nonce);
+    if expect != commitment {
+        return Err(
+            "role precommit: commitment_hash != H(secret||nonce) (mutated reveal)".to_string(),
+        );
+    }
+    Ok(role_precommit_leaf(
+        network_id,
+        target_height,
+        claim.role_id,
+        &claim.solver_pkh,
+        &commitment,
+    ))
+}
+
 // ── Phase 20: production receipt extension (carries the role/fee payout data) ──
 //
 // `Phase20ReceiptExt` is the versioned block-receipt extension that travels with a
 // Phase 20 production block after activation. It carries the three revealed role
-// claims, the RoleReward payout pkhs, and the (signed) third-party fee terms. It is
-// a self-contained wire/JSON type with a digest; threading it into the live node
-// pending/storage/reorg/P2P path + the pool producer is the remaining integration
-// step (see the design-gap docs). Encoded only when present, so pre-activation
-// receipt v1/v2 encoding stays byte-identical.
+// claims, the RoleReward payout pkhs, the (signed) third-party fee terms, and
+// (Step 6A) the optional `precommit_root` committing the NEXT block's role-claim
+// leaves. Encoded only when present, so pre-activation receipt v1/v2 encoding stays
+// byte-identical; the precommit_root is a trailing-optional field so pre-Step-6A
+// Phase 20 exts remain byte-identical too.
 pub const PHASE20_EXT_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -510,11 +601,18 @@ pub struct Phase20ReceiptExt {
     /// Third-party fee terms (must match the signed delegation). `fee_bps==0` => official.
     pub fee_bps: u16,
     pub fee_pkh: [u8; 20],
+    /// Phase 20 Step 6A: optional hidden-precommit root committing the NEXT block's
+    /// role-claim leaves. `None` => absent (pre-Step-6A; trailing-optional so older
+    /// Phase 20 exts stay byte-identical). After hidden-precommit activation this is
+    /// required on every production block.
+    pub precommit_root: Option<[u8; 32]>,
 }
 
 impl Phase20ReceiptExt {
-    /// Wire: version(1) || role_reward(60) || (len_u16 || claim) ×3 || fee_bps(2) || fee_pkh(20).
-    /// Each claim is length-prefixed because a claim carries an optional commitment.
+    /// Wire: version(1) || role_reward(60) || (len_u16 || claim) ×3 || fee_bps(2) ||
+    /// fee_pkh(20) || [precommit flag(1) + root(32) IFF Some]. The precommit section
+    /// is a TRAILING optional: when `precommit_root` is None nothing is appended, so
+    /// pre-Step-6A exts serialize byte-identically.
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(PHASE20_EXT_VERSION);
@@ -526,6 +624,10 @@ impl Phase20ReceiptExt {
         }
         out.extend_from_slice(&self.fee_bps.to_le_bytes());
         out.extend_from_slice(&self.fee_pkh);
+        if let Some(root) = &self.precommit_root {
+            out.push(1);
+            out.extend_from_slice(root);
+        }
         out
     }
 
@@ -564,6 +666,24 @@ impl Phase20ReceiptExt {
         need(off, 20, "fee_pkh")?;
         let mut fee_pkh = [0u8; 20];
         fee_pkh.copy_from_slice(&raw[off..off + 20]);
+        off += 20;
+        // Step 6A trailing-optional precommit_root: present iff there are more bytes.
+        let precommit_root = if off < raw.len() {
+            let flag = raw[off];
+            off += 1;
+            match flag {
+                0 => None,
+                1 => {
+                    need(off, 32, "precommit_root")?;
+                    let mut r = [0u8; 32];
+                    r.copy_from_slice(&raw[off..off + 32]);
+                    Some(r)
+                }
+                other => return Err(format!("phase20 ext: bad precommit flag {}", other)),
+            }
+        } else {
+            None
+        };
         Ok(Self {
             role_reward,
             compute_claim,
@@ -571,6 +691,7 @@ impl Phase20ReceiptExt {
             support_claim,
             fee_bps,
             fee_pkh,
+            precommit_root,
         })
     }
 
@@ -1524,6 +1645,7 @@ mod tests {
             support_claim: fairness_valid_claim(1, 90, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
             fee_bps: 150,
             fee_pkh: [0xFEu8; 20],
+            precommit_root: None,
         };
         let bytes = ext.serialize();
         let ext2 = Phase20ReceiptExt::deserialize(&bytes).expect("deserialize");
@@ -1543,6 +1665,118 @@ mod tests {
     }
 
     #[test]
+    fn phase20_hidden_precommit_primitives() {
+        let secret = [7u8; 32];
+        let nonce = [9u8; 32];
+        let c = role_precommit_commitment(&secret, &nonce);
+        // commitment deterministic + sensitive to secret/nonce.
+        assert_eq!(c, role_precommit_commitment(&secret, &nonce));
+        assert_ne!(c, role_precommit_commitment(&[8u8; 32], &nonce));
+        assert_ne!(c, role_precommit_commitment(&secret, &[10u8; 32]));
+        // leaf deterministic + mutation/replay sensitive.
+        let solver = [0xA1u8; 20];
+        let leaf = role_precommit_leaf(1, 100, ROLE_COMPUTE_CONTRIBUTOR, &solver, &c);
+        assert_eq!(
+            leaf,
+            role_precommit_leaf(1, 100, ROLE_COMPUTE_CONTRIBUTOR, &solver, &c)
+        );
+        assert_ne!(
+            leaf,
+            role_precommit_leaf(2, 100, ROLE_COMPUTE_CONTRIBUTOR, &solver, &c),
+            "network"
+        );
+        assert_ne!(
+            leaf,
+            role_precommit_leaf(1, 101, ROLE_COMPUTE_CONTRIBUTOR, &solver, &c),
+            "height replay"
+        );
+        assert_ne!(
+            leaf,
+            role_precommit_leaf(1, 100, ROLE_VERIFY_CONTRIBUTOR, &solver, &c),
+            "role"
+        );
+        assert_ne!(
+            leaf,
+            role_precommit_leaf(1, 100, ROLE_COMPUTE_CONTRIBUTOR, &[0xB2u8; 20], &c),
+            "solver"
+        );
+        assert_ne!(
+            leaf,
+            role_precommit_leaf(1, 100, ROLE_COMPUTE_CONTRIBUTOR, &solver, &[0u8; 32]),
+            "commitment"
+        );
+        // root order-independent + set-sensitive.
+        let (l1, l2, l3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        assert_eq!(
+            role_precommit_root(&[l1, l2, l3]),
+            role_precommit_root(&[l3, l1, l2])
+        );
+        assert_ne!(
+            role_precommit_root(&[l1, l2]),
+            role_precommit_root(&[l1, l3])
+        );
+        // leaf_for_claim: valid claim reconstructs the leaf; mutated/missing reject.
+        let claim = PoawxRoleClaim {
+            role_id: ROLE_COMPUTE_CONTRIBUTOR,
+            lane_id: 0,
+            solver_pkh: solver,
+            nonce,
+            secret,
+            claim_digest: [0u8; 32],
+            commitment_hash: Some(c),
+        };
+        assert_eq!(role_precommit_leaf_for_claim(&claim, 1, 100).unwrap(), leaf);
+        let mut mutated = claim.clone();
+        mutated.secret = [0xFFu8; 32];
+        assert!(
+            role_precommit_leaf_for_claim(&mutated, 1, 100).is_err(),
+            "mutated secret"
+        );
+        let mut nocommit = claim.clone();
+        nocommit.commitment_hash = None;
+        assert!(
+            role_precommit_leaf_for_claim(&nocommit, 1, 100).is_err(),
+            "missing commitment"
+        );
+    }
+
+    #[test]
+    fn phase20_ext_precommit_root_roundtrip_and_digest() {
+        let prev = [0x44u8; 32];
+        let base = || Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+        };
+        let none = base();
+        let mut some = base();
+        some.precommit_root = Some([0xABu8; 32]);
+        // None is trailing-byte-free (byte-identical to pre-6A); Some adds flag(1)+32.
+        assert_eq!(some.serialize().len(), none.serialize().len() + 33);
+        assert_eq!(
+            Phase20ReceiptExt::deserialize(&none.serialize()).unwrap(),
+            none
+        );
+        assert_eq!(
+            Phase20ReceiptExt::deserialize(&some.serialize()).unwrap(),
+            some
+        );
+        // ext digest changes when precommit_root changes (G7).
+        assert_ne!(none.digest(), some.digest());
+        let mut some2 = base();
+        some2.precommit_root = Some([0xCDu8; 32]);
+        assert_ne!(some.digest(), some2.digest());
+    }
+
+    #[test]
     fn phase20_block_receipt_v3_element_roundtrip() {
         let prev = [0x44u8; 32];
         let mk_ext = || Phase20ReceiptExt {
@@ -1556,6 +1790,7 @@ mod tests {
             support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
             fee_bps: 0,
             fee_pkh: [0u8; 20],
+            precommit_root: None,
         };
         // no-ext v3 element == v2 element + a single 0 flag byte (present-only).
         let r = make_test_receipt(9);
@@ -1590,6 +1825,7 @@ mod tests {
             support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
             fee_bps,
             fee_pkh,
+            precommit_root: None,
         };
 
         // Base mode-0 receipt with a production extension attached.

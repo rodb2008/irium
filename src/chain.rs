@@ -2011,6 +2011,23 @@ pub fn third_party_pool_mode_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Phase 20 Step 6A: whether the hidden role-precommit commitment root is active
+/// for `height`. **Mainnet always false.** Testnet/devnet gate on
+/// `IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT`. When active, every Phase 20
+/// production block must carry a `precommit_root` (committing the next block's
+/// role-claim leaves) and its role claims must reveal pre-committed leaves matching
+/// the parent block's `precommit_root` (one transition-block grace at the exact
+/// activation height, whose parent predates activation).
+pub fn hidden_precommit_active(height: u64) -> bool {
+    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
+        return false;
+    }
+    match crate::activation::poawx_hidden_precommit_activation_height() {
+        Some(h) => height >= h,
+        None => false,
+    }
+}
+
 /// Phase 20: parse a standard 25-byte P2PKH script `76 a9 14 <20> 88 ac` to its pkh.
 fn parse_p2pkh_pkh(script: &[u8]) -> Option<[u8; 20]> {
     if script.len() == 25
@@ -2280,6 +2297,7 @@ fn validate_phase20_production_block(
     receipts: &[crate::poawx::PoawxBlockReceipt],
     height: u64,
     prev_hash: &[u8; 32],
+    previous: Option<&Block>,
 ) -> Result<(), String> {
     let coinbase = block
         .transactions
@@ -2322,6 +2340,80 @@ fn validate_phase20_production_block(
             ext,
             third_party_mode,
         )?;
+    }
+    // Step 6A: hidden role-precommit commitment-root enforcement (gated; mainnet-off).
+    if hidden_precommit_active(height) {
+        validate_hidden_precommit(receipts, height, network_id, previous)?;
+    }
+    Ok(())
+}
+
+/// Phase 20 Step 6A: enforce the hidden role-precommit commitment root. Each block
+/// after activation MUST carry a `precommit_root` (committing the NEXT block's
+/// role-claim leaves), and each revealed role claim must reconstruct a leaf whose
+/// sorted root equals the PARENT block's committed `precommit_root`. One transition
+/// grace at the exact activation height (its parent predates activation).
+fn validate_hidden_precommit(
+    receipts: &[crate::poawx::PoawxBlockReceipt],
+    height: u64,
+    network_id: u8,
+    previous: Option<&Block>,
+) -> Result<(), String> {
+    let act_h = crate::activation::poawx_hidden_precommit_activation_height()
+        .ok_or_else(|| "hidden precommit: active but no activation height".to_string())?;
+    // Reconstruct this block's role-claim leaves (validating each commitment) and
+    // require every receipt to carry a precommit_root for the next height.
+    let mut leaves: Vec<[u8; 32]> = Vec::new();
+    for (i, r) in receipts.iter().enumerate() {
+        let ext = r.phase20_ext.as_ref().ok_or_else(|| {
+            format!(
+                "hidden precommit: receipt[{}] missing extension at height {}",
+                i, height
+            )
+        })?;
+        if ext.precommit_root.is_none() {
+            return Err(format!(
+                "hidden precommit: receipt[{}] missing precommit_root for next height at {}",
+                i, height
+            ));
+        }
+        for claim in [&ext.compute_claim, &ext.verify_claim, &ext.support_claim] {
+            leaves.push(crate::poawx::role_precommit_leaf_for_claim(
+                claim, network_id, height,
+            )?);
+        }
+    }
+    let computed_root = crate::poawx::role_precommit_root(&leaves);
+    // Grace: the single transition block at the activation height has a parent that
+    // predates activation (no committed root), so the parent-root match is skipped.
+    if height == act_h {
+        return Ok(());
+    }
+    let parent = previous.ok_or_else(|| {
+        format!(
+            "hidden precommit: no parent block to load committed root at height {}",
+            height
+        )
+    })?;
+    let parent_root = parent
+        .poawx_receipts
+        .as_ref()
+        .and_then(|v| v.first())
+        .and_then(|r| r.phase20_ext.as_ref())
+        .and_then(|e| e.precommit_root)
+        .ok_or_else(|| {
+            format!(
+                "hidden precommit: parent block has no precommit_root at height {}",
+                height
+            )
+        })?;
+    if computed_root != parent_root {
+        return Err(format!(
+            "hidden precommit: role-claim leaves root {} != parent committed root {} at height {}",
+            hex::encode(computed_root),
+            hex::encode(parent_root),
+            height
+        ));
     }
     Ok(())
 }
@@ -2653,7 +2745,7 @@ fn validate_poawx_block_receipts(
     // validator enforces role claims + RoleReward + the canonical fee-aware
     // multi-role coinbase, and a missing extension fails closed.
     if phase20_active {
-        validate_phase20_production_block(block, receipts, height, &parent_hash)?;
+        validate_phase20_production_block(block, receipts, height, &parent_hash, previous)?;
     } else {
         validate_poawx_reward_split_from_block(block, receipts, height)?;
     }
@@ -7271,6 +7363,7 @@ mod tests {
             support_claim: p20_claim(net, height, prev, crate::poawx::ROLE_SUPPORT_CONTRIBUTOR, s),
             fee_bps,
             fee_pkh,
+            precommit_root: None,
         }
     }
 
@@ -7764,6 +7857,207 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT");
         clear_mode1_env();
+    }
+
+    #[test]
+    fn phase20_hidden_precommit_enforcement() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", "1");
+
+        let net = crate::activation::network_id_byte();
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let roles = [
+            crate::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+            crate::poawx::ROLE_VERIFY_CONTRIBUTOR,
+            crate::poawx::ROLE_SUPPORT_CONTRIBUTOR,
+        ];
+        let solvers = [[0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]];
+        // Deterministic per-(height,role) secret/nonce — computable at precommit time
+        // (block H-1) WITHOUT knowing hash(H-1), so the precommit and reveal agree.
+        let sn = |h: u64, role: u8| -> ([u8; 32], [u8; 32]) {
+            let mk = |tag: &[u8]| -> [u8; 32] {
+                let mut x = Sha256::new();
+                x.update(b"hp_test");
+                x.update(tag);
+                x.update(h.to_le_bytes());
+                x.update([role]);
+                x.finalize().into()
+            };
+            (mk(b"s"), mk(b"n"))
+        };
+        let mk_claim = |h: u64, prev: &[u8; 32], i: usize| -> crate::poawx::PoawxRoleClaim {
+            let role = roles[i];
+            let solver = solvers[i];
+            let lane = crate::poawx::assign_lane(net, h, prev, role, 0);
+            let (secret, nonce) = sn(h, role);
+            let cd = crate::poawx::role_claim_digest(
+                net,
+                h,
+                prev,
+                role,
+                lane.id(),
+                &solver,
+                &nonce,
+                &secret,
+            );
+            crate::poawx::PoawxRoleClaim {
+                role_id: role,
+                lane_id: lane.id(),
+                solver_pkh: solver,
+                nonce,
+                secret,
+                claim_digest: cd,
+                commitment_hash: Some(crate::poawx::role_precommit_commitment(&secret, &nonce)),
+            }
+        };
+        // precommit root committing height h's leaves (no prev/lane in the leaf).
+        let root_for = |h: u64| -> [u8; 32] {
+            let leaves: Vec<[u8; 32]> = (0..3)
+                .map(|i| {
+                    let (s, n) = sn(h, roles[i]);
+                    let c = crate::poawx::role_precommit_commitment(&s, &n);
+                    crate::poawx::role_precommit_leaf(net, h, roles[i], &solvers[i], &c)
+                })
+                .collect();
+            crate::poawx::role_precommit_root(&leaves)
+        };
+        let mk_ext = |h: u64,
+                      prev: &[u8; 32],
+                      next_root: Option<[u8; 32]>|
+         -> crate::poawx::Phase20ReceiptExt {
+            crate::poawx::Phase20ReceiptExt {
+                role_reward: crate::poawx::RoleReward {
+                    compute_contributor_pkh: solvers[0],
+                    verify_contributor_pkh: solvers[1],
+                    support_contributor_pkh: solvers[2],
+                },
+                compute_claim: mk_claim(h, prev, 0),
+                verify_claim: mk_claim(h, prev, 1),
+                support_claim: mk_claim(h, prev, 2),
+                fee_bps: 0,
+                fee_pkh: [0u8; 20],
+                precommit_root: next_root,
+            }
+        };
+        let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {
+            let mut receipt = make_test_receipt(h, &sk, *prev, 1);
+            receipt.phase20_ext = Some(ext.clone());
+            let primary = receipt.worker_pkh;
+            let root = crate::poawx::irx1_root_from_block_receipts_gated(
+                std::slice::from_ref(&receipt),
+                true,
+            );
+            let mut irx1 = vec![0x6a, 0x24u8];
+            irx1.extend_from_slice(b"irx1");
+            irx1.extend_from_slice(&root);
+            let mut payout = p20_coinbase(&primary, ext, block_reward(h));
+            payout[0] = TxOutput {
+                value: 0,
+                script_pubkey: irx1,
+            };
+            let cb = Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: 0xffff_ffff,
+                    script_sig: vec![0x01, 0x00],
+                    sequence: 0xffff_ffff,
+                }],
+                outputs: payout,
+                locktime: 0,
+            };
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: *prev,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![cb],
+                auxpow: None,
+                poawx_receipts: Some(vec![receipt]),
+            }
+        };
+
+        // Block 1 = grace (activation height): parent predates activation, so the
+        // parent-root match is skipped, but the block must carry a precommit_root
+        // (for block 2) and its claim commitments must be valid.
+        let block1 = build(1, &parent_hash, &mk_ext(1, &parent_hash, Some(root_for(2))));
+        assert!(
+            validate_poawx_block_receipts(&block1, 1, Some(&parent)).is_ok(),
+            "grace block: {:?}",
+            validate_poawx_block_receipts(&block1, 1, Some(&parent))
+        );
+        let h1 = block1.header.hash_for_height(1);
+
+        // Block 2 (non-grace): reveals leaves matching block1's committed root.
+        let block2 = build(2, &h1, &mk_ext(2, &h1, Some(root_for(3))));
+        let r2 = validate_poawx_block_receipts(&block2, 2, Some(&block1));
+        assert!(r2.is_ok(), "valid parent-root reveal: {:?}", r2);
+
+        // (12) parent has no precommit_root => reject.
+        let block1_nr = build(1, &parent_hash, &mk_ext(1, &parent_hash, None));
+        let h1nr = block1_nr.header.hash_for_height(1);
+        let block2_nr = build(2, &h1nr, &mk_ext(2, &h1nr, Some(root_for(3))));
+        assert!(
+            validate_poawx_block_receipts(&block2_nr, 2, Some(&block1_nr)).is_err(),
+            "missing parent root rejects"
+        );
+
+        // (13) parent commits the wrong root => reject.
+        let block1_w = build(
+            1,
+            &parent_hash,
+            &mk_ext(1, &parent_hash, Some(root_for(99))),
+        );
+        let h1w = block1_w.header.hash_for_height(1);
+        let block2_w = build(2, &h1w, &mk_ext(2, &h1w, Some(root_for(3))));
+        assert!(
+            validate_poawx_block_receipts(&block2_w, 2, Some(&block1_w)).is_err(),
+            "wrong parent root rejects"
+        );
+
+        // (17) reveal with a commitment that doesn't match secret/nonce => reject
+        // (fairness still passes; precommit commitment check fails).
+        let mut ext2_mut = mk_ext(2, &h1, Some(root_for(3)));
+        ext2_mut.compute_claim.commitment_hash = Some([0xEEu8; 32]);
+        let block2_mut = build(2, &h1, &ext2_mut);
+        assert!(
+            validate_poawx_block_receipts(&block2_mut, 2, Some(&block1)).is_err(),
+            "mutated commitment rejects"
+        );
+
+        // block missing its OWN precommit_root after activation => reject.
+        let block2_noown = build(2, &h1, &mk_ext(2, &h1, None));
+        assert!(
+            validate_poawx_block_receipts(&block2_noown, 2, Some(&block1)).is_err(),
+            "missing own precommit_root rejects"
+        );
+
+        // (18) mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!hidden_precommit_active(2), "mainnet hard-off");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT");
     }
 
     #[test]
