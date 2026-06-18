@@ -88,6 +88,7 @@ pub mod poawx_candidate;
 pub mod poawx_dominance;
 pub mod poawx_gossip;
 pub mod poawx_penalty;
+pub mod poawx_puzzle;
 pub mod poawx_ticket;
 pub mod pow;
 pub mod protocol;
