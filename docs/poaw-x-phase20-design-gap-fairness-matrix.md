@@ -33,6 +33,14 @@
 > in the window (propagation-sensitive, testnet/devnet), not among unseen offline miners.
 > Details: `poaw-x-phase21e-candidate-admission-gossip.md`. LWMA-144 untouched.
 
+> **Phase 21F (puzzle work modes).** Assigned-work verification primitives
+> (`src/poawx_puzzle.rs`): 5 deterministic modes (sha256d-anchor, random-memory,
+> parallel-compute, verification, finality-placeholder), no hardware-class lanes (any
+> miner any mode), fast bounded float-free verification, and a gated ext PZL1 section the
+> node verifies before accepting role rewards. NOT chain PoW: block target/bits/interval
+> and LWMA-144 are untouched; the finality mode is a placeholder. Details:
+> `poaw-x-phase21f-puzzle-work-modes.md`.
+
 > **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has
 > been validated live, end-to-end, twice. **Step 6E** (single-VPS loopback) and **Step 6F**
 > (two-VPS, role gossip over real cross-VPS P2P with an observer node validating byte-identical)

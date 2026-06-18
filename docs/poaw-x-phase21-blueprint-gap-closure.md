@@ -1,4 +1,4 @@
-# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation; 21E mandatory candidate admission/gossip)
+# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation; 21E mandatory candidate admission/gossip; 21F puzzle work modes)
 
 **Status: Phase 21A implemented the FOUNDATION primitives (data-only); Phase 21B now wires ticket
 + penalty enforcement into the Phase 20 consensus/pool/wallet path behind explicit testnet/devnet
@@ -45,6 +45,17 @@ mainnet hard-off. **HONEST LIMITATION:** best among candidates ADMITTED TO THIS 
 window (propagation-sensitive, testnet/devnet) — still NOT proof that unseen offline miners
 did not exist, and the assignment proof remains a VRF-style placeholder. Details:
 `poaw-x-phase21e-candidate-admission-gossip.md`.
+
+**Phase 21F (this pass)** adds assigned puzzle work modes + fast verification: a new
+`src/poawx_puzzle.rs` (PuzzleMode x5, deterministic assign_puzzle_mode, PuzzleChallengeV1/
+PuzzleSolutionV1, bounded integer-only PuzzleDifficultyProfile, fast bounded verify_solution),
+an optional trailing PZL1 ext section (role_puzzle_proofs[3], byte-identical absent), node
+validate_block_puzzle_proofs (recompute per-role challenge from the selected candidate +
+verify, fail-closed) behind IRIUM_POAWX_PUZZLE_WORK_{ACTIVATION_HEIGHT,REQUIRED}
+(mainnet hard-off), pool solve+attach (byte-identical mirror, fail-closed) + wallet
+poawx-puzzle-challenge/poawx-puzzle-solve (no key, testnet-only). These are ASSIGNED-WORK
+proofs, NOT chain PoW: block interval/bits/target/LWMA-144 are untouched; the finality mode
+is a deterministic placeholder. Details: `poaw-x-phase21f-puzzle-work-modes.md`.
 
 ## Phase 21B — gated enforcement (this pass)
 - **Ticket proof binding (`src/poawx_ticket.rs` + `src/poawx.rs`):** a compact, self-verifiable
@@ -164,7 +175,7 @@ unaffected. Chain difficulty remains **LWMA-144 automatic**.
 | Adaptive mining/security modes | **PARTIAL** — deterministic mode/policy state machine (not yet consumed by node) |
 | Penalty / fraud state | **PARTIAL** — status enum + record/escalation/expiry (slashing placeholder only) |
 | Fuller private assignment / VRF eligibility | **21D** — candidate-set commitment + AssignmentProofV1 (VRF-STYLE PLACEHOLDER, not true VRF) + node best-within-included-set validation; true VRF = future; mandatory candidate admission/gossip = **21E** |
-| Puzzle work-mode primitives beyond simplified role path | **PENDING** |
+| Puzzle work-mode primitives beyond simplified role path | **21F** — 5 assigned-work modes (sha256d-anchor/random-memory/parallel-compute/verification/finality-placeholder), deterministic mode assignment, fast bounded verify, gated ext PZL1 enforcement; NOT chain PoW (LWMA untouched); finality mode placeholder |
 | Stronger finality-committee integration with the 10% role | **PENDING** — `require_finality` is a placeholder flag |
 
 ## Remaining next technical steps (Phase 21B+)
