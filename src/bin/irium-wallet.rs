@@ -2328,6 +2328,7 @@ fn usage() {
     eprintln!("  irium-wallet poawx-role-reveal --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --secret <64hex> --nonce <64hex> --prev-hash <64hex>");
     eprintln!("  irium-wallet poawx-ticket-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --epoch <N> --expiry-height <N> [--assignment-pubkey <66hex>] [--sybil-nonce <64hex>] [--penalty-status <0..4>]");
     eprintln!("  irium-wallet poawx-assignment-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--assignment-pubkey <66hex>]  (VRF-style placeholder; testnet/devnet only; no private key)");
+    eprintln!("  irium-wallet poawx-candidate-admission --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--role-claim-digest <64hex>] [--penalty-status <0..4>] [--dominance-weight <N>] [--assignment-pubkey <66hex>]  (emits wire_hex to POST to /poawx/candidate-admission; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3775,6 +3776,135 @@ fn cmd_poawx_role_emit(args: &[String], reveal: bool) -> Result<(), String> {
 
 /// Phase 21B: emit a PoAW-X miner work-ticket PROOF bound to a role + height
 /// (testnet/devnet only; mainnet hard-off). Prints JSON only — no private key.
+/// Phase 21E: build the candidate-admission JSON (+ wire hex). Pure + testable;
+/// no private key, no seed phrase. Mainnet hard-off (network_id 0).
+fn candidate_admission_json(args: &[String]) -> Result<serde_json::Value, String> {
+    use irium_node_rs::poawx_admission::CandidateAdmissionV1;
+    use irium_node_rs::poawx_candidate::RoleCandidate;
+    use irium_node_rs::poawx_dominance::DOMINANCE_BASE_WORK_SCORE;
+    let mut network_id: Option<u8> = None;
+    let mut target_height: Option<u64> = None;
+    let mut role: Option<u8> = None;
+    let mut solver: Option<[u8; 20]> = None;
+    let mut apk: [u8; 33] = [0x02u8; 33];
+    let mut ticket_digest: [u8; 32] = [0u8; 32];
+    let mut seed: [u8; 32] = [0u8; 32];
+    let mut role_claim_digest: [u8; 32] = [0u8; 32];
+    let mut penalty_status: u8 = 0;
+    let mut dominance_weight: u64 = DOMINANCE_BASE_WORK_SCORE;
+    let hex_into = |s: &str, out: &mut [u8]| -> Result<(), String> {
+        let b = hex::decode(s.trim()).map_err(|_| "invalid hex".to_string())?;
+        if b.len() != out.len() {
+            return Err(format!("expected {} bytes", out.len()));
+        }
+        out.copy_from_slice(&b);
+        Ok(())
+    };
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--network-id" => {
+                network_id = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --network-id".to_string())?,
+                )
+            }
+            "--target-height" => {
+                target_height = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --target-height".to_string())?,
+                )
+            }
+            "--role" => {
+                let r = next_flag_value(args, &mut i)?;
+                role = Some(match r.to_ascii_lowercase().as_str() {
+                    "compute" | "1" => irium_node_rs::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+                    "verify" | "2" => irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR,
+                    "support" | "3" => irium_node_rs::poawx::ROLE_SUPPORT_CONTRIBUTOR,
+                    other => return Err(format!("invalid --role {other}")),
+                });
+            }
+            "--solver" => solver = Some(resolve_fee_pkh_arg(&next_flag_value(args, &mut i)?)?),
+            "--assignment-pubkey" => hex_into(&next_flag_value(args, &mut i)?, &mut apk)?,
+            "--ticket-digest" => hex_into(&next_flag_value(args, &mut i)?, &mut ticket_digest)?,
+            "--seed" | "--prev-hash" => hex_into(&next_flag_value(args, &mut i)?, &mut seed)?,
+            "--role-claim-digest" => {
+                hex_into(&next_flag_value(args, &mut i)?, &mut role_claim_digest)?
+            }
+            "--penalty-status" => {
+                penalty_status = next_flag_value(args, &mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --penalty-status".to_string())?
+            }
+            "--dominance-weight" => {
+                dominance_weight = next_flag_value(args, &mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --dominance-weight".to_string())?
+            }
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    let network_id = network_id.ok_or("--network-id required")?;
+    if network_id == 0 {
+        return Err("candidate admission is mainnet-hard-off (network_id 0)".to_string());
+    }
+    let target_height = target_height.ok_or("--target-height required")?;
+    let role = role.ok_or("--role required")?;
+    let solver = solver.ok_or("--solver <addr|40hex> required")?;
+    if irium_node_rs::poawx_penalty::PenaltyStatus::from_id(penalty_status).is_none() {
+        return Err("invalid --penalty-status (0..=4)".to_string());
+    }
+    let candidate = RoleCandidate::build(
+        network_id,
+        target_height,
+        &seed,
+        role,
+        solver,
+        apk,
+        ticket_digest,
+        penalty_status,
+        dominance_weight,
+        role_claim_digest,
+    );
+    let adm = CandidateAdmissionV1::new(network_id, target_height, seed, candidate.clone());
+    Ok(serde_json::json!({
+        "admission": {
+            "network_id": adm.network_id,
+            "target_height": adm.target_height,
+            "seed": hex::encode(adm.seed),
+            "candidate": {
+                "role_id": candidate.role_id,
+                "solver_pkh": hex::encode(candidate.solver_pkh),
+                "assignment_public_key": hex::encode(candidate.assignment_public_key),
+                "ticket_digest": hex::encode(candidate.ticket_digest),
+                "penalty_status": candidate.penalty_status,
+                "assignment_proof_digest": hex::encode(candidate.assignment_proof_digest),
+                "dominance_weight": candidate.dominance_weight,
+                "penalty_weight": candidate.penalty_weight,
+                "effective_score": candidate.effective_score,
+                "role_claim_digest": hex::encode(candidate.role_claim_digest),
+            },
+        },
+        "admission_digest": hex::encode(adm.digest),
+        "wire_hex": hex::encode(adm.serialize()),
+        "note": "VRF-style placeholder assignment; testnet/devnet only; no signing key needed; POST wire_hex to /poawx/candidate-admission",
+    }))
+}
+
+/// Phase 21E: emit a PoAW-X candidate admission (+ wire hex to POST to the node).
+/// No private key, testnet/devnet only, mainnet hard-off.
+fn cmd_poawx_candidate_admission_emit(args: &[String]) -> Result<(), String> {
+    let v = candidate_admission_json(args)?;
+    println!(
+        "{}",
+        serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?
+    );
+    eprintln!("[candidate-admission] VRF-style placeholder, no private key; POST wire_hex to the node's loopback /poawx/candidate-admission (testnet/devnet only).");
+    Ok(())
+}
+
 /// Phase 21D: build the assignment-proof JSON (VRF-style placeholder). Pure +
 /// testable; no private key, no seed phrase. Mainnet hard-off (network_id 0).
 fn assignment_proof_json(args: &[String]) -> Result<serde_json::Value, String> {
@@ -15616,6 +15746,65 @@ mod tests {
         o
     }
 
+    fn cadm_args(v: &[&str]) -> Vec<String> {
+        let mut o = vec!["poawx-candidate-admission".to_string()];
+        o.extend(v.iter().map(|s| s.to_string()));
+        o
+    }
+
+    #[test]
+    fn phase21e_candidate_admission_emit_json_no_secret_mainnet_off() {
+        let td = "11".repeat(32);
+        let sd = "22".repeat(32);
+        let sv = "aa".repeat(20);
+        let args = cadm_args(&[
+            "--network-id",
+            "1",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            &sv,
+            "--ticket-digest",
+            &td,
+            "--seed",
+            &sd,
+        ]);
+        let v = candidate_admission_json(&args).expect("json");
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.contains("admission_digest"));
+        assert!(s.contains("wire_hex"));
+        assert!(s.contains("assignment_proof_digest"));
+        // no key material leaks.
+        assert!(!s.to_lowercase().contains("private"));
+        assert!(!s.to_lowercase().contains("mnemonic"));
+        assert!(!s.to_lowercase().contains("secret"));
+        // wire_hex deserializes via the node lib + validates.
+        let wire = hex::decode(v["wire_hex"].as_str().unwrap()).unwrap();
+        let adm = irium_node_rs::poawx_admission::CandidateAdmissionV1::deserialize(&wire).unwrap();
+        assert!(
+            adm.validate(1, 10).is_ok(),
+            "node validates wallet admission"
+        );
+        // mainnet hard-off.
+        let m = cadm_args(&[
+            "--network-id",
+            "0",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            &sv,
+            "--ticket-digest",
+            &td,
+            "--seed",
+            &sd,
+        ]);
+        assert!(candidate_admission_json(&m).is_err(), "mainnet hard-off");
+    }
+
     #[test]
     fn phase21d_assignment_proof_emit_json_no_secret_mainnet_off() {
         let td = "11".repeat(32);
@@ -26106,6 +26295,12 @@ fn main() {
         }
         "poawx-assignment-proof" => {
             if let Err(e) = cmd_poawx_assignment_emit(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        "poawx-candidate-admission" => {
+            if let Err(e) = cmd_poawx_candidate_admission_emit(&args) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
