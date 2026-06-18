@@ -1,4 +1,4 @@
-# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation)
+# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation; 21E mandatory candidate admission/gossip)
 
 **Status: Phase 21A implemented the FOUNDATION primitives (data-only); Phase 21B now wires ticket
 + penalty enforcement into the Phase 20 consensus/pool/wallet path behind explicit testnet/devnet
@@ -31,6 +31,20 @@ fail-closed), pool candidate-set production + byte-identical mirror, and a walle
 validates best WITHIN the included candidate set; it cannot prove unseen miners did not
 exist (no mandatory candidate admission/gossip yet), and the proof is a placeholder not
 a true VRF. Details: `poaw-x-phase21d-candidate-set-assignment.md`.
+
+**Phase 21E (this pass)** makes candidate admission/gossip mandatory when gated: a new
+`src/poawx_admission.rs` (`CandidateAdmissionV1` + process-global node cache: validate →
+window → dedupe → store, deterministic admitted-set root), a `PoawxCandidateAdmission`
+P2P type + receive-loop ingest/rebroadcast, loopback RPC (`POST /poawx/candidate-admission`,
+`GET /poawx/candidate-admissions`), node enforcement that a block's candidate set EQUALS
+the node-admitted set for the height/seed (missing or extra candidate rejects; selected =
+best among ADMITTED; fail-closed when none), pool build-from-admitted (fail-closed if the
+admitted cache is unavailable) + a wallet `poawx-candidate-admission` emitter (no key,
+testnet-only). Gates `IRIUM_POAWX_CANDIDATE_ADMISSION_{ACTIVATION_HEIGHT,REQUIRED,WINDOW}`,
+mainnet hard-off. **HONEST LIMITATION:** best among candidates ADMITTED TO THIS NODE in the
+window (propagation-sensitive, testnet/devnet) — still NOT proof that unseen offline miners
+did not exist, and the assignment proof remains a VRF-style placeholder. Details:
+`poaw-x-phase21e-candidate-admission-gossip.md`.
 
 ## Phase 21B — gated enforcement (this pass)
 - **Ticket proof binding (`src/poawx_ticket.rs` + `src/poawx.rs`):** a compact, self-verifiable
@@ -149,7 +163,7 @@ unaffected. Chain difficulty remains **LWMA-144 automatic**.
 | Anti-domination / recent reward history | **21C** — persistent + reorg-safe per-(miner,window) state, connect/disconnect/reorg/restart, gated ext weight binding + node validation, pool selection weighting (global-best candidate optimality = 21D) |
 | Adaptive mining/security modes | **PARTIAL** — deterministic mode/policy state machine (not yet consumed by node) |
 | Penalty / fraud state | **PARTIAL** — status enum + record/escalation/expiry (slashing placeholder only) |
-| Fuller private assignment / VRF eligibility | **21D** — candidate-set commitment + AssignmentProofV1 (VRF-STYLE PLACEHOLDER, not true VRF) + node best-within-included-set validation; true VRF + mandatory candidate admission/gossip = future |
+| Fuller private assignment / VRF eligibility | **21D** — candidate-set commitment + AssignmentProofV1 (VRF-STYLE PLACEHOLDER, not true VRF) + node best-within-included-set validation; true VRF = future; mandatory candidate admission/gossip = **21E** |
 | Puzzle work-mode primitives beyond simplified role path | **PENDING** |
 | Stronger finality-committee integration with the 10% role | **PENDING** — `require_finality` is a placeholder flag |
 

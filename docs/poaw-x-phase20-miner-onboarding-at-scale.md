@@ -90,6 +90,15 @@ flow into a repeatable onboarding runbook for additional trusted miners.
 > candidate **within the included set** (gated by
 > `IRIUM_POAWX_CANDIDATE_SET_{ACTIVATION_HEIGHT,REQUIRED}`). Default off; LWMA-144 untouched.
 
+> **Candidate admission (Phase 21E, testnet/devnet, opt-in, mainnet hard-off).** When the
+> admission gate is on, candidate sets must derive from candidates ADMITTED to the node
+> (P2P-gossiped). A miner emits an admission with `irium-wallet poawx-candidate-admission
+> --network-id <id> --target-height <H> --role <…> --solver <addr> --ticket-digest <64hex>
+> --seed <64hex>` (**no private key**) and POSTs the printed `wire_hex` to the operator's
+> **loopback** `/poawx/candidate-admission`. The node then requires a block's candidate set
+> to equal its admitted set (best among ADMITTED). Best among admitted, NOT among unseen
+> offline miners. Default off; LWMA-144 untouched.
+
 ## 1. Miner requirements
 - A stock SHA-256d CPU miner (`cpuminer`/`minerd`) — unchanged, no version-rolling needed.
 - The Irium wallet binary with `poawx-register --emit-only` (Phase 19B+).

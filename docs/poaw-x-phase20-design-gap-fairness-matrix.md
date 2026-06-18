@@ -25,6 +25,14 @@
 > true VRF. Details: `poaw-x-phase21d-candidate-set-assignment.md`. No hardware-class
 > assumptions; LWMA-144 untouched.
 
+> **Phase 21E (candidate admission/gossip).** Candidate sets now derive from candidates
+> ADMITTED to the validating node (P2P-gossiped `CandidateAdmissionV1` + node cache +
+> loopback RPC); the node requires a block's candidate set to EQUAL its admitted set for
+> the height/seed (missing/extra rejects; selected = best among admitted; fail-closed when
+> none), gated + mainnet hard-off. Limitation: best among candidates admitted to THIS node
+> in the window (propagation-sensitive, testnet/devnet), not among unseen offline miners.
+> Details: `poaw-x-phase21e-candidate-admission-gossip.md`. LWMA-144 untouched.
+
 > **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has
 > been validated live, end-to-end, twice. **Step 6E** (single-VPS loopback) and **Step 6F**
 > (two-VPS, role gossip over real cross-VPS P2P with an observer node validating byte-identical)
