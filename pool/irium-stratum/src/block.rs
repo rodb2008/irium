@@ -461,7 +461,13 @@ mod tests {
         let worker_pkh = [0xabu8; 20];
         let sol = [0x01u8; 8];
         let nonce = [0xcdu8; 32];
-        let mut r = mkr(7, "cpu", &hex::encode(worker_pkh), &hex::encode(sol), &hex::encode(nonce));
+        let mut r = mkr(
+            7,
+            "cpu",
+            &hex::encode(worker_pkh),
+            &hex::encode(sol),
+            &hex::encode(nonce),
+        );
         r.phase20_ext = hex::encode(node_ext.serialize());
 
         // Gate OFF: wrapper == gated(false); the extension is ignored.
@@ -493,7 +499,10 @@ mod tests {
             std::slice::from_ref(&block_rec),
             true,
         );
-        assert_eq!(pool_on, node_on, "pool gated root must equal node gated root");
+        assert_eq!(
+            pool_on, node_on,
+            "pool gated root must equal node gated root"
+        );
     }
 }
 
