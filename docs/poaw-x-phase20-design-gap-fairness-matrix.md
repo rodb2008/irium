@@ -1,4 +1,4 @@
-# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (hidden-precommit commitment root NOW implemented in Step 6A; role collection in Step 6B; role gossip PLUMBING in Step 6C; public live relay pending)
+# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (hidden-precommit commitment root in Step 6A; role collection in Step 6B; role gossip plumbing in Step 6C; live cross-process node↔pool bridge in Step 6D; public/two-VPS live E2E pending)
 
 **Status (updated Step 6A, 2026-06-18):** Deterministic lane assignment, role-claim
 reveal/validation primitives, the 34/33/33 distribution, serialization, and activation gates
@@ -18,11 +18,18 @@ testnet/devnet**: forward-compatible node P2P wire types (`PoawxRolePrecommit = 
 `PoawxRoleReveal = 27`; old/mainnet peers drop them safely) + a versioned pool gossip envelope and a
 conservative `RoleGossipEngine` (validate → dedupe → height-window → store in the Step 6B store →
 rebroadcast only-if-newly-accepted), proven with an in-memory multi-node relay + production parity.
-**Still pending:** the **live cross-process bridge** (node P2P receive ⇄ pool store, and pool → P2P
-broadcast) is NOT wired — Step 6C is payload + validation + in-memory-relay only; the public/external
-live role-gossip run is future. The synthetic builder remains a testnet/devnet-only fallback behind
-`IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`; gossip is mainnet-hard-off and needs both
-`IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1` and `IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1`.
+**Step 6D (2026-06-18) wires the live cross-process bridge**: the node P2P receive loop ingests
+`PoawxRolePrecommit`/`PoawxRoleReveal` into a node-side role-gossip cache (`src/poawx_gossip.rs`,
+process-global) and rebroadcasts newly-accepted payloads; four **loopback-only** RPC endpoints
+(`/poawx/role-gossip/{precommit,reveal,precommits,reveals}`) let the pool POST local submissions
+(forwarded to P2P) and GET node-collected gossip, which the pool ingests into its `RoleProtocolStore`
+before production. So external/testnet peer gossip now reaches pool block production end-to-end over
+loopback. **Still pending:** a local loopback live role-gossip E2E, then a two-VPS live role-gossip
+E2E (only with operator firewall handoff). All Step 6D bridge endpoints are loopback-only — **no
+public ports**; mainnet hard-off; needs both `IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1` and
+`IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1` (plus optional `IRIUM_POAWX_ROLE_GOSSIP_WINDOW`,
+`IRIUM_POAWX_ROLE_GOSSIP_NODE_RPC`). The synthetic builder remains a testnet/devnet-only fallback
+behind `IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`.
 Mainnet hard-off; chain difficulty remains LWMA-144 automatic. Local-only; not pushed. See
 `poaw-x-phase20-production-wiring-status.md` (Steps 6A/6B) for full detail.
 

@@ -1,4 +1,69 @@
-# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 + 6A + 6B + 6C COMPLETE: extension threaded + consensus-enforced + root-committed + official+third-party-fee production + hidden-precommit root + local/testnet role precommit/reveal collection + testnet/devnet role gossip plumbing; public live relay / E2E follow-up)
+# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 + 6A + 6B + 6C + 6D COMPLETE: extension threaded + consensus-enforced + root-committed + official+third-party-fee production + hidden-precommit root + local/testnet role collection + role gossip plumbing + live cross-process node↔pool bridge; public/two-VPS live E2E follow-up)
+
+## Step 6D (this pass) — live cross-process node↔pool role-gossip bridge: COMPLETE (loopback bridge + P2P receive/rebroadcast wired; public live E2E = follow-up)
+
+Step 6D closes the Step 6C gap: the node P2P bus and the pool `RoleProtocolStore`
+are now joined over loopback so externally-gossiped role data reaches pool
+production, and pool-local submissions reach the P2P network.
+
+**Architecture now:**
+```
+peer gossip → iriumd P2P receive → node role-gossip cache → (loopback RPC GET) → pool RoleProtocolStore → Phase20 block production
+pool local role-precommit/reveal endpoint → pool store → (loopback RPC POST) → node cache → iriumd P2P broadcast/rebroadcast
+```
+
+- **Node cache** (`src/poawx_gossip.rs`, new): `NodeRoleGossipCache` — a process-global
+  singleton (`global_cache()`) shared by the P2P task(s) and the axum RPC handlers (no Arc
+  threaded through `P2PNode`). Validates the SAME Step 6C wire envelopes
+  (`RolePrecommitGossip`/`RoleRevealGossip`, v1), dedupes by stable digest, bounds by the
+  height window `[tip, tip+window]` (`IRIUM_POAWX_ROLE_GOSSIP_WINDOW`, default 64), stores
+  precommits/reveals by target height, prunes old heights. **Mainnet hard-off**
+  (`activation::network_id_byte()==0`), disabled unless `IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1`.
+  Reveal requires a matching precommit (graceful reject otherwise). **No consensus effect**
+  (Step 6A enforcement stays block-driven).
+- **P2P receive dispatch** (`src/p2p.rs`): `MessageType::PoawxRolePrecommit`/`PoawxRoleReveal`
+  are now handled in **both** receive sites (inbound + outbound), mirroring `OfferBroadcast`:
+  gate → `global_cache().ingest_*` → **rebroadcast only when newly accepted** (`broadcast_raw`).
+  Duplicate/invalid are neither stored nor rebroadcast; malformed never panics. Unknown/old
+  message handling and existing block/tx/receipt gossip are unchanged.
+- **P2P broadcast** (`src/p2p.rs`): `P2PNode::broadcast_role_precommit`/`broadcast_role_reveal`
+  flood an envelope to all peers (mirror of `broadcast_offer`).
+- **Loopback RPC bridge** (`src/bin/iriumd.rs`): four routes on the existing RPC listener,
+  each **loopback-only** (`addr.ip().is_loopback()` → 403 otherwise) + gated + mainnet-off:
+  `POST /poawx/role-gossip/precommit`, `POST /poawx/role-gossip/reveal` (validate/dedupe/store
+  → best-effort P2P broadcast on `AcceptedNew`; 400 on reject), `GET /poawx/role-gossip/precommits?target_height=H`
+  and `GET /poawx/role-gossip/reveals?target_height=H` (return stored envelopes for a
+  window-bounded height). No new port bound.
+- **Pool bridge** (`pool/irium-stratum/src/delegation.rs` + `stratum.rs`): on a valid local
+  role submission the pool stores it (Step 6B) **and** best-effort forwards the envelope to the
+  node (`forward_precommit_to_node`/`forward_reveal_to_node`); a node failure never affects the
+  local store/response. Before producing a block the pool `bridge_fetch_into_store` pulls
+  node-collected precommits (height + height+1) and reveals (height) and ingests them into the
+  local store, then builds the collected Phase 20 ext. Node RPC base defaults to the pool's
+  existing node RPC; override via `IRIUM_POAWX_ROLE_GOSSIP_NODE_RPC`. Production priority is
+  unchanged: **collected (now bridged) real role data → synthetic fallback
+  (`IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`) → fail closed.**
+- **P2P receive wired:** YES (both dispatch sites). **P2P rebroadcast wired:** YES
+  (`broadcast_raw` on newly-accepted, mirroring OfferBroadcast). **Loopback RPC bridge:** YES
+  (POST/GET, loopback-enforced). **Public exposure:** OUT OF SCOPE — all bridge endpoints are
+  loopback-only; no public ports were bound and **no live E2E was run** this step.
+- **Env (new this step):** `IRIUM_POAWX_ROLE_GOSSIP_WINDOW` (default 64),
+  `IRIUM_POAWX_ROLE_GOSSIP_NODE_RPC` (default = pool node RPC). Existing:
+  `IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1` (mainnet hard-off, default off).
+- **Tests:** node `poawx_gossip` (envelope/version/oversize/malformed + hides secret;
+  ingest validate/window/dedupe; reveal-needs-precommit; GET-able; prune; rebroadcast policy;
+  mainnet+disabled hard-off); node `protocol` (26/27 forward-compat unchanged); pool
+  `phase20_role_gossip_bridge_*` (real-HTTP fetch → store → build → **node validator accepts**;
+  official + third-party fee; real-HTTP forward POSTs the envelope to the bridge path;
+  unreachable-node error-safety; base override; mainnet hard-off; synthetic gating). All Step
+  6A/6B/6C tests unchanged.
+- **NOT done (follow-up):** local loopback live role-gossip E2E (stock miner → real
+  cross-process bridge → block), then a two-VPS live role-gossip E2E **only with the operator
+  firewall handoff** (source-restricted, as in Step 5B). Mainnet remains disabled; chain
+  difficulty remains **LWMA-144 automatic**; the external-miner low-devnet-height PoW caveat
+  remains separate.
+
+
 
 **Status:** **PARTIAL** (advancing). Steps **1** (ext threading), **2** (`connect_block`/`submit_block_extended`
 enforcement + receipts-root), **3** (official fee-0 multi-role coinbase), **4** (third-party-fee

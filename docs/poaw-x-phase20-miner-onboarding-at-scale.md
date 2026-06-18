@@ -35,6 +35,19 @@ flow into a repeatable onboarding runbook for additional trusted miners.
 > pool store is a documented follow-up, so operators onboarding miners today still use the
 > loopback-only Step 6B endpoints. **No public ports** are opened by Step 6C.
 
+> **Role gossip live bridge (Phase 20 Step 6D, testnet/devnet, opt-in).** Step 6D wires the live
+> cross-process bridge: iriumd ingests `PoawxRolePrecommit`/`PoawxRoleReveal` P2P gossip into a
+> node-side cache and rebroadcasts; four **loopback-only** node RPC endpoints
+> (`/poawx/role-gossip/{precommit,reveal,precommits,reveals}`) let the pool forward local
+> submissions (→ P2P broadcast) and fetch node-collected gossip into its store before producing a
+> block. Enable with `IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1` on **both** iriumd and the pool (mainnet
+> hard-off, default off); optional `IRIUM_POAWX_ROLE_GOSSIP_WINDOW` (default 64) and
+> `IRIUM_POAWX_ROLE_GOSSIP_NODE_RPC` (defaults to the pool's node RPC base). **All bridge endpoints
+> are loopback-only** — bind iriumd's RPC to `127.0.0.1` (as in the Step 5A recipe); **no public
+> ports** are opened by Step 6D. The next steps are a local loopback live E2E, then a two-VPS live
+> role-gossip E2E (only with the operator firewall handoff). Production still prefers real
+> (bridged) role data over the synthetic fallback (`IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`).
+
 ## 1. Miner requirements
 - A stock SHA-256d CPU miner (`cpuminer`/`minerd`) — unchanged, no version-rolling needed.
 - The Irium wallet binary with `poawx-register --emit-only` (Phase 19B+).
