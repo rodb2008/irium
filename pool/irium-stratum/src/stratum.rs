@@ -1,8 +1,7 @@
 use crate::block::{
     build_coinbase_tx, build_irx1_commitment_script, build_merkle_branches, coinbase_prefix_suffix,
     compute_receipts_root_from_pending, compute_receipts_root_from_pending_gated, header_bytes,
-    merkle_root_from_coinbase,
-    parse_address_to_pkh, parse_hex32, parse_u32_hex,
+    merkle_root_from_coinbase, parse_address_to_pkh, parse_hex32, parse_u32_hex,
 };
 use crate::pow::{hash_meets_target, sha256d, target_from_bits, target_from_difficulty_with_limit};
 use crate::template::{GetBlockTemplate, PoawxPendingReceipt, TemplateClient};
@@ -1755,7 +1754,7 @@ fn build_native_rewardable_coinbase(
             role_outs.push((fee_amt, payout_script_from_pkh(&fee_pkh)));
         }
         tx.push((1 + role_outs.len()) as u8); // irx1 + role/fee outputs
-        // irx1 OP_RETURN (zero value) first.
+                                              // irx1 OP_RETURN (zero value) first.
         tx.extend_from_slice(&0u64.to_le_bytes());
         tx.push(irx1_script.len() as u8);
         tx.extend_from_slice(&irx1_script);
@@ -4744,8 +4743,6 @@ mod tests {
         }
     }
 
-    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn sample_poawx_receipt() -> PoawxPendingReceipt {
         PoawxPendingReceipt {
             height: 1,
@@ -4891,7 +4888,11 @@ mod tests {
         // irx1 first, zero value, gated root.
         assert_eq!(outs[0].0, 0);
         let expected_root = compute_receipts_root_from_pending_gated(&[receipt], true);
-        assert_eq!(outs[0].1, build_irx1_commitment_script(&expected_root), "gated irx1 root");
+        assert_eq!(
+            outs[0].1,
+            build_irx1_commitment_script(&expected_root),
+            "gated irx1 root"
+        );
         // canonical 55/22/13/10 amounts (remainder -> primary), exact sum.
         let amts = crate::delegation::multi_role_amounts(snapshot.coinbase_value);
         let p2pkh = |pkh: &[u8; 20]| payout_script_from_pkh(pkh);
@@ -4912,7 +4913,10 @@ mod tests {
             "SUPPORT 10%"
         );
         let paid: u64 = outs.iter().skip(1).map(|(v, _)| *v).sum();
-        assert_eq!(paid, snapshot.coinbase_value, "split sums to coinbase value");
+        assert_eq!(
+            paid, snapshot.coinbase_value,
+            "split sums to coinbase value"
+        );
         // No fee output (official): every p2pkh is a role pkh; none is a fresh fee pkh.
         // (In the MVP single-miner case all role pkhs == primary; still exactly 4.)
         assert_eq!(outs.iter().filter(|(_, s)| s.len() == 25).count(), 4);
@@ -4925,7 +4929,10 @@ mod tests {
         rebuilt.extend_from_slice(&cb2);
         let marker_cb =
             build_native_rewardable_coinbase(&snapshot, &[0x1c, 0xab, 0xad, 0x1d]).unwrap();
-        assert_eq!(rebuilt, marker_cb, "notify split matches validation coinbase");
+        assert_eq!(
+            rebuilt, marker_cb,
+            "notify split matches validation coinbase"
+        );
 
         std::env::remove_var("IRIUM_NETWORK");
         std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
@@ -4982,11 +4989,19 @@ mod tests {
         let amts = crate::delegation::multi_role_amounts(snapshot.coinbase_value);
         let (pnet, pfee) = crate::delegation::apply_fee(amts[0], 200);
         let p2pkh = |pkh: &[u8; 20]| payout_script_from_pkh(pkh);
-        assert_eq!(outs[1], (pnet, p2pkh(&primary)), "PRIMARY net (gross - fee)");
+        assert_eq!(
+            outs[1],
+            (pnet, p2pkh(&primary)),
+            "PRIMARY net (gross - fee)"
+        );
         assert_eq!(outs[2].0, amts[1], "COMPUTE untaxed");
         assert_eq!(outs[3].0, amts[2], "VERIFY untaxed");
         assert_eq!(outs[4].0, amts[3], "SUPPORT untaxed");
-        assert_eq!(outs[5], (pfee, p2pkh(&fee_pkh)), "fee output to fee_pkh at position 6");
+        assert_eq!(
+            outs[5],
+            (pfee, p2pkh(&fee_pkh)),
+            "fee output to fee_pkh at position 6"
+        );
         // Total across the payout outputs is exactly the coinbase value (fee comes
         // out of PRIMARY, so net+fee == primary gross).
         let paid: u64 = outs.iter().skip(1).map(|(v, _)| *v).sum();
@@ -5032,7 +5047,10 @@ mod tests {
         let outs = parse_coinbase_outputs(&cb);
         // legacy: single payout + irx1 (2 outputs), NOT the 5-output multi-role shape.
         assert_eq!(outs.len(), 2, "pre-activation coinbase stays legacy");
-        assert_eq!(outs[0].0, snapshot.coinbase_value, "single full miner payout");
+        assert_eq!(
+            outs[0].0, snapshot.coinbase_value,
+            "single full miner payout"
+        );
     }
 
     #[test]
@@ -5240,8 +5258,15 @@ mod tests {
         assert!(!should_suppress_unsolicited_mask(None));
     }
 
+    // Share ONE process-wide env lock with the delegation env-mutating tests.
+    // These native-fixture tests set/clear IRIUM_NETWORK (via `native_fixture`),
+    // and so do the Step 6B/6C role-protocol/gossip tests in `delegation`; using a
+    // single mutex across both modules serializes all env mutation and prevents a
+    // cross-module env race (e.g. a concurrent test flipping IRIUM_NETWORK mid-fixture).
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-        TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+        crate::delegation::p20_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     fn reset_phase1_counters() {

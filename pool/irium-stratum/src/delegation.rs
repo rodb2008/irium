@@ -897,7 +897,9 @@ pub fn pool_third_party_fee_terms() -> Option<(u16, [u8; 20])> {
             a
         }
         _ => {
-            warn!("[poawx-deleg] IRIUM_POAWX_THIRD_PARTY_FEE_PKH invalid (need 40 hex); fee disabled");
+            warn!(
+                "[poawx-deleg] IRIUM_POAWX_THIRD_PARTY_FEE_PKH invalid (need 40 hex); fee disabled"
+            );
             return None;
         }
     };
@@ -1165,7 +1167,13 @@ pub fn synthetic_role_claims_enabled() -> bool {
 }
 
 /// Deterministic per-(role) 32-byte field for reproducible synthetic claims.
-fn synth_field(tag: &[u8], network_id: u8, height: u64, prev_hash: &[u8; 32], role_id: u8) -> [u8; 32] {
+fn synth_field(
+    tag: &[u8],
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    role_id: u8,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"IRIUM_POAWX_SYNTHETIC_V1");
     h.update(tag);
@@ -1561,7 +1569,11 @@ impl RoleProtocolStore {
 
     /// Deterministic one-per-role precommit selection for `target_height`: the
     /// precommit with the smallest (solver_pkh, commitment_hash). None if absent.
-    pub fn canonical_precommit(&self, target_height: u64, role_id: u8) -> Option<ValidatedPrecommit> {
+    pub fn canonical_precommit(
+        &self,
+        target_height: u64,
+        role_id: u8,
+    ) -> Option<ValidatedPrecommit> {
         let g = self.precommits.lock().unwrap_or_else(|e| e.into_inner());
         g.iter()
             .filter(|((t, r, _), _)| *t == target_height && *r == role_id)
@@ -1643,6 +1655,277 @@ pub fn build_collected_phase20_ext(
         fee_pkh,
         precommit_root: Some(next_root),
     })
+}
+
+// ── Step 6C: testnet/devnet role precommit/reveal gossip plumbing ────────────
+// Versioned gossip envelopes + a conservative validate→dedupe→store→(maybe)
+// rebroadcast engine, reusing the Step 6B DTOs/store/primitives (one model).
+// Mainnet hard-off; default off unless IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1 AND the
+// Step 6B role protocol is enabled.
+//
+// SCOPE: this is the payload + validation + in-memory relay layer. The live
+// cross-process bridge (node P2P receive → this pool store, and pool → node
+// broadcast) is intentionally NOT wired here — the node P2P bus and this store
+// live in separate crates/processes joined only by RPC. The node side reserves
+// the forward-compatible wire variants (`MessageType::PoawxRolePrecommit`/
+// `PoawxRoleReveal`); a future step bridges them to this engine. No public
+// ports, no live E2E in this step.
+
+/// Versioned role-gossip envelope version. Receivers reject other versions.
+pub const ROLE_GOSSIP_VERSION: u8 = 1;
+
+/// Conservative upper bound on an accepted role-gossip payload (bytes). Anti-flood
+/// guard; well above the largest legitimate reveal envelope.
+pub const ROLE_GOSSIP_MAX_BYTES: usize = 4096;
+
+/// Soft cap on the dedupe seen-set before it is cleared (the seen-set holds
+/// opaque digests with no height, so it is bounded by size rather than pruned by
+/// height; the store itself is pruned by height via `RoleProtocolStore::prune`).
+pub const ROLE_GOSSIP_SEEN_CAP: usize = 8192;
+
+/// Whether role-gossip ingest is enabled. Requires BOTH the Step 6B role protocol
+/// (`IRIUM_POAWX_ROLE_PROTOCOL_ENABLED=1`, mainnet hard-off) AND the gossip opt-in
+/// (`IRIUM_POAWX_ROLE_GOSSIP_ENABLED=1`). Default off.
+pub fn role_gossip_enabled() -> bool {
+    role_protocol_enabled()
+        && env::var("IRIUM_POAWX_ROLE_GOSSIP_ENABLED")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+}
+
+/// Versioned gossip envelope for a role precommit. Inner DTO is the Step 6B
+/// `RolePrecommitDto` (hides secret/nonce).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolePrecommitGossip {
+    pub gossip_version: u8,
+    pub precommit: RolePrecommitDto,
+}
+
+/// Versioned gossip envelope for a role reveal. Inner DTO is the Step 6B
+/// `RoleRevealDto` (carries secret/nonce + claim fields).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleRevealGossip {
+    pub gossip_version: u8,
+    pub reveal: RoleRevealDto,
+}
+
+impl RolePrecommitGossip {
+    pub fn new(precommit: RolePrecommitDto) -> Self {
+        Self {
+            gossip_version: ROLE_GOSSIP_VERSION,
+            precommit,
+        }
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > ROLE_GOSSIP_MAX_BYTES {
+            return Err("role gossip: precommit payload too large".to_string());
+        }
+        let g: RolePrecommitGossip = serde_json::from_slice(bytes)
+            .map_err(|e| format!("role gossip: malformed precommit: {e}"))?;
+        if g.gossip_version != ROLE_GOSSIP_VERSION {
+            return Err(format!(
+                "role gossip: unsupported precommit version {}",
+                g.gossip_version
+            ));
+        }
+        Ok(g)
+    }
+}
+
+impl RoleRevealGossip {
+    pub fn new(reveal: RoleRevealDto) -> Self {
+        Self {
+            gossip_version: ROLE_GOSSIP_VERSION,
+            reveal,
+        }
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > ROLE_GOSSIP_MAX_BYTES {
+            return Err("role gossip: reveal payload too large".to_string());
+        }
+        let g: RoleRevealGossip = serde_json::from_slice(bytes)
+            .map_err(|e| format!("role gossip: malformed reveal: {e}"))?;
+        if g.gossip_version != ROLE_GOSSIP_VERSION {
+            return Err(format!(
+                "role gossip: unsupported reveal version {}",
+                g.gossip_version
+            ));
+        }
+        Ok(g)
+    }
+}
+
+/// Stable, mutation-sensitive dedupe digest for a validated reveal. (Precommits
+/// dedupe on `ValidatedPrecommit::leaf()`, which already binds net/height/role/
+/// solver/commitment.)
+fn reveal_gossip_digest(r: &ValidatedReveal) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"IRIUM_POAWX_ROLE_REVEAL_GOSSIP_V1");
+    h.update([r.network_id]);
+    h.update(r.target_height.to_le_bytes());
+    h.update([r.claim.role_id, r.claim.lane_id]);
+    h.update(r.claim.solver_pkh);
+    h.update(r.claim.nonce);
+    h.update(r.claim.secret);
+    h.update(r.claim.claim_digest);
+    if let Some(c) = r.claim.commitment_hash {
+        h.update(c);
+    }
+    h.finalize().into()
+}
+
+/// Outcome of ingesting one gossip payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GossipOutcome {
+    /// Valid and newly stored — the caller SHOULD rebroadcast to other peers.
+    AcceptedNew,
+    /// Valid but already seen — stored once already; do NOT rebroadcast (stops
+    /// gossip-flood loops).
+    Duplicate,
+    /// Invalid / disabled / out-of-window / no-matching-precommit — NOT stored,
+    /// NEVER rebroadcast.
+    Rejected(String),
+}
+
+impl GossipOutcome {
+    /// Only a newly-accepted payload is rebroadcast; duplicates and rejects are not.
+    pub fn should_rebroadcast(&self) -> bool {
+        matches!(self, GossipOutcome::AcceptedNew)
+    }
+    /// True if the payload is (now or already) in the store.
+    pub fn accepted(&self) -> bool {
+        matches!(self, GossipOutcome::AcceptedNew | GossipOutcome::Duplicate)
+    }
+}
+
+/// Conservative role-gossip engine: validate first, dedupe by stable digest, store
+/// only if valid and within the height window, never rebroadcast invalid. Holds
+/// the seen-digest set separately from the store, so Step 6B store semantics are
+/// unchanged.
+#[derive(Default)]
+pub struct RoleGossipEngine {
+    seen: Mutex<std::collections::BTreeSet<[u8; 32]>>,
+}
+
+impl RoleGossipEngine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accept `target_height` in `[tip, tip + ROLE_PROTOCOL_HEIGHT_WINDOW]`:
+    /// precommits/reveals target the block being built (>= tip), and we bound how
+    /// far ahead we accept. Older than `tip` is stale; further than the window is
+    /// far-future.
+    fn height_in_window(target: u64, tip: u64) -> bool {
+        target >= tip && target <= tip.saturating_add(ROLE_PROTOCOL_HEIGHT_WINDOW)
+    }
+
+    fn mark_seen(&self, digest: [u8; 32]) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= ROLE_GOSSIP_SEEN_CAP {
+            seen.clear();
+        }
+        seen.insert(digest);
+    }
+
+    fn already_seen(&self, digest: &[u8; 32]) -> bool {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(digest)
+    }
+
+    /// Ingest a role-precommit gossip payload. `expected_network` is the local
+    /// network id (0 = mainnet hard-off); `tip` is the current chain tip height.
+    pub fn ingest_precommit(
+        &self,
+        store: &RoleProtocolStore,
+        bytes: &[u8],
+        expected_network: u8,
+        tip: u64,
+    ) -> GossipOutcome {
+        if expected_network == 0 || !role_gossip_enabled() {
+            return GossipOutcome::Rejected("role gossip disabled".to_string());
+        }
+        let g = match RolePrecommitGossip::decode(bytes) {
+            Ok(g) => g,
+            Err(e) => return GossipOutcome::Rejected(e),
+        };
+        let v = match g.precommit.validate(expected_network) {
+            Ok(v) => v,
+            Err(e) => return GossipOutcome::Rejected(e),
+        };
+        if !Self::height_in_window(v.target_height, tip) {
+            return GossipOutcome::Rejected(format!(
+                "role gossip: precommit height {} outside window [{}, {}]",
+                v.target_height,
+                tip,
+                tip.saturating_add(ROLE_PROTOCOL_HEIGHT_WINDOW)
+            ));
+        }
+        let digest = v.leaf();
+        if self.already_seen(&digest) {
+            return GossipOutcome::Duplicate;
+        }
+        // store policy (Step 6B): duplicate-different-commitment fails closed.
+        if let Err(e) = store.add_precommit(v) {
+            return GossipOutcome::Rejected(e);
+        }
+        self.mark_seen(digest);
+        GossipOutcome::AcceptedNew
+    }
+
+    /// Ingest a role-reveal gossip payload. A reveal without a matching precommit
+    /// is rejected GRACEFULLY per Step 6B store policy (no crash, not stored, not
+    /// rebroadcast).
+    pub fn ingest_reveal(
+        &self,
+        store: &RoleProtocolStore,
+        bytes: &[u8],
+        expected_network: u8,
+        tip: u64,
+    ) -> GossipOutcome {
+        if expected_network == 0 || !role_gossip_enabled() {
+            return GossipOutcome::Rejected("role gossip disabled".to_string());
+        }
+        let g = match RoleRevealGossip::decode(bytes) {
+            Ok(g) => g,
+            Err(e) => return GossipOutcome::Rejected(e),
+        };
+        let v = match g.reveal.validate(expected_network) {
+            Ok(v) => v,
+            Err(e) => return GossipOutcome::Rejected(e),
+        };
+        if !Self::height_in_window(v.target_height, tip) {
+            return GossipOutcome::Rejected(format!(
+                "role gossip: reveal height {} outside window [{}, {}]",
+                v.target_height,
+                tip,
+                tip.saturating_add(ROLE_PROTOCOL_HEIGHT_WINDOW)
+            ));
+        }
+        let digest = reveal_gossip_digest(&v);
+        if self.already_seen(&digest) {
+            return GossipOutcome::Duplicate;
+        }
+        if let Err(e) = store.add_reveal(v) {
+            return GossipOutcome::Rejected(e);
+        }
+        self.mark_seen(digest);
+        GossipOutcome::AcceptedNew
+    }
+
+    /// Prune the backing store by height (mirrors the Step 6B window). The seen-set
+    /// is size-bounded separately (see `mark_seen`).
+    pub fn prune(&self, store: &RoleProtocolStore, tip: u64) {
+        store.prune(tip);
+    }
 }
 
 // ── HTTP server (raw-TCP, loopback-only by config; opt-in) ───────────────────
@@ -1873,8 +2156,11 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
             Some(p) => {
                 // Advertise the pool's configured third-party fee terms (or fee-0
                 // when official / mode off / mainnet).
-                let v =
-                    pool_identity_json(&p.key.pubkey_hex(), p.network_id, pool_third_party_fee_terms());
+                let v = pool_identity_json(
+                    &p.key.pubkey_hex(),
+                    p.network_id,
+                    pool_third_party_fee_terms(),
+                );
                 respond(&mut stream, 200, "OK", &v).await
             }
         },
@@ -1978,8 +2264,13 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
             let producer = match &ctx.producer {
                 Some(p) => p,
                 None => {
-                    respond(&mut stream, 503, "Service Unavailable",
-                        &serde_json::json!({"error":"role protocol unavailable on mainnet"})).await;
+                    respond(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        &serde_json::json!({"error":"role protocol unavailable on mainnet"}),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -2005,12 +2296,22 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
             };
             match result {
                 Ok(kind) => {
-                    respond(&mut stream, 200, "OK",
-                        &serde_json::json!({"status":"accepted","kind":kind})).await
+                    respond(
+                        &mut stream,
+                        200,
+                        "OK",
+                        &serde_json::json!({"status":"accepted","kind":kind}),
+                    )
+                    .await
                 }
                 Err(e) => {
-                    respond(&mut stream, 400, "Bad Request",
-                        &serde_json::json!({"error": e})).await
+                    respond(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        &serde_json::json!({"error": e}),
+                    )
+                    .await
                 }
             }
         }
@@ -2516,7 +2817,10 @@ mod tests {
         assert_eq!(v["fee_bps"], 0);
         assert_eq!(v["deleg_version"], Delegation::VERSION);
         assert_eq!(v["domain"], "irium.poawx.delegation.v1");
-        assert!(v.get("fee_pkh").is_none(), "official identity has no fee_pkh");
+        assert!(
+            v.get("fee_pkh").is_none(),
+            "official identity has no fee_pkh"
+        );
         // Third-party identity advertises exact fee terms.
         let fp = [0xFEu8; 20];
         let vt = pool_identity_json(&pk, 1, Some((200, fp)));
@@ -2705,7 +3009,11 @@ mod tests {
             verify_contributor_pkh: [0xC2u8; 20],
             support_contributor_pkh: [0xC3u8; 20],
         };
-        assert_eq!(rr.serialize(), node_rr.serialize(), "RoleReward wire parity");
+        assert_eq!(
+            rr.serialize(),
+            node_rr.serialize(),
+            "RoleReward wire parity"
+        );
 
         // multi_role_amounts parity over a range incl. remainder cases.
         for total in [0u64, 1, 7, 999, 5_000_000_000, 5_000_000_001, u64::MAX / 2] {
@@ -2734,7 +3042,16 @@ mod tests {
                 irium_node_rs::poawx::assign_lane(1, 100, &prev, role, 0).id()
             );
             assert_eq!(
-                role_claim_digest(1, 100, &prev, role, 0, &[0x07u8; 20], &[1u8; 32], &[2u8; 32]),
+                role_claim_digest(
+                    1,
+                    100,
+                    &prev,
+                    role,
+                    0,
+                    &[0x07u8; 20],
+                    &[1u8; 32],
+                    &[2u8; 32]
+                ),
                 irium_node_rs::poawx::role_claim_digest(
                     1,
                     100,
@@ -2767,7 +3084,11 @@ mod tests {
             claim_digest: [role.wrapping_add(2); 32],
             commitment_hash: None,
         };
-        assert_eq!(mk_pool(1).serialize(), mk_node(1).serialize(), "RoleClaim parity");
+        assert_eq!(
+            mk_pool(1).serialize(),
+            mk_node(1).serialize(),
+            "RoleClaim parity"
+        );
         let ext = Phase20ReceiptExtMirror {
             role_reward: rr,
             compute_claim: mk_pool(1),
@@ -2786,7 +3107,11 @@ mod tests {
             fee_pkh: [0u8; 20],
             precommit_root: None,
         };
-        assert_eq!(ext.serialize(), node_ext.serialize(), "Phase20ReceiptExt wire parity");
+        assert_eq!(
+            ext.serialize(),
+            node_ext.serialize(),
+            "Phase20ReceiptExt wire parity"
+        );
         assert_eq!(ext.digest(), node_ext.digest(), "ext digest parity");
         // The node can deserialize the pool's bytes back to the identical type.
         let round = irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
@@ -2846,19 +3171,33 @@ mod tests {
         let primary = [0xA1u8; 20];
         let total = 5_000_000_001u64;
 
-        let ext = build_synthetic_phase20_ext(net, height, &prev, &primary, &[], None).expect("ext");
+        let ext =
+            build_synthetic_phase20_ext(net, height, &prev, &primary, &[], None).expect("ext");
         // three role claims, expected role ids, solver == primary (MVP single-miner).
         assert_eq!(ext.compute_claim.role_id, ROLE_COMPUTE_CONTRIBUTOR);
         assert_eq!(ext.verify_claim.role_id, ROLE_VERIFY_CONTRIBUTOR);
         assert_eq!(ext.support_claim.role_id, ROLE_SUPPORT_CONTRIBUTOR);
-        assert_eq!(ext.role_reward.compute_contributor_pkh, ext.compute_claim.solver_pkh);
-        assert_eq!(ext.role_reward.verify_contributor_pkh, ext.verify_claim.solver_pkh);
-        assert_eq!(ext.role_reward.support_contributor_pkh, ext.support_claim.solver_pkh);
+        assert_eq!(
+            ext.role_reward.compute_contributor_pkh,
+            ext.compute_claim.solver_pkh
+        );
+        assert_eq!(
+            ext.role_reward.verify_contributor_pkh,
+            ext.verify_claim.solver_pkh
+        );
+        assert_eq!(
+            ext.role_reward.support_contributor_pkh,
+            ext.support_claim.solver_pkh
+        );
         assert_eq!(ext.fee_bps, 0, "official fee-0 only");
         assert_eq!(ext.fee_pkh, [0u8; 20]);
         // deterministic / reproducible.
         let ext2 = build_synthetic_phase20_ext(net, height, &prev, &primary, &[], None).unwrap();
-        assert_eq!(ext.serialize(), ext2.serialize(), "synthetic builder is deterministic");
+        assert_eq!(
+            ext.serialize(),
+            ext2.serialize(),
+            "synthetic builder is deterministic"
+        );
 
         // each claim validates via the node consensus primitive.
         let node_ext =
@@ -2887,7 +3226,10 @@ mod tests {
         };
         let outs = vec![
             irx1,
-            irium_node_rs::tx::TxOutput { value: amts[0], script_pubkey: p2pkh(&primary) },
+            irium_node_rs::tx::TxOutput {
+                value: amts[0],
+                script_pubkey: p2pkh(&primary),
+            },
             irium_node_rs::tx::TxOutput {
                 value: amts[1],
                 script_pubkey: p2pkh(&node_ext.role_reward.compute_contributor_pkh),
@@ -2917,22 +3259,34 @@ mod tests {
         // Tamper cases rejected by the node validator.
         let mut bad = outs.clone();
         bad[1].value += 1;
-        assert!(irium_node_rs::chain::validate_phase20_production_payout(
-            &bad, &primary, total, height, &prev, net, &node_ext, false
-        )
-        .is_err(), "wrong amount must reject");
+        assert!(
+            irium_node_rs::chain::validate_phase20_production_payout(
+                &bad, &primary, total, height, &prev, net, &node_ext, false
+            )
+            .is_err(),
+            "wrong amount must reject"
+        );
         let mut bad = outs.clone();
         bad.swap(1, 2);
-        assert!(irium_node_rs::chain::validate_phase20_production_payout(
-            &bad, &primary, total, height, &prev, net, &node_ext, false
-        )
-        .is_err(), "wrong order must reject");
+        assert!(
+            irium_node_rs::chain::validate_phase20_production_payout(
+                &bad, &primary, total, height, &prev, net, &node_ext, false
+            )
+            .is_err(),
+            "wrong order must reject"
+        );
         let mut bad = outs.clone();
-        bad.push(irium_node_rs::tx::TxOutput { value: 1, script_pubkey: p2pkh(&[0x9Au8; 20]) });
-        assert!(irium_node_rs::chain::validate_phase20_production_payout(
-            &bad, &primary, total, height, &prev, net, &node_ext, false
-        )
-        .is_err(), "hidden extra output must reject");
+        bad.push(irium_node_rs::tx::TxOutput {
+            value: 1,
+            script_pubkey: p2pkh(&[0x9Au8; 20]),
+        });
+        assert!(
+            irium_node_rs::chain::validate_phase20_production_payout(
+                &bad, &primary, total, height, &prev, net, &node_ext, false
+            )
+            .is_err(),
+            "hidden extra output must reject"
+        );
 
         std::env::remove_var("IRIUM_NETWORK");
         std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
@@ -2953,7 +3307,17 @@ mod tests {
         // Official mode (expected_fee None) rejects a nonzero-fee delegation.
         let d_fee = mirror_signed_fee(&miner, pool_pub, 1, "rig1", 100, 150, fee_pkh);
         assert_eq!(
-            verify_and_store(&store, &hex::encode(d_fee.serialize()), "rig1", "", &pool_pub, 1, 10, 1, None),
+            verify_and_store(
+                &store,
+                &hex::encode(d_fee.serialize()),
+                "rig1",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1,
+                None
+            ),
             Err(DelegError::NonZeroFee),
             "official mode rejects nonzero fee"
         );
@@ -2981,25 +3345,65 @@ mod tests {
 
         // fee_bps mismatch vs pool config rejects.
         assert_eq!(
-            verify_and_store(&store, &hex::encode(d_fee.serialize()), "rig1", "", &pool_pub, 1, 10, 1, Some((100, fee_pkh))),
+            verify_and_store(
+                &store,
+                &hex::encode(d_fee.serialize()),
+                "rig1",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1,
+                Some((100, fee_pkh))
+            ),
             Err(DelegError::FeeMismatch)
         );
         // fee_pkh mismatch rejects.
         assert_eq!(
-            verify_and_store(&store, &hex::encode(d_fee.serialize()), "rig1", "", &pool_pub, 1, 10, 1, Some((150, [0xABu8; 20]))),
+            verify_and_store(
+                &store,
+                &hex::encode(d_fee.serialize()),
+                "rig1",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1,
+                Some((150, [0xABu8; 20]))
+            ),
             Err(DelegError::FeePkhMismatch)
         );
         // Over-cap pool config never accepts a fee.
         let d_over = mirror_signed_fee(&miner, pool_pub, 1, "rig1", 100, 201, fee_pkh);
         assert_eq!(
-            verify_and_store(&store, &hex::encode(d_over.serialize()), "rig1", "", &pool_pub, 1, 10, 1, Some((201, fee_pkh))),
+            verify_and_store(
+                &store,
+                &hex::encode(d_over.serialize()),
+                "rig1",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1,
+                Some((201, fee_pkh))
+            ),
             Err(DelegError::FeeMismatch)
         );
         // Post-signing fee mutation breaks the signature.
         let mut tampered = d_fee.clone();
         tampered.fee_bps = 100; // not re-signed
         assert_eq!(
-            verify_and_store(&store, &hex::encode(tampered.serialize()), "rig1", "", &pool_pub, 1, 10, 1, Some((100, fee_pkh))),
+            verify_and_store(
+                &store,
+                &hex::encode(tampered.serialize()),
+                "rig1",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1,
+                Some((100, fee_pkh))
+            ),
             Err(DelegError::BadSignature)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3018,8 +3422,9 @@ mod tests {
         let fee_pkh = [0xFEu8; 20];
 
         // With fee terms, the ext carries them; without, official 0.
-        let ext = build_synthetic_phase20_ext(net, height, &prev, &primary, &[], Some((200, fee_pkh)))
-            .expect("ext");
+        let ext =
+            build_synthetic_phase20_ext(net, height, &prev, &primary, &[], Some((200, fee_pkh)))
+                .expect("ext");
         assert_eq!(ext.fee_bps, 200);
         assert_eq!(ext.fee_pkh, fee_pkh);
         // fee terms recoverable from the hex tail.
@@ -3030,10 +3435,20 @@ mod tests {
         // ext digest changes when fee_bps or fee_pkh change.
         let ext0 = build_synthetic_phase20_ext(net, height, &prev, &primary, &[], None).unwrap();
         assert_ne!(ext.digest(), ext0.digest(), "fee changes ext digest");
-        let ext_pkh2 =
-            build_synthetic_phase20_ext(net, height, &prev, &primary, &[], Some((200, [0x11u8; 20])))
-                .unwrap();
-        assert_ne!(ext.digest(), ext_pkh2.digest(), "fee_pkh changes ext digest");
+        let ext_pkh2 = build_synthetic_phase20_ext(
+            net,
+            height,
+            &prev,
+            &primary,
+            &[],
+            Some((200, [0x11u8; 20])),
+        )
+        .unwrap();
+        assert_ne!(
+            ext.digest(),
+            ext_pkh2.digest(),
+            "fee_pkh changes ext digest"
+        );
 
         // The node validator accepts the fee-aware fixture in third-party mode and
         // rejects it without third-party mode.
@@ -3048,12 +3463,30 @@ mod tests {
             s
         };
         let outs = vec![
-            irium_node_rs::tx::TxOutput { value: 0, script_pubkey: vec![0x6a, 0x24, b'i', b'r', b'x', b'1'] },
-            irium_node_rs::tx::TxOutput { value: pnet, script_pubkey: p2pkh(&primary) },
-            irium_node_rs::tx::TxOutput { value: amts[1], script_pubkey: p2pkh(&node_ext.role_reward.compute_contributor_pkh) },
-            irium_node_rs::tx::TxOutput { value: amts[2], script_pubkey: p2pkh(&node_ext.role_reward.verify_contributor_pkh) },
-            irium_node_rs::tx::TxOutput { value: amts[3], script_pubkey: p2pkh(&node_ext.role_reward.support_contributor_pkh) },
-            irium_node_rs::tx::TxOutput { value: pfee, script_pubkey: p2pkh(&fee_pkh) },
+            irium_node_rs::tx::TxOutput {
+                value: 0,
+                script_pubkey: vec![0x6a, 0x24, b'i', b'r', b'x', b'1'],
+            },
+            irium_node_rs::tx::TxOutput {
+                value: pnet,
+                script_pubkey: p2pkh(&primary),
+            },
+            irium_node_rs::tx::TxOutput {
+                value: amts[1],
+                script_pubkey: p2pkh(&node_ext.role_reward.compute_contributor_pkh),
+            },
+            irium_node_rs::tx::TxOutput {
+                value: amts[2],
+                script_pubkey: p2pkh(&node_ext.role_reward.verify_contributor_pkh),
+            },
+            irium_node_rs::tx::TxOutput {
+                value: amts[3],
+                script_pubkey: p2pkh(&node_ext.role_reward.support_contributor_pkh),
+            },
+            irium_node_rs::tx::TxOutput {
+                value: pfee,
+                script_pubkey: p2pkh(&fee_pkh),
+            },
         ];
         irium_node_rs::chain::validate_phase20_production_payout(
             &outs, &primary, total, height, &prev, net, &node_ext, true,
@@ -3088,8 +3521,14 @@ mod tests {
         // reveals height-2's claims.
         let ext1 = build_synthetic_phase20_ext(net, 1, &prev1, &primary, &[], None).expect("ext1");
         let ext2 = build_synthetic_phase20_ext(net, 2, &prev2, &primary, &[], None).expect("ext2");
-        assert!(ext1.precommit_root.is_some(), "producer commits next-height root");
-        assert!(ext2.compute_claim.commitment_hash.is_some(), "reveal carries commitment");
+        assert!(
+            ext1.precommit_root.is_some(),
+            "producer commits next-height root"
+        );
+        assert!(
+            ext2.compute_claim.commitment_hash.is_some(),
+            "reveal carries commitment"
+        );
         // The committed root equals the pool's deterministic height-2 root.
         assert_eq!(
             ext1.precommit_root.unwrap(),
@@ -3144,7 +3583,14 @@ mod tests {
 
     // ── Step 6B: role precommit/reveal protocol payloads + store + production ──
 
-    fn mk_precommit_dto(net: u8, h: u64, role: u8, solver: [u8; 20], secret: [u8; 32], nonce: [u8; 32]) -> RolePrecommitDto {
+    fn mk_precommit_dto(
+        net: u8,
+        h: u64,
+        role: u8,
+        solver: [u8; 20],
+        secret: [u8; 32],
+        nonce: [u8; 32],
+    ) -> RolePrecommitDto {
         RolePrecommitDto {
             network_id: net,
             target_height: h,
@@ -3154,7 +3600,15 @@ mod tests {
             worker: String::new(),
         }
     }
-    fn mk_reveal_dto(net: u8, h: u64, prev: &[u8; 32], role: u8, solver: [u8; 20], secret: [u8; 32], nonce: [u8; 32]) -> RoleRevealDto {
+    fn mk_reveal_dto(
+        net: u8,
+        h: u64,
+        prev: &[u8; 32],
+        role: u8,
+        solver: [u8; 20],
+        secret: [u8; 32],
+        nonce: [u8; 32],
+    ) -> RoleRevealDto {
         let lane = assign_lane_id(net, h, prev, role, 0);
         let cd = role_claim_digest(net, h, prev, role, lane, &solver, &nonce, &secret);
         RoleRevealDto {
@@ -3174,7 +3628,11 @@ mod tests {
     fn phase20_role_protocol_payloads_and_store() {
         let net = 1u8;
         let prev = [0x77u8; 32];
-        let roles = [ROLE_COMPUTE_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR];
+        let roles = [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ];
         let solvers = [[0xA1u8; 20], [0xA2u8; 20], [0xA3u8; 20]];
         let sn = |role: u8| ([role; 32], [role.wrapping_add(100); 32]);
 
@@ -3183,15 +3641,22 @@ mod tests {
         let pc = mk_precommit_dto(net, 2, ROLE_COMPUTE_CONTRIBUTOR, solvers[0], s, n);
         // precommit hides secret/nonce (DTO has no such fields).
         let pc_json = serde_json::to_string(&pc).unwrap();
-        assert!(!pc_json.contains(&hex::encode(s)) && !pc_json.contains(&hex::encode(n)), "precommit hides secret/nonce");
+        assert!(
+            !pc_json.contains(&hex::encode(s)) && !pc_json.contains(&hex::encode(n)),
+            "precommit hides secret/nonce"
+        );
         // JSON round-trip.
         let pc2: RolePrecommitDto = serde_json::from_str(&pc_json).unwrap();
         assert_eq!(pc2.validate(net).unwrap(), pc.validate(net).unwrap());
         let rv = mk_reveal_dto(net, 2, &prev, ROLE_COMPUTE_CONTRIBUTOR, solvers[0], s, n);
-        let rv2: RoleRevealDto = serde_json::from_str(&serde_json::to_string(&rv).unwrap()).unwrap();
+        let rv2: RoleRevealDto =
+            serde_json::from_str(&serde_json::to_string(&rv).unwrap()).unwrap();
         // reveal reconstructs commitment_hash from secret/nonce (validate succeeds).
         let vr = rv2.validate(net).unwrap();
-        assert_eq!(vr.claim.commitment_hash, Some(role_precommit_commitment(&s, &n)));
+        assert_eq!(
+            vr.claim.commitment_hash,
+            Some(role_precommit_commitment(&s, &n))
+        );
         // mutation: a reveal whose commitment doesn't match secret/nonce rejects.
         let mut bad = rv.clone();
         bad.commitment_hash = hex::encode([0xEEu8; 32]);
@@ -3215,22 +3680,54 @@ mod tests {
         for h in [2u64, 3u64] {
             for (i, &role) in roles.iter().enumerate() {
                 let (s, n) = sn(role);
-                store.add_precommit(mk_precommit_dto(net, h, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+                store
+                    .add_precommit(
+                        mk_precommit_dto(net, h, role, solvers[i], s, n)
+                            .validate(net)
+                            .unwrap(),
+                    )
+                    .unwrap();
             }
         }
         // duplicate same-commitment is idempotent; different-commitment rejects.
         let (s0, n0) = sn(ROLE_COMPUTE_CONTRIBUTOR);
-        store.add_precommit(mk_precommit_dto(net, 2, ROLE_COMPUTE_CONTRIBUTOR, solvers[0], s0, n0).validate(net).unwrap()).unwrap();
+        store
+            .add_precommit(
+                mk_precommit_dto(net, 2, ROLE_COMPUTE_CONTRIBUTOR, solvers[0], s0, n0)
+                    .validate(net)
+                    .unwrap(),
+            )
+            .unwrap();
         let mut diff = mk_precommit_dto(net, 2, ROLE_COMPUTE_CONTRIBUTOR, solvers[0], s0, n0);
         diff.commitment_hash = hex::encode([0x01u8; 32]);
-        assert!(store.add_precommit(diff.validate(net).unwrap()).is_err(), "dup different commitment rejects");
+        assert!(
+            store.add_precommit(diff.validate(net).unwrap()).is_err(),
+            "dup different commitment rejects"
+        );
         // reveal without precommit rejects (height 2, solver not precommitted).
-        let orphan = mk_reveal_dto(net, 2, &prev, ROLE_COMPUTE_CONTRIBUTOR, [0xBBu8; 20], s0, n0);
-        assert!(store.add_reveal(orphan.validate(net).unwrap()).is_err(), "reveal w/o precommit rejects");
+        let orphan = mk_reveal_dto(
+            net,
+            2,
+            &prev,
+            ROLE_COMPUTE_CONTRIBUTOR,
+            [0xBBu8; 20],
+            s0,
+            n0,
+        );
+        assert!(
+            store.add_reveal(orphan.validate(net).unwrap()).is_err(),
+            "reveal w/o precommit rejects"
+        );
         // valid reveals for height 2 accepted.
         for (i, &role) in roles.iter().enumerate() {
             let (s, n) = sn(role);
-            store.add_reveal(mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+            store
+                .add_reveal(
+                    mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n)
+                        .validate(net)
+                        .unwrap(),
+                )
+                .unwrap();
         }
         // selection: one per role; precommit_root deterministic.
         let sel = store.select_reveals(2).expect("3 reveals");
@@ -3238,7 +3735,10 @@ mod tests {
         assert_eq!(sel[2].claim.role_id, ROLE_SUPPORT_CONTRIBUTOR);
         let root2 = store.precommit_root_for(2).expect("root2");
         assert_eq!(root2, store.precommit_root_for(2).unwrap(), "deterministic");
-        assert!(store.precommit_root_for(3).is_some(), "next-height root present");
+        assert!(
+            store.precommit_root_for(3).is_some(),
+            "next-height root present"
+        );
         // prune drops stale (window 64): targeting tip far ahead removes height 2/3.
         store.prune(2 + ROLE_PROTOCOL_HEIGHT_WINDOW + 5);
         assert!(store.precommit_root_for(2).is_none(), "pruned stale");
@@ -3254,52 +3754,505 @@ mod tests {
         std::env::set_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", "1");
         let net = 1u8;
         let prev = [0x55u8; 32];
-        let roles = [ROLE_COMPUTE_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR];
+        let roles = [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ];
         let solvers = [[0xA1u8; 20], [0xA2u8; 20], [0xA3u8; 20]];
         let sn = |role: u8| ([role; 32], [role.wrapping_add(50); 32]);
         let store = RoleProtocolStore::new();
         // precommits+reveals for height 2; precommits for height 3 (next).
         for (i, &role) in roles.iter().enumerate() {
             let (s, n) = sn(role);
-            store.add_precommit(mk_precommit_dto(net, 2, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
-            store.add_precommit(mk_precommit_dto(net, 3, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
-            store.add_reveal(mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+            store
+                .add_precommit(
+                    mk_precommit_dto(net, 2, role, solvers[i], s, n)
+                        .validate(net)
+                        .unwrap(),
+                )
+                .unwrap();
+            store
+                .add_precommit(
+                    mk_precommit_dto(net, 3, role, solvers[i], s, n)
+                        .validate(net)
+                        .unwrap(),
+                )
+                .unwrap();
+            store
+                .add_reveal(
+                    mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n)
+                        .validate(net)
+                        .unwrap(),
+                )
+                .unwrap();
         }
         // COLLECTED production ext for height 2.
         let ext = build_collected_phase20_ext(&store, net, 2, None).expect("collected ext");
-        assert_eq!(ext.precommit_root, store.precommit_root_for(3), "commits next-height root");
+        assert_eq!(
+            ext.precommit_root,
+            store.precommit_root_for(3),
+            "commits next-height root"
+        );
         assert_eq!(ext.role_reward.compute_contributor_pkh, solvers[0]);
 
         // Node parity: each revealed claim validates against fairness + reconstructs
         // a leaf; the sorted root equals the PARENT's committed root (root_for(2)).
-        let node_ext = irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        let node_ext =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
         let mut leaves = Vec::new();
-        for c in [&node_ext.compute_claim, &node_ext.verify_claim, &node_ext.support_claim] {
+        for c in [
+            &node_ext.compute_claim,
+            &node_ext.verify_claim,
+            &node_ext.support_claim,
+        ] {
             irium_node_rs::poawx::validate_role_claim(c, net, 2, &prev, 0).expect("claim valid");
-            leaves.push(irium_node_rs::poawx::role_precommit_leaf_for_claim(c, net, 2).expect("leaf"));
+            leaves.push(
+                irium_node_rs::poawx::role_precommit_leaf_for_claim(c, net, 2).expect("leaf"),
+            );
         }
-        assert_eq!(irium_node_rs::poawx::role_precommit_root(&leaves), store.precommit_root_for(2).unwrap(),
-            "reveal leaves root == parent committed root");
+        assert_eq!(
+            irium_node_rs::poawx::role_precommit_root(&leaves),
+            store.precommit_root_for(2).unwrap(),
+            "reveal leaves root == parent committed root"
+        );
 
         // missing role reveal => fail closed (None) after activation.
         let store2 = RoleProtocolStore::new();
         for (i, &role) in roles.iter().enumerate().take(2) {
             let (s, n) = sn(role);
-            store2.add_precommit(mk_precommit_dto(net, 2, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
-            store2.add_reveal(mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n).validate(net).unwrap()).unwrap();
+            store2
+                .add_precommit(
+                    mk_precommit_dto(net, 2, role, solvers[i], s, n)
+                        .validate(net)
+                        .unwrap(),
+                )
+                .unwrap();
+            store2
+                .add_reveal(
+                    mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n)
+                        .validate(net)
+                        .unwrap(),
+                )
+                .unwrap();
         }
-        assert!(build_collected_phase20_ext(&store2, net, 2, None).is_none(), "missing role => fail closed");
+        assert!(
+            build_collected_phase20_ext(&store2, net, 2, None).is_none(),
+            "missing role => fail closed"
+        );
 
         // off-path: role protocol disabled => None (falls back to synthetic upstream).
         std::env::remove_var("IRIUM_POAWX_ROLE_PROTOCOL_ENABLED");
-        assert!(build_collected_phase20_ext(&store, net, 2, None).is_none(), "disabled => None");
+        assert!(
+            build_collected_phase20_ext(&store, net, 2, None).is_none(),
+            "disabled => None"
+        );
         // mainnet hard-off.
-        assert!(build_collected_phase20_ext(&store, 0, 2, None).is_none(), "mainnet hard-off");
+        assert!(
+            build_collected_phase20_ext(&store, 0, 2, None).is_none(),
+            "mainnet hard-off"
+        );
         assert!(!role_protocol_enabled(), "gate off");
 
         std::env::remove_var("IRIUM_NETWORK");
         std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT");
+    }
+
+    // ── Step 6C: role gossip envelopes + engine + in-memory relay ─────────────
+
+    fn enable_role_gossip_env() {
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_ROLE_PROTOCOL_ENABLED", "1");
+        std::env::set_var("IRIUM_POAWX_ROLE_GOSSIP_ENABLED", "1");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", "1");
+    }
+    fn clear_role_gossip_env() {
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_ROLE_PROTOCOL_ENABLED");
+        std::env::remove_var("IRIUM_POAWX_ROLE_GOSSIP_ENABLED");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT");
+    }
+
+    // Tests 1–5: payload encoding (no env needed — pure encode/decode/validate).
+    #[test]
+    fn phase20_role_gossip_envelope_roundtrip_and_versioning() {
+        let net = 1u8;
+        let prev = [0x33u8; 32];
+        let (s, n) = ([0x11u8; 32], [0x22u8; 32]);
+        let solver = [0xC1u8; 20];
+
+        // (1) precommit envelope wire round-trip.
+        let pc = mk_precommit_dto(net, 2, ROLE_COMPUTE_CONTRIBUTOR, solver, s, n);
+        let pc_bytes = RolePrecommitGossip::new(pc.clone()).encode();
+        let pc_dec = RolePrecommitGossip::decode(&pc_bytes).expect("precommit decode");
+        assert_eq!(pc_dec.gossip_version, ROLE_GOSSIP_VERSION);
+        assert_eq!(
+            pc_dec.precommit.validate(net).unwrap(),
+            pc.validate(net).unwrap()
+        );
+        // (3) precommit envelope never carries secret/nonce.
+        let pc_str = String::from_utf8(pc_bytes.clone()).unwrap();
+        assert!(
+            !pc_str.contains(&hex::encode(s)) && !pc_str.contains(&hex::encode(n)),
+            "precommit gossip hides secret/nonce"
+        );
+
+        // (2) reveal envelope wire round-trip.
+        let rv = mk_reveal_dto(net, 2, &prev, ROLE_COMPUTE_CONTRIBUTOR, solver, s, n);
+        let rv_bytes = RoleRevealGossip::new(rv.clone()).encode();
+        let rv_dec = RoleRevealGossip::decode(&rv_bytes).expect("reveal decode");
+        // (4) reveal reconstructs the commitment via validate().
+        let vr = rv_dec.reveal.validate(net).unwrap();
+        assert_eq!(
+            vr.claim.commitment_hash,
+            Some(role_precommit_commitment(&s, &n))
+        );
+
+        // (5) mutation changes the dedupe digest.
+        let d0 = reveal_gossip_digest(&vr);
+        let mut rv_mut = rv.clone();
+        rv_mut.nonce = hex::encode([0x99u8; 32]);
+        rv_mut.commitment_hash = hex::encode(role_precommit_commitment(&s, &[0x99u8; 32]));
+        // recompute claim_digest so validate passes but content differs
+        let lane = assign_lane_id(net, 2, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0);
+        rv_mut.claim_digest = hex::encode(role_claim_digest(
+            net,
+            2,
+            &prev,
+            ROLE_COMPUTE_CONTRIBUTOR,
+            lane,
+            &solver,
+            &[0x99u8; 32],
+            &s,
+        ));
+        let vr_mut = rv_mut.validate(net).unwrap();
+        assert_ne!(d0, reveal_gossip_digest(&vr_mut), "mutation changes digest");
+
+        // versioning + size + malformed all reject.
+        let mut badver = RolePrecommitGossip::new(pc.clone());
+        badver.gossip_version = 2;
+        assert!(
+            RolePrecommitGossip::decode(&badver.encode()).is_err(),
+            "bad version rejects"
+        );
+        assert!(
+            RolePrecommitGossip::decode(&vec![b'{'; ROLE_GOSSIP_MAX_BYTES + 1]).is_err(),
+            "oversize rejects"
+        );
+        assert!(
+            RolePrecommitGossip::decode(b"not json").is_err()
+                && RoleRevealGossip::decode(b"not json").is_err(),
+            "malformed rejects"
+        );
+    }
+
+    // Tests 6–12: validation / window / dedupe (engine ingest; env-gated).
+    #[test]
+    fn phase20_role_gossip_validation_window_dedupe() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        enable_role_gossip_env();
+        let net = 1u8;
+        let prev = [0x44u8; 32];
+        let solver = [0xD1u8; 20];
+        let (s, n) = ([0x31u8; 32], [0x32u8; 32]);
+        let store = RoleProtocolStore::new();
+        let eng = RoleGossipEngine::new();
+
+        let pc_bytes = |h: u64, sv: [u8; 20]| {
+            RolePrecommitGossip::new(mk_precommit_dto(net, h, ROLE_COMPUTE_CONTRIBUTOR, sv, s, n))
+                .encode()
+        };
+
+        // (12) valid precommit within window accepted.
+        let tip = 1u64;
+        assert_eq!(
+            eng.ingest_precommit(&store, &pc_bytes(2, solver), net, tip),
+            GossipOutcome::AcceptedNew
+        );
+        // (10) duplicate dedupes (stored once).
+        assert_eq!(
+            eng.ingest_precommit(&store, &pc_bytes(2, solver), net, tip),
+            GossipOutcome::Duplicate
+        );
+        assert!(store
+            .canonical_precommit(2, ROLE_COMPUTE_CONTRIBUTOR)
+            .is_some());
+
+        // (6) wrong network rejects (dto net=1, expected_network=2).
+        assert!(matches!(
+            eng.ingest_precommit(&store, &pc_bytes(2, [0xD2u8; 20]), 2, tip),
+            GossipOutcome::Rejected(_)
+        ));
+        // (7) stale height (< tip) rejects.
+        assert!(matches!(
+            eng.ingest_precommit(&store, &pc_bytes(0, [0xD3u8; 20]), net, 5),
+            GossipOutcome::Rejected(_)
+        ));
+        // (8) far-future (> tip + window) rejects.
+        let far = tip + ROLE_PROTOCOL_HEIGHT_WINDOW + 1;
+        assert!(matches!(
+            eng.ingest_precommit(&store, &pc_bytes(far, [0xD4u8; 20]), net, tip),
+            GossipOutcome::Rejected(_)
+        ));
+        // (9) malformed rejects.
+        assert!(matches!(
+            eng.ingest_precommit(&store, b"garbage", net, tip),
+            GossipOutcome::Rejected(_)
+        ));
+
+        // (11) reveal WITHOUT a matching precommit is rejected gracefully (no crash).
+        let orphan = RoleRevealGossip::new(mk_reveal_dto(
+            net,
+            2,
+            &prev,
+            ROLE_VERIFY_CONTRIBUTOR,
+            [0xEEu8; 20],
+            s,
+            n,
+        ))
+        .encode();
+        assert!(matches!(
+            eng.ingest_reveal(&store, &orphan, net, tip),
+            GossipOutcome::Rejected(_)
+        ));
+        assert!(
+            store.select_reveals(2).is_none(),
+            "orphan reveal not stored"
+        );
+
+        // (12) reveal WITH a matching precommit accepted.
+        let rv = RoleRevealGossip::new(mk_reveal_dto(
+            net,
+            2,
+            &prev,
+            ROLE_COMPUTE_CONTRIBUTOR,
+            solver,
+            s,
+            n,
+        ))
+        .encode();
+        assert_eq!(
+            eng.ingest_reveal(&store, &rv, net, tip),
+            GossipOutcome::AcceptedNew
+        );
+
+        clear_role_gossip_env();
+    }
+
+    // Tests 13–17: in-memory relay (validate→store-once→rebroadcast-only-valid).
+    #[test]
+    fn phase20_role_gossip_inmemory_relay() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        enable_role_gossip_env();
+        let net = 1u8;
+        let prev = [0x66u8; 32];
+        let solver = [0xF1u8; 20];
+        let (s, n) = ([0x41u8; 32], [0x42u8; 32]);
+        let tip = 1u64;
+
+        struct Node {
+            store: RoleProtocolStore,
+            eng: RoleGossipEngine,
+        }
+        let nodes: Vec<Node> = (0..3)
+            .map(|_| Node {
+                store: RoleProtocolStore::new(),
+                eng: RoleGossipEngine::new(),
+            })
+            .collect();
+
+        let pc_bytes = RolePrecommitGossip::new(mk_precommit_dto(
+            net,
+            2,
+            ROLE_COMPUTE_CONTRIBUTOR,
+            solver,
+            s,
+            n,
+        ))
+        .encode();
+
+        // Flood from node 0. AcceptedNew triggers a rebroadcast to peers; the
+        // seen-set dedup makes the flood converge (no infinite loop).
+        let mut frontier = vec![0usize];
+        let mut relays = 0;
+        while let Some(src) = frontier.pop() {
+            let out = nodes[src]
+                .eng
+                .ingest_precommit(&nodes[src].store, &pc_bytes, net, tip);
+            if out.should_rebroadcast() {
+                relays += 1;
+                for (i, _) in nodes.iter().enumerate() {
+                    if i != src {
+                        frontier.push(i);
+                    }
+                }
+            }
+        }
+        // (13/14) every node stored exactly once (canonical present), flood converged.
+        for nd in &nodes {
+            assert!(nd
+                .store
+                .canonical_precommit(2, ROLE_COMPUTE_CONTRIBUTOR)
+                .is_some());
+            // re-ingest on the same node is a Duplicate (stored once).
+            assert_eq!(
+                nd.eng.ingest_precommit(&nd.store, &pc_bytes, net, tip),
+                GossipOutcome::Duplicate
+            );
+        }
+        assert!(relays >= 3, "valid precommit relayed across nodes");
+
+        // (15) invalid precommit: not stored, not rebroadcast.
+        let nd = &nodes[0];
+        let before = nd.store.canonical_precommit(2, ROLE_VERIFY_CONTRIBUTOR);
+        let out = nd.eng.ingest_precommit(&nd.store, b"garbage", net, tip);
+        assert!(matches!(out, GossipOutcome::Rejected(_)) && !out.should_rebroadcast());
+        assert_eq!(
+            nd.store.canonical_precommit(2, ROLE_VERIFY_CONTRIBUTOR),
+            before
+        );
+
+        // (16) valid reveal stores once (after its precommit).
+        let rv_bytes = RoleRevealGossip::new(mk_reveal_dto(
+            net,
+            2,
+            &prev,
+            ROLE_COMPUTE_CONTRIBUTOR,
+            solver,
+            s,
+            n,
+        ))
+        .encode();
+        assert_eq!(
+            nd.eng.ingest_reveal(&nd.store, &rv_bytes, net, tip),
+            GossipOutcome::AcceptedNew
+        );
+        assert_eq!(
+            nd.eng.ingest_reveal(&nd.store, &rv_bytes, net, tip),
+            GossipOutcome::Duplicate
+        );
+
+        // (17) invalid reveal (no precommit on a fresh node): not stored/rebroadcast.
+        let fresh = Node {
+            store: RoleProtocolStore::new(),
+            eng: RoleGossipEngine::new(),
+        };
+        let out = fresh.eng.ingest_reveal(&fresh.store, &rv_bytes, net, tip);
+        assert!(matches!(out, GossipOutcome::Rejected(_)) && !out.should_rebroadcast());
+        assert!(fresh.store.select_reveals(2).is_none());
+
+        clear_role_gossip_env();
+    }
+
+    // Tests 20–26: production parity from gossip-collected data + fallback + hard-off.
+    #[test]
+    fn phase20_role_gossip_production_parity() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        enable_role_gossip_env();
+        let net = 1u8;
+        let prev = [0x55u8; 32];
+        let primary = [0x09u8; 20];
+        let roles = [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ];
+        let solvers = [[0xA1u8; 20], [0xA2u8; 20], [0xA3u8; 20]];
+        let sn = |role: u8| ([role; 32], [role.wrapping_add(70); 32]);
+        let store = RoleProtocolStore::new();
+        let eng = RoleGossipEngine::new();
+        let tip = 1u64;
+
+        // Ingest precommits for height 2 + 3 and reveals for height 2, all via gossip.
+        for (i, &role) in roles.iter().enumerate() {
+            let (s, n) = sn(role);
+            for h in [2u64, 3u64] {
+                let pc = RolePrecommitGossip::new(mk_precommit_dto(net, h, role, solvers[i], s, n))
+                    .encode();
+                assert_eq!(
+                    eng.ingest_precommit(&store, &pc, net, tip),
+                    GossipOutcome::AcceptedNew
+                );
+            }
+            let rv = RoleRevealGossip::new(mk_reveal_dto(net, 2, &prev, role, solvers[i], s, n))
+                .encode();
+            assert_eq!(
+                eng.ingest_reveal(&store, &rv, net, tip),
+                GossipOutcome::AcceptedNew
+            );
+        }
+
+        // (20) collected gossip precommits build the parent precommit_root.
+        let root2 = store.precommit_root_for(2).expect("root2 from gossip");
+        // (21) collected gossip reveals build the child ext (official fee-0 / 23).
+        let ext = build_collected_phase20_ext(&store, net, 2, None).expect("collected ext");
+        assert_eq!(ext.fee_bps, 0, "official fee-0");
+        assert_eq!(ext.precommit_root, store.precommit_root_for(3));
+        // (22) node validator accepts the gossip-built fixture.
+        let node_ext =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        let mut leaves = Vec::new();
+        for c in [
+            &node_ext.compute_claim,
+            &node_ext.verify_claim,
+            &node_ext.support_claim,
+        ] {
+            irium_node_rs::poawx::validate_role_claim(c, net, 2, &prev, 0).expect("claim valid");
+            leaves.push(
+                irium_node_rs::poawx::role_precommit_leaf_for_claim(c, net, 2).expect("leaf"),
+            );
+        }
+        assert_eq!(
+            irium_node_rs::poawx::role_precommit_root(&leaves),
+            root2,
+            "gossip reveal leaves root == parent committed root"
+        );
+
+        // (24) third-party fee still works from gossip-collected data.
+        let fee_pkh = [0x7Fu8; 20];
+        let ext_fee = build_collected_phase20_ext(&store, net, 2, Some((200, fee_pkh)))
+            .expect("collected fee ext");
+        assert_eq!(ext_fee.fee_bps, 200);
+        assert_eq!(ext_fee.fee_pkh, fee_pkh);
+
+        // (25) synthetic fallback works ONLY when explicitly enabled.
+        assert!(
+            build_synthetic_phase20_ext(net, 2, &prev, &primary, &[], None).is_none(),
+            "synthetic disabled by default"
+        );
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        assert!(
+            build_synthetic_phase20_ext(net, 2, &prev, &primary, &[], None).is_some(),
+            "synthetic enabled => Some"
+        );
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+
+        // (26) mainnet hard-off: build returns None and ingest rejects.
+        assert!(
+            build_collected_phase20_ext(&store, 0, 2, None).is_none(),
+            "mainnet build None"
+        );
+        let pc0 = RolePrecommitGossip::new(mk_precommit_dto(
+            net,
+            2,
+            ROLE_COMPUTE_CONTRIBUTOR,
+            solvers[0],
+            sn(ROLE_COMPUTE_CONTRIBUTOR).0,
+            sn(ROLE_COMPUTE_CONTRIBUTOR).1,
+        ))
+        .encode();
+        assert!(matches!(
+            eng.ingest_precommit(&store, &pc0, 0, tip),
+            GossipOutcome::Rejected(_)
+        ));
+
+        clear_role_gossip_env();
     }
 }
