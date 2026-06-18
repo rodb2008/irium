@@ -211,6 +211,15 @@ const PRUNE_MARGIN_WINDOWS: u64 = 8;
 /// Domain tag for the dominance state commitment digest.
 const DOMINANCE_DIGEST_TAG: &[u8] = b"IRIUM_POAWX_DOMINANCE_STATE_V1";
 
+/// Magic prefix for the Phase 21C trailing dominance-weight ext section.
+pub const DOMINANCE_SECTION_MAGIC: &[u8] = b"DOM1";
+/// Wire size of the 4 role weights (LE u64) carried in the dominance section.
+pub const DOMINANCE_WEIGHTS_WIRE: usize = 32;
+/// Deterministic baseline valid-work score that the per-claim dominance weight
+/// scales down by the miner recent reward share. A constant baseline makes the
+/// included weight a pure, node-recomputable function of the persisted state.
+pub const DOMINANCE_BASE_WORK_SCORE: u64 = 1000;
+
 /// Per-(miner, window) reward bucket. Integer-only; exactly revertible.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DominanceBucket {

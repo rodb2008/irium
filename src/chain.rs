@@ -853,6 +853,9 @@ impl ChainState {
         self.validate_block_header(&block, expected_height, previous)?;
         validate_poawx_coinbase(&block, expected_height)?;
         validate_poawx_block_receipts(&block, expected_height, previous)?;
+        if crate::poawx_dominance::anti_domination_enforced(expected_height) {
+            self.validate_block_dominance_weights(&block, expected_height)?;
+        }
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1013,6 +1016,51 @@ impl ChainState {
             ));
         }
         events
+    }
+
+    /// Phase 21C: when anti-domination enforcement is on, every production
+    /// receipt must carry `role_dominance_weights` whose 4 entries equal the
+    /// node-recomputed fairness weights for [PRIMARY, COMPUTE, VERIFY, SUPPORT]
+    /// from the PERSISTED dominance state. This block is validated BEFORE it is
+    /// applied, so the persisted state is exactly the parent state the producer
+    /// used. Fails closed on missing/mismatched weights. The weight is a
+    /// per-claim quantity (a deterministic baseline scaled by the miner recent
+    /// reward share); proving the producer also selected the GLOBALLY
+    /// best-weighted worker among all (possibly unseen) candidates is Phase 21D
+    /// (candidate-set / VRF), documented as pending.
+    fn validate_block_dominance_weights(&self, block: &Block, height: u64) -> Result<(), String> {
+        use crate::poawx_dominance::DOMINANCE_BASE_WORK_SCORE;
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        for r in receipts {
+            let ext = match &r.phase20_ext {
+                Some(e) => e,
+                None => continue,
+            };
+            let weights = ext
+                .role_dominance_weights
+                .ok_or_else(|| "phase21c: missing required role_dominance_weights".to_string())?;
+            let pkhs = [
+                r.worker_pkh,
+                ext.role_reward.compute_contributor_pkh,
+                ext.role_reward.verify_contributor_pkh,
+                ext.role_reward.support_contributor_pkh,
+            ];
+            for (i, pkh) in pkhs.iter().enumerate() {
+                let expected = self
+                    .dominance
+                    .weight(DOMINANCE_BASE_WORK_SCORE, pkh, height);
+                if weights[i] != expected {
+                    return Err(format!(
+                        "phase21c: dominance weight mismatch role {} got {} expected {}",
+                        i, weights[i], expected
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Apply the accepted tip block's reward events to the dominance state.
@@ -7511,6 +7559,7 @@ mod tests {
             fee_pkh,
             precommit_root: None,
             role_ticket_proofs: None,
+            role_dominance_weights: None,
         }
     }
 
@@ -7893,6 +7942,109 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
         std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn phase21c_dominance_weight_enforcement() {
+        use crate::poawx_dominance::{RoleRewardKind, DOMINANCE_BASE_WORK_SCORE};
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW", "1000");
+        std::env::set_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK", "4");
+        assert!(
+            crate::poawx_dominance::anti_domination_enforced(1),
+            "enforced on testnet with gate+required"
+        );
+
+        let net = crate::activation::network_id_byte();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let sk = signing_key(0x41);
+        let ext0 = p20_ext(net, height, &parent_hash, 0, [0u8; 20]);
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        let primary = receipt.worker_pkh;
+
+        let mut cs = base_chain(None);
+        // give PRIMARY a prior recent reward so its weight drops below the base.
+        cs.dominance
+            .apply_event(primary, RoleRewardKind::Primary, 5_000, height);
+
+        let pkhs = [
+            primary,
+            ext0.role_reward.compute_contributor_pkh,
+            ext0.role_reward.verify_contributor_pkh,
+            ext0.role_reward.support_contributor_pkh,
+        ];
+        let mut expected = [0u64; 4];
+        for (i, p) in pkhs.iter().enumerate() {
+            expected[i] = cs.dominance.weight(DOMINANCE_BASE_WORK_SCORE, p, height);
+        }
+        assert!(
+            expected[0] < DOMINANCE_BASE_WORK_SCORE,
+            "primary down-weighted by its recent reward"
+        );
+        assert_eq!(
+            expected[1], DOMINANCE_BASE_WORK_SCORE,
+            "a fresh role keeps full weight"
+        );
+
+        let mk = |weights: Option<[u64; 4]>| -> Block {
+            let mut ext = ext0.clone();
+            ext.role_dominance_weights = weights;
+            let mut r = receipt.clone();
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+        // correct weights accept.
+        assert!(
+            cs.validate_block_dominance_weights(&mk(Some(expected)), height)
+                .is_ok(),
+            "node-recomputed weights must accept"
+        );
+        // wrong weight rejects.
+        let mut bad = expected;
+        bad[0] = bad[0].wrapping_add(1);
+        assert!(
+            cs.validate_block_dominance_weights(&mk(Some(bad)), height)
+                .is_err(),
+            "mismatched weight must reject"
+        );
+        // missing weights reject (fail closed).
+        assert!(
+            cs.validate_block_dominance_weights(&mk(None), height)
+                .is_err(),
+            "missing required weights must reject"
+        );
+
+        // mainnet hard-off: enforcement gate is false regardless of env.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(
+            !crate::poawx_dominance::anti_domination_enforced(1),
+            "mainnet hard-off"
+        );
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK");
     }
 
     #[test]
@@ -8400,6 +8552,7 @@ mod tests {
                 fee_pkh: [0u8; 20],
                 precommit_root: next_root,
                 role_ticket_proofs: None,
+                role_dominance_weights: None,
             }
         };
         let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {

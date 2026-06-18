@@ -3,6 +3,7 @@
 //! Env-var reads are intentionally absent here — callers own activation gating.
 
 use crate::block::Block;
+use crate::poawx_dominance::{DOMINANCE_SECTION_MAGIC, DOMINANCE_WEIGHTS_WIRE};
 use crate::poawx_ticket::{TicketProof, TICKET_PROOF_WIRE, TICKET_SECTION_MAGIC};
 use sha2::{Digest, Sha256};
 
@@ -612,6 +613,12 @@ pub struct Phase20ReceiptExt {
     /// pre-Step-21B exts stay byte-identical). Required on every production block
     /// when the ticket gate is enabled (validated in connect_block).
     pub role_ticket_proofs: Option<[TicketProof; 3]>,
+    /// Phase 21C: optional per-role anti-domination fairness weights
+    /// [PRIMARY, COMPUTE, VERIFY, SUPPORT]. `None` => absent (trailing DOM1
+    /// section omitted, byte-identical to pre-21C exts). Required + validated
+    /// against persisted dominance state in connect_block when the
+    /// anti-domination gate is enforced.
+    pub role_dominance_weights: Option<[u64; 4]>,
 }
 
 impl Phase20ReceiptExt {
@@ -641,7 +648,7 @@ impl Phase20ReceiptExt {
                 out.extend_from_slice(root);
             }
             None => {
-                if self.role_ticket_proofs.is_some() {
+                if self.role_ticket_proofs.is_some() || self.role_dominance_weights.is_some() {
                     out.push(0);
                 }
             }
@@ -650,6 +657,14 @@ impl Phase20ReceiptExt {
             out.extend_from_slice(TICKET_SECTION_MAGIC);
             for p in proofs.iter() {
                 out.extend_from_slice(&p.serialize());
+            }
+        }
+        // Phase 21C trailing dominance-weight section (present-only): magic + 4
+        // role weights (LE u64). Absent => byte-identical to pre-21C exts.
+        if let Some(weights) = &self.role_dominance_weights {
+            out.extend_from_slice(DOMINANCE_SECTION_MAGIC);
+            for w in weights.iter() {
+                out.extend_from_slice(&w.to_le_bytes());
             }
         }
         out
@@ -709,25 +724,48 @@ impl Phase20ReceiptExt {
         } else {
             None
         };
-        // Step 21B trailing ticket section (present-only): magic + 3 fixed proofs.
-        let role_ticket_proofs = if off < raw.len() {
-            need(off, 4, "ticket section magic")?;
-            if &raw[off..off + 4] != TICKET_SECTION_MAGIC {
-                return Err("phase20 ext: bad ticket section magic".to_string());
+        // Trailing magic-prefixed sections (present-only, strict): the Step 21B
+        // ticket section and the Phase 21C dominance-weight section, in any
+        // order. An unrecognized or truncated trailing magic is rejected (same
+        // strictness as pre-21C). Absent => byte-identical to the pre-section ext.
+        let mut role_ticket_proofs: Option<[TicketProof; 3]> = None;
+        let mut role_dominance_weights: Option<[u64; 4]> = None;
+        while off < raw.len() {
+            need(off, 4, "trailing section magic")?;
+            let magic = &raw[off..off + 4];
+            if magic == TICKET_SECTION_MAGIC {
+                if role_ticket_proofs.is_some() {
+                    return Err("phase20 ext: duplicate ticket section".to_string());
+                }
+                off += 4;
+                let mut proofs: Vec<TicketProof> = Vec::with_capacity(3);
+                for _ in 0..3 {
+                    need(off, TICKET_PROOF_WIRE, "ticket proof")?;
+                    proofs.push(TicketProof::deserialize(
+                        &raw[off..off + TICKET_PROOF_WIRE],
+                    )?);
+                    off += TICKET_PROOF_WIRE;
+                }
+                role_ticket_proofs =
+                    Some([proofs[0].clone(), proofs[1].clone(), proofs[2].clone()]);
+            } else if magic == DOMINANCE_SECTION_MAGIC {
+                if role_dominance_weights.is_some() {
+                    return Err("phase20 ext: duplicate dominance section".to_string());
+                }
+                off += 4;
+                need(off, DOMINANCE_WEIGHTS_WIRE, "dominance weights")?;
+                let mut w = [0u64; 4];
+                for slot in w.iter_mut() {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&raw[off..off + 8]);
+                    *slot = u64::from_le_bytes(b);
+                    off += 8;
+                }
+                role_dominance_weights = Some(w);
+            } else {
+                return Err("phase20 ext: unknown trailing section magic".to_string());
             }
-            off += 4;
-            let mut proofs: Vec<TicketProof> = Vec::with_capacity(3);
-            for _ in 0..3 {
-                need(off, TICKET_PROOF_WIRE, "ticket proof")?;
-                proofs.push(TicketProof::deserialize(
-                    &raw[off..off + TICKET_PROOF_WIRE],
-                )?);
-                off += TICKET_PROOF_WIRE;
-            }
-            Some([proofs[0].clone(), proofs[1].clone(), proofs[2].clone()])
-        } else {
-            None
-        };
+        }
         Ok(Self {
             role_reward,
             compute_claim,
@@ -737,6 +775,7 @@ impl Phase20ReceiptExt {
             fee_pkh,
             precommit_root,
             role_ticket_proofs,
+            role_dominance_weights,
         })
     }
 
@@ -1692,6 +1731,7 @@ mod tests {
             fee_pkh: [0xFEu8; 20],
             precommit_root: None,
             role_ticket_proofs: None,
+            role_dominance_weights: None,
         };
         let bytes = ext.serialize();
         let ext2 = Phase20ReceiptExt::deserialize(&bytes).expect("deserialize");
@@ -1802,6 +1842,7 @@ mod tests {
             fee_pkh: [0u8; 20],
             precommit_root: None,
             role_ticket_proofs: None,
+            role_dominance_weights: None,
         };
         let none = base();
         let mut some = base();
@@ -1839,6 +1880,7 @@ mod tests {
             fee_pkh: [0u8; 20],
             precommit_root: None,
             role_ticket_proofs: None,
+            role_dominance_weights: None,
         };
         let proofs = [
             TicketProof::new(
@@ -1904,6 +1946,101 @@ mod tests {
     }
 
     #[test]
+    fn phase21c_ext_dominance_section_roundtrip_backward_compatible() {
+        let prev = [0x44u8; 32];
+        let base = || Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+        };
+        let weights = [1000u64, 800, 900, 950];
+        // (1) absent => no DOM1 magic, byte-identical, round-trips.
+        let none = base();
+        let nb = none.serialize();
+        assert!(
+            nb.windows(4).all(|w| w != DOMINANCE_SECTION_MAGIC),
+            "no DOM1 magic when absent"
+        );
+        assert_eq!(Phase20ReceiptExt::deserialize(&nb).unwrap(), none);
+        // (2) dominance present (precommit + ticket None): +1 flag +4 magic +32 bytes.
+        let mut d = base();
+        d.role_dominance_weights = Some(weights);
+        let db = d.serialize();
+        assert_eq!(db.len(), nb.len() + 1 + 4 + DOMINANCE_WEIGHTS_WIRE);
+        assert_eq!(Phase20ReceiptExt::deserialize(&db).unwrap(), d);
+        assert_ne!(
+            none.digest(),
+            d.digest(),
+            "dominance section changes digest"
+        );
+        // (3) precommit + dominance round-trips.
+        let mut pd = base();
+        pd.precommit_root = Some([0xABu8; 32]);
+        pd.role_dominance_weights = Some(weights);
+        assert_eq!(Phase20ReceiptExt::deserialize(&pd.serialize()).unwrap(), pd);
+        // (4) ticket + dominance (both sections) round-trips in order.
+        let proofs = [
+            TicketProof::new(
+                1,
+                60,
+                ROLE_COMPUTE_CONTRIBUTOR,
+                [0xC1u8; 20],
+                1,
+                200,
+                [0x02u8; 33],
+                [0x11u8; 32],
+                0,
+            ),
+            TicketProof::new(
+                1,
+                60,
+                ROLE_VERIFY_CONTRIBUTOR,
+                [0xC2u8; 20],
+                1,
+                200,
+                [0x02u8; 33],
+                [0x12u8; 32],
+                0,
+            ),
+            TicketProof::new(
+                1,
+                60,
+                ROLE_SUPPORT_CONTRIBUTOR,
+                [0xC3u8; 20],
+                1,
+                200,
+                [0x02u8; 33],
+                [0x13u8; 32],
+                0,
+            ),
+        ];
+        let mut td = base();
+        td.role_ticket_proofs = Some(proofs);
+        td.role_dominance_weights = Some(weights);
+        let tdb = td.serialize();
+        assert!(tdb.windows(4).any(|w| w == TICKET_SECTION_MAGIC));
+        assert!(tdb.windows(4).any(|w| w == DOMINANCE_SECTION_MAGIC));
+        assert_eq!(Phase20ReceiptExt::deserialize(&tdb).unwrap(), td);
+        // (5) unknown trailing magic is rejected (strict).
+        let mut junk = d.serialize();
+        junk.extend_from_slice(b"ZZZZ");
+        assert!(
+            Phase20ReceiptExt::deserialize(&junk).is_err(),
+            "unknown trailing magic rejects"
+        );
+    }
+
+    #[test]
     fn phase20_block_receipt_v3_element_roundtrip() {
         let prev = [0x44u8; 32];
         let mk_ext = || Phase20ReceiptExt {
@@ -1919,6 +2056,7 @@ mod tests {
             fee_pkh: [0u8; 20],
             precommit_root: None,
             role_ticket_proofs: None,
+            role_dominance_weights: None,
         };
         // no-ext v3 element == v2 element + a single 0 flag byte (present-only).
         let r = make_test_receipt(9);
@@ -1955,6 +2093,7 @@ mod tests {
             fee_pkh,
             precommit_root: None,
             role_ticket_proofs: None,
+            role_dominance_weights: None,
         };
 
         // Base mode-0 receipt with a production extension attached.
