@@ -1224,6 +1224,10 @@ pub struct Phase20ReceiptExtMirror {
     /// Phase 21B: optional per-role ticket proofs (trailing section; None =>
     /// byte-identical to pre-21B). Attached when the pool ticket gate is enabled.
     pub role_ticket_proofs: Option<[TicketProofMirror; 3]>,
+    /// Phase 21C: optional per-role dominance weights (trailing DOM1
+    /// section; None => byte-identical to pre-21C). Attached when
+    /// `pool_anti_domination_enforced(height)`.
+    pub role_dominance_weights: Option<[u64; 4]>,
 }
 
 impl Phase20ReceiptExtMirror {
@@ -1250,7 +1254,7 @@ impl Phase20ReceiptExtMirror {
                 out.extend_from_slice(root);
             }
             None => {
-                if self.role_ticket_proofs.is_some() {
+                if self.role_ticket_proofs.is_some() || self.role_dominance_weights.is_some() {
                     out.push(0);
                 }
             }
@@ -1259,6 +1263,14 @@ impl Phase20ReceiptExtMirror {
             out.extend_from_slice(TICKET_SECTION_MAGIC);
             for p in proofs.iter() {
                 out.extend_from_slice(&p.serialize());
+            }
+        }
+        // Phase 21C trailing DOM1 dominance-weight section (present-only),
+        // byte-identical to node poawx::Phase20ReceiptExt::serialize.
+        if let Some(weights) = &self.role_dominance_weights {
+            out.extend_from_slice(DOMINANCE_SECTION_MAGIC);
+            for w in weights.iter() {
+                out.extend_from_slice(&w.to_le_bytes());
             }
         }
         out
@@ -1378,6 +1390,124 @@ fn synth_field(
 /// `RoleReward` mirrors the validated solver pkhs. `fee` carries the OPTIONAL
 /// third-party fee terms (`Some((fee_bps, fee_pkh))`); `None` => OFFICIAL fee-0.
 /// Returns None on mainnet or when synthetic claims are disabled (never fakes).
+/// ── Phase 21C: anti-domination dominance weights (pool side) ────────────────
+/// Byte-identical mirror of node `poawx_dominance` wire constants + the
+/// deterministic fairness math, plus a pool selection helper. PoAW-X is
+/// consensus-level: the pool is only one miner interface, so the node remains
+/// authoritative and re-validates every attached weight against its persisted
+/// state. The pool view is populated operationally from authoritative node state
+/// (loopback RPC / block observation); that sync is the remaining operational
+/// wiring (global-best candidate selection = Phase 21D). An empty view yields
+/// full (base) weights.
+pub const DOMINANCE_SECTION_MAGIC: &[u8; 4] = b"DOM1";
+pub const DOMINANCE_WEIGHTS_WIRE: usize = 32;
+pub const DOMINANCE_BASE_WORK_SCORE: u64 = 1000;
+
+/// Mirror of node `poawx_dominance::fairness_weight`.
+pub fn fairness_weight(valid_work_score: u64, recent_reward_share_permille: u32) -> u64 {
+    let num = (valid_work_score as u128).saturating_mul(1000);
+    let den = 1000u128 + recent_reward_share_permille as u128;
+    (num / den) as u64
+}
+
+/// Pool-side recent-reward view (recent totals per miner + network total).
+#[derive(Debug, Clone, Default)]
+pub struct PoolDominanceView {
+    recent: BTreeMap<[u8; 20], u64>,
+    network_total: u64,
+}
+
+impl PoolDominanceView {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn record(&mut self, pkh: [u8; 20], amount: u64) {
+        let e = self.recent.entry(pkh).or_insert(0);
+        *e = e.saturating_add(amount);
+        self.network_total = self.network_total.saturating_add(amount);
+    }
+    pub fn clear(&mut self) {
+        self.recent.clear();
+        self.network_total = 0;
+    }
+    pub fn recent_reward_share_permille(&self, pkh: &[u8; 20]) -> u32 {
+        if self.network_total == 0 {
+            return 0;
+        }
+        let mine = *self.recent.get(pkh).unwrap_or(&0) as u128;
+        (mine.saturating_mul(1000) / self.network_total as u128).min(1000) as u32
+    }
+    pub fn weight(&self, base: u64, pkh: &[u8; 20]) -> u64 {
+        fairness_weight(base, self.recent_reward_share_permille(pkh))
+    }
+}
+
+/// Compute the 4 role dominance weights [PRIMARY, COMPUTE, VERIFY, SUPPORT] using
+/// the same baseline + formula the node recomputes from its persisted state.
+pub fn pool_role_dominance_weights(
+    primary_pkh: &[u8; 20],
+    rr: &RoleRewardMirror,
+    view: &PoolDominanceView,
+    base: u64,
+) -> [u64; 4] {
+    [
+        view.weight(base, primary_pkh),
+        view.weight(base, &rr.compute_contributor_pkh),
+        view.weight(base, &rr.verify_contributor_pkh),
+        view.weight(base, &rr.support_contributor_pkh),
+    ]
+}
+
+/// Select the fairest candidate among collected role candidates: highest fairness
+/// weight wins; deterministic tie-break by lower pkh. No hardware-class or
+/// pool-ownership assumptions. None for an empty set. (Selecting the GLOBALLY best
+/// worker among all possibly-unseen candidates is Phase 21D.)
+pub fn select_candidate_by_fairness_weight(
+    candidates: &[[u8; 20]],
+    view: &PoolDominanceView,
+    base: u64,
+) -> Option<[u8; 20]> {
+    candidates.iter().copied().max_by(|a, b| {
+        view.weight(base, a)
+            .cmp(&view.weight(base, b))
+            .then_with(|| b.cmp(a))
+    })
+}
+
+/// Pool anti-domination enforcement gate (mirror node `anti_domination_enforced`):
+/// activation height + `_REQUIRED=1`, mainnet hard-off.
+pub fn pool_anti_domination_enforced(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false;
+    }
+    let active = match env::var("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    };
+    let required = env::var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    active && required
+}
+
+/// Process-global pool dominance view (operationally populated; tests set/clear
+/// under p20_env_lock).
+pub fn pool_dominance_view() -> &'static std::sync::Mutex<PoolDominanceView> {
+    static V: std::sync::OnceLock<std::sync::Mutex<PoolDominanceView>> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::sync::Mutex::new(PoolDominanceView::new()))
+}
+
+/// Snapshot the global view + compute an ext's role weights (gated attach point).
+pub fn pool_dominance_weights_for(primary_pkh: &[u8; 20], rr: &RoleRewardMirror) -> [u64; 4] {
+    let v = pool_dominance_view()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    pool_role_dominance_weights(primary_pkh, rr, &v, DOMINANCE_BASE_WORK_SCORE)
+}
+
 pub fn build_synthetic_phase20_ext(
     network_id: u8,
     height: u64,
@@ -1455,6 +1585,13 @@ pub fn build_synthetic_phase20_ext(
     } else {
         None
     };
+    // Phase 21C: attach per-role dominance weights when enforcement is on
+    // (else the node fails closed). Off => None (byte-identical to pre-21C).
+    let role_dominance_weights = if pool_anti_domination_enforced(height) {
+        Some(pool_dominance_weights_for(primary_pkh, &role_reward))
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim,
@@ -1464,6 +1601,7 @@ pub fn build_synthetic_phase20_ext(
         fee_pkh,
         precommit_root,
         role_ticket_proofs,
+        role_dominance_weights,
     })
 }
 
@@ -1828,6 +1966,7 @@ pub fn build_collected_phase20_ext(
     network_id: u8,
     height: u64,
     fee: Option<(u16, [u8; 20])>,
+    primary_pkh: &[u8; 20],
 ) -> Option<Phase20ReceiptExtMirror> {
     if network_id == 0 || !role_protocol_enabled() {
         return None;
@@ -1849,6 +1988,13 @@ pub fn build_collected_phase20_ext(
     } else {
         None
     };
+    // Phase 21C: attach per-role dominance weights when enforcement is on
+    // (else the node fails closed). Off => None (byte-identical to pre-21C).
+    let role_dominance_weights = if pool_anti_domination_enforced(height) {
+        Some(pool_dominance_weights_for(primary_pkh, &role_reward))
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim: reveals[0].claim.clone(),
@@ -1858,6 +2004,7 @@ pub fn build_collected_phase20_ext(
         fee_pkh,
         precommit_root: Some(next_root),
         role_ticket_proofs,
+        role_dominance_weights,
     })
 }
 
@@ -3468,6 +3615,7 @@ mod tests {
             fee_pkh: [0u8; 20],
             precommit_root: None,
             role_ticket_proofs: None,
+            role_dominance_weights: None,
         };
         let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
             role_reward: node_rr,
@@ -3478,6 +3626,7 @@ mod tests {
             fee_pkh: [0u8; 20],
             precommit_root: None,
             role_ticket_proofs: None,
+            role_dominance_weights: None,
         };
         assert_eq!(
             ext.serialize(),
@@ -3491,6 +3640,109 @@ mod tests {
         // RoleReward pkhs extractable from the hex without full deserialize.
         let (c, v, s) = role_reward_pkhs_from_ext_hex(&hex::encode(ext.serialize())).unwrap();
         assert_eq!((c, v, s), ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]));
+    }
+
+    #[test]
+    fn phase21c_pool_dominance_weights_and_selection() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1");
+        let net = network_id_from_env();
+        assert!(pool_anti_domination_enforced(1), "enforced on testnet");
+        assert!(!pool_anti_domination_enforced(0), "below activation off");
+
+        let h = 5u64;
+        let prev = [0x44u8; 32];
+        let (cc, vv, ss) = ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]);
+        let primary = [0xA0u8; 20];
+        let base = DOMINANCE_BASE_WORK_SCORE;
+
+        let mut view = PoolDominanceView::new();
+        view.record(primary, 7_000);
+        view.record(cc, 3_000);
+        let rr = RoleRewardMirror {
+            compute_contributor_pkh: cc,
+            verify_contributor_pkh: vv,
+            support_contributor_pkh: ss,
+        };
+        let weights = pool_role_dominance_weights(&primary, &rr, &view, base);
+        assert!(weights[0] < base, "primary (heavier) down-weighted");
+        assert!(
+            weights[1] < base && weights[1] > weights[0],
+            "compute lighter than primary"
+        );
+        assert_eq!(weights[2], base, "fresh verify keeps full weight");
+
+        let mk_claim = |role: u8, solver: [u8; 20]| PoawxRoleClaimMirror {
+            role_id: role,
+            lane_id: assign_lane_id(net, h, &prev, role, 0),
+            solver_pkh: solver,
+            nonce: [role; 32],
+            secret: [role.wrapping_add(9); 32],
+            claim_digest: role_claim_digest(
+                net,
+                h,
+                &prev,
+                role,
+                assign_lane_id(net, h, &prev, role, 0),
+                &solver,
+                &[role; 32],
+                &[role.wrapping_add(9); 32],
+            ),
+            commitment_hash: None,
+        };
+        let ext = Phase20ReceiptExtMirror {
+            role_reward: rr.clone(),
+            compute_claim: mk_claim(ROLE_COMPUTE_CONTRIBUTOR, cc),
+            verify_claim: mk_claim(ROLE_VERIFY_CONTRIBUTOR, vv),
+            support_claim: mk_claim(ROLE_SUPPORT_CONTRIBUTOR, ss),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: Some(weights),
+        };
+        // node lib reads the pool DOM1 weights back identically (wire parity).
+        let node_ext =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        assert_eq!(
+            node_ext.role_dominance_weights,
+            Some(weights),
+            "node reads pool DOM1 weights"
+        );
+        // absent => no DOM1 magic (byte-identical to pre-21C).
+        let mut ext_off = ext.clone();
+        ext_off.role_dominance_weights = None;
+        assert!(
+            ext_off
+                .serialize()
+                .windows(4)
+                .all(|w| w != &DOMINANCE_SECTION_MAGIC[..]),
+            "no DOM1 magic when absent"
+        );
+
+        // selection: fairness picks the less-recently-rewarded candidate.
+        let light = [0x0Bu8; 20];
+        assert_eq!(
+            select_candidate_by_fairness_weight(&[primary, light], &view, base),
+            Some(light),
+            "fairness selects the lighter candidate"
+        );
+        // deterministic tie-break (equal weights) -> lower pkh.
+        let empty = PoolDominanceView::new();
+        assert_eq!(
+            select_candidate_by_fairness_weight(&[[0x02u8; 20], [0x01u8; 20]], &empty, base),
+            Some([0x01u8; 20])
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!pool_anti_domination_enforced(1), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED");
     }
 
     #[test]
@@ -4160,7 +4412,8 @@ mod tests {
                 .unwrap();
         }
         // COLLECTED production ext for height 2.
-        let ext = build_collected_phase20_ext(&store, net, 2, None).expect("collected ext");
+        let ext = build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20])
+            .expect("collected ext");
         assert_eq!(
             ext.precommit_root,
             store.precommit_root_for(3),
@@ -4209,19 +4462,19 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            build_collected_phase20_ext(&store2, net, 2, None).is_none(),
+            build_collected_phase20_ext(&store2, net, 2, None, &[0x11u8; 20]).is_none(),
             "missing role => fail closed"
         );
 
         // off-path: role protocol disabled => None (falls back to synthetic upstream).
         std::env::remove_var("IRIUM_POAWX_ROLE_PROTOCOL_ENABLED");
         assert!(
-            build_collected_phase20_ext(&store, net, 2, None).is_none(),
+            build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20]).is_none(),
             "disabled => None"
         );
         // mainnet hard-off.
         assert!(
-            build_collected_phase20_ext(&store, 0, 2, None).is_none(),
+            build_collected_phase20_ext(&store, 0, 2, None, &[0x11u8; 20]).is_none(),
             "mainnet hard-off"
         );
         assert!(!role_protocol_enabled(), "gate off");
@@ -4564,7 +4817,8 @@ mod tests {
         // (20) collected gossip precommits build the parent precommit_root.
         let root2 = store.precommit_root_for(2).expect("root2 from gossip");
         // (21) collected gossip reveals build the child ext (official fee-0 / 23).
-        let ext = build_collected_phase20_ext(&store, net, 2, None).expect("collected ext");
+        let ext = build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20])
+            .expect("collected ext");
         assert_eq!(ext.fee_bps, 0, "official fee-0");
         assert_eq!(ext.precommit_root, store.precommit_root_for(3));
         // (22) node validator accepts the gossip-built fixture.
@@ -4589,8 +4843,9 @@ mod tests {
 
         // (24) third-party fee still works from gossip-collected data.
         let fee_pkh = [0x7Fu8; 20];
-        let ext_fee = build_collected_phase20_ext(&store, net, 2, Some((200, fee_pkh)))
-            .expect("collected fee ext");
+        let ext_fee =
+            build_collected_phase20_ext(&store, net, 2, Some((200, fee_pkh)), &[0x11u8; 20])
+                .expect("collected fee ext");
         assert_eq!(ext_fee.fee_bps, 200);
         assert_eq!(ext_fee.fee_pkh, fee_pkh);
 
@@ -4608,7 +4863,7 @@ mod tests {
 
         // (26) mainnet hard-off: build returns None and ingest rejects.
         assert!(
-            build_collected_phase20_ext(&store, 0, 2, None).is_none(),
+            build_collected_phase20_ext(&store, 0, 2, None, &[0x11u8; 20]).is_none(),
             "mainnet build None"
         );
         let pc0 = RolePrecommitGossip::new(mk_precommit_dto(
@@ -4722,8 +4977,8 @@ mod tests {
                     .unwrap();
             }
             // build collected ext from the fetched data; node validator accepts.
-            let ext =
-                build_collected_phase20_ext(&store, net, 2, None).expect("collected from fetched");
+            let ext = build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20])
+                .expect("collected from fetched");
             let node_ext =
                 irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
             let mut leaves = Vec::new();
@@ -4744,8 +4999,14 @@ mod tests {
                 "fetched leaves root == parent committed root"
             );
             // (24) third-party fee from bridged data.
-            let ext_fee = build_collected_phase20_ext(&store, net, 2, Some((200, [0x7Fu8; 20])))
-                .expect("fee ext");
+            let ext_fee = build_collected_phase20_ext(
+                &store,
+                net,
+                2,
+                Some((200, [0x7Fu8; 20])),
+                &[0x11u8; 20],
+            )
+            .expect("fee ext");
             assert_eq!(ext_fee.fee_bps, 200);
         });
         clear_role_gossip_env();
@@ -4859,6 +5120,7 @@ mod tests {
                 fee_pkh,
                 precommit_root: root,
                 role_ticket_proofs: None,
+                role_dominance_weights: None,
             };
         let fpkh = [0x7Fu8; 20];
         // Pre-6A (no precommit_root): fee parses correctly.
@@ -4969,6 +5231,7 @@ mod tests {
             fee_pkh: [0u8; 20],
             precommit_root: None,
             role_ticket_proofs: Some(build_role_ticket_proofs(net, h, &rr)),
+            role_dominance_weights: None,
         };
         let node_ext =
             irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();

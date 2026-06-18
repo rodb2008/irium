@@ -1472,6 +1472,7 @@ fn build_session_poawx_receipts(
                     producer.network_id,
                     ctx.block_height,
                     fee,
+                    pkh,
                 );
                 let chosen = match collected {
                     Some(ext) => {
