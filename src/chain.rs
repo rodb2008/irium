@@ -2345,6 +2345,72 @@ fn validate_phase20_production_block(
     if hidden_precommit_active(height) {
         validate_hidden_precommit(receipts, height, network_id, previous)?;
     }
+    // Phase 21B: ticket + penalty enforcement (gated; mainnet-off). When the ticket
+    // gate is ENFORCED (active + required), every rewarded role must carry a valid
+    // ticket proof bound to the role solver pkh; when penalty enforcement is on,
+    // suspended/slashed identities are blocked from high-trust roles. When the gate
+    // is off, the ext's optional ticket proofs are ignored (old behavior unchanged).
+    if crate::poawx_ticket::tickets_enforced(height) {
+        validate_phase20_ticket_proofs(receipts, height, network_id)?;
+    }
+    Ok(())
+}
+
+/// Phase 21B: validate per-role ticket proofs carried in each receipt's Phase 20
+/// extension. Gated by `poawx_ticket::tickets_enforced(height)` (mainnet-off) before
+/// being called. Fails closed if the extension or its ticket proofs are missing.
+fn validate_phase20_ticket_proofs(
+    receipts: &[crate::poawx::PoawxBlockReceipt],
+    height: u64,
+    network_id: u8,
+) -> Result<(), String> {
+    let require_sybil = crate::poawx_ticket::sybil_threshold_bits();
+    let penalty_enforced = crate::poawx_penalty::penalty_state_enforced(height);
+    for (i, r) in receipts.iter().enumerate() {
+        let ext = r.phase20_ext.as_ref().ok_or_else(|| {
+            format!(
+                "phase20: ticket gate active but receipt[{}] missing extension at height {}",
+                i, height
+            )
+        })?;
+        let proofs = ext.role_ticket_proofs.as_ref().ok_or_else(|| {
+            format!(
+                "phase20: ticket gate active but receipt[{}] missing ticket proofs at height {}",
+                i, height
+            )
+        })?;
+        let roles = [
+            (
+                crate::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+                ext.role_reward.compute_contributor_pkh,
+            ),
+            (
+                crate::poawx::ROLE_VERIFY_CONTRIBUTOR,
+                ext.role_reward.verify_contributor_pkh,
+            ),
+            (
+                crate::poawx::ROLE_SUPPORT_CONTRIBUTOR,
+                ext.role_reward.support_contributor_pkh,
+            ),
+        ];
+        for (j, (role_id, solver)) in roles.iter().enumerate() {
+            proofs[j]
+                .validate(
+                    network_id,
+                    height,
+                    *role_id,
+                    solver,
+                    require_sybil,
+                    penalty_enforced,
+                )
+                .map_err(|e| {
+                    format!(
+                        "phase20: receipt[{}] role {} ticket proof invalid: {}",
+                        i, role_id, e
+                    )
+                })?;
+        }
+    }
     Ok(())
 }
 
@@ -7364,6 +7430,7 @@ mod tests {
             fee_bps,
             fee_pkh,
             precommit_root: None,
+            role_ticket_proofs: None,
         }
     }
 
@@ -7749,6 +7816,172 @@ mod tests {
     }
 
     #[test]
+    fn phase21b_ticket_penalty_enforcement() {
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_penalty::PenaltyStatus;
+        use crate::poawx_ticket::TicketProof;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE");
+        std::env::remove_var("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT");
+
+        let net = crate::activation::network_id_byte();
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let total = block_reward(height);
+        let base_receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        let primary = base_receipt.worker_pkh;
+
+        let build = |ext: &crate::poawx::Phase20ReceiptExt| -> Block {
+            let mut receipt = base_receipt.clone();
+            receipt.phase20_ext = Some(ext.clone());
+            let root = crate::poawx::irx1_root_from_block_receipts_gated(
+                std::slice::from_ref(&receipt),
+                true,
+            );
+            let mut irx1_script = vec![0x6a, 0x24u8];
+            irx1_script.extend_from_slice(b"irx1");
+            irx1_script.extend_from_slice(&root);
+            let mut payout = p20_coinbase(&primary, ext, total);
+            payout[0] = TxOutput {
+                value: 0,
+                script_pubkey: irx1_script,
+            };
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: 0xffff_ffff,
+                    script_sig: vec![0x01, 0x00],
+                    sequence: 0xffff_ffff,
+                }],
+                outputs: payout,
+                locktime: 0,
+            };
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![coinbase],
+                auxpow: None,
+                poawx_receipts: Some(vec![receipt]),
+            }
+        };
+        // ext role solvers are c/v/s = 0xC1/0xC2/0xC3 (see p20_ext).
+        let tickets = |expiry: u64, verify_status: u8| {
+            [
+                TicketProof::new(
+                    net,
+                    height,
+                    ROLE_COMPUTE_CONTRIBUTOR,
+                    [0xC1u8; 20],
+                    1,
+                    expiry,
+                    [0x02u8; 33],
+                    [0x11u8; 32],
+                    PenaltyStatus::Clean.id(),
+                ),
+                TicketProof::new(
+                    net,
+                    height,
+                    ROLE_VERIFY_CONTRIBUTOR,
+                    [0xC2u8; 20],
+                    1,
+                    expiry,
+                    [0x02u8; 33],
+                    [0x12u8; 32],
+                    verify_status,
+                ),
+                TicketProof::new(
+                    net,
+                    height,
+                    ROLE_SUPPORT_CONTRIBUTOR,
+                    [0xC3u8; 20],
+                    1,
+                    expiry,
+                    [0x02u8; 33],
+                    [0x13u8; 32],
+                    PenaltyStatus::Clean.id(),
+                ),
+            ]
+        };
+
+        // (20) gate OFF: ext WITHOUT tickets accepts (old behavior unchanged).
+        std::env::remove_var("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TICKETS_REQUIRED");
+        let ext_plain = p20_ext(net, height, &parent_hash, 0, [0u8; 20]);
+        assert!(
+            validate_poawx_block_receipts(&build(&ext_plain), height, Some(&parent)).is_ok(),
+            "gate off: ticketless ext must accept"
+        );
+
+        // gate ON.
+        std::env::set_var("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TICKETS_REQUIRED", "1");
+        // (2) gate on + missing tickets -> reject.
+        assert!(
+            validate_poawx_block_receipts(&build(&ext_plain), height, Some(&parent)).is_err(),
+            "gate on: missing ticket proofs must reject"
+        );
+        // (3) gate on + valid tickets -> accept.
+        let mut ext_ok = ext_plain.clone();
+        ext_ok.role_ticket_proofs = Some(tickets(100, PenaltyStatus::Clean.id()));
+        assert!(
+            validate_poawx_block_receipts(&build(&ext_ok), height, Some(&parent)).is_ok(),
+            "gate on: valid tickets must accept"
+        );
+        // (5) gate on + expired ticket -> reject.
+        let mut ext_exp = ext_plain.clone();
+        ext_exp.role_ticket_proofs = Some(tickets(1, PenaltyStatus::Clean.id())); // expiry==height
+        assert!(
+            validate_poawx_block_receipts(&build(&ext_exp), height, Some(&parent)).is_err(),
+            "gate on: expired ticket must reject"
+        );
+        // (12) penalty enforced + suspended VERIFY (high-trust) -> reject.
+        std::env::set_var("IRIUM_POAWX_PENALTY_STATE_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_PENALTY_STATE_REQUIRED", "1");
+        let mut ext_susp = ext_plain.clone();
+        ext_susp.role_ticket_proofs = Some(tickets(100, PenaltyStatus::SuspendedForEpoch.id()));
+        assert!(
+            validate_poawx_block_receipts(&build(&ext_susp), height, Some(&parent)).is_err(),
+            "penalty on: suspended high-trust role must reject"
+        );
+        // (13) penalty NOT enforced: same suspended ticket accepts.
+        std::env::remove_var("IRIUM_POAWX_PENALTY_STATE_REQUIRED");
+        assert!(
+            validate_poawx_block_receipts(&build(&ext_susp), height, Some(&parent)).is_ok(),
+            "penalty off: suspended ticket accepts (penalty not enforced)"
+        );
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TICKETS_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_PENALTY_STATE_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
     fn phase20_connect_block_mode1_third_party_fee_and_binding() {
         use k256::ecdsa::signature::hazmat::PrehashSigner;
         let _g = chain_poawx_env_lock()
@@ -7947,6 +8180,7 @@ mod tests {
                 fee_bps: 0,
                 fee_pkh: [0u8; 20],
                 precommit_root: next_root,
+                role_ticket_proofs: None,
             }
         };
         let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {

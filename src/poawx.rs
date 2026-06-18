@@ -3,6 +3,7 @@
 //! Env-var reads are intentionally absent here — callers own activation gating.
 
 use crate::block::Block;
+use crate::poawx_ticket::{TicketProof, TICKET_PROOF_WIRE, TICKET_SECTION_MAGIC};
 use sha2::{Digest, Sha256};
 
 const IRX1_TAG: &[u8] = b"irx1";
@@ -606,6 +607,11 @@ pub struct Phase20ReceiptExt {
     /// Phase 20 exts stay byte-identical). After hidden-precommit activation this is
     /// required on every production block.
     pub precommit_root: Option<[u8; 32]>,
+    /// Phase 21B: optional per-role ticket proofs (compute/verify/support) bound
+    /// to this block/height. `None` => absent (trailing ticket section omitted, so
+    /// pre-Step-21B exts stay byte-identical). Required on every production block
+    /// when the ticket gate is enabled (validated in connect_block).
+    pub role_ticket_proofs: Option<[TicketProof; 3]>,
 }
 
 impl Phase20ReceiptExt {
@@ -624,9 +630,27 @@ impl Phase20ReceiptExt {
         }
         out.extend_from_slice(&self.fee_bps.to_le_bytes());
         out.extend_from_slice(&self.fee_pkh);
-        if let Some(root) = &self.precommit_root {
-            out.push(1);
-            out.extend_from_slice(root);
+        // Step 6A precommit_root (present-only) followed by the Step 21B trailing
+        // ticket section (present-only). When a ticket section is present but
+        // precommit_root is None, an explicit `0` precommit flag is written first so
+        // the reader can unambiguously skip to the ticket magic. When both are
+        // absent, nothing is appended -> byte-identical to pre-Step-21B exts.
+        match &self.precommit_root {
+            Some(root) => {
+                out.push(1);
+                out.extend_from_slice(root);
+            }
+            None => {
+                if self.role_ticket_proofs.is_some() {
+                    out.push(0);
+                }
+            }
+        }
+        if let Some(proofs) = &self.role_ticket_proofs {
+            out.extend_from_slice(TICKET_SECTION_MAGIC);
+            for p in proofs.iter() {
+                out.extend_from_slice(&p.serialize());
+            }
         }
         out
     }
@@ -677,10 +701,30 @@ impl Phase20ReceiptExt {
                     need(off, 32, "precommit_root")?;
                     let mut r = [0u8; 32];
                     r.copy_from_slice(&raw[off..off + 32]);
+                    off += 32;
                     Some(r)
                 }
                 other => return Err(format!("phase20 ext: bad precommit flag {}", other)),
             }
+        } else {
+            None
+        };
+        // Step 21B trailing ticket section (present-only): magic + 3 fixed proofs.
+        let role_ticket_proofs = if off < raw.len() {
+            need(off, 4, "ticket section magic")?;
+            if &raw[off..off + 4] != TICKET_SECTION_MAGIC {
+                return Err("phase20 ext: bad ticket section magic".to_string());
+            }
+            off += 4;
+            let mut proofs: Vec<TicketProof> = Vec::with_capacity(3);
+            for _ in 0..3 {
+                need(off, TICKET_PROOF_WIRE, "ticket proof")?;
+                proofs.push(TicketProof::deserialize(
+                    &raw[off..off + TICKET_PROOF_WIRE],
+                )?);
+                off += TICKET_PROOF_WIRE;
+            }
+            Some([proofs[0].clone(), proofs[1].clone(), proofs[2].clone()])
         } else {
             None
         };
@@ -692,6 +736,7 @@ impl Phase20ReceiptExt {
             fee_bps,
             fee_pkh,
             precommit_root,
+            role_ticket_proofs,
         })
     }
 
@@ -1646,6 +1691,7 @@ mod tests {
             fee_bps: 150,
             fee_pkh: [0xFEu8; 20],
             precommit_root: None,
+            role_ticket_proofs: None,
         };
         let bytes = ext.serialize();
         let ext2 = Phase20ReceiptExt::deserialize(&bytes).expect("deserialize");
@@ -1755,6 +1801,7 @@ mod tests {
             fee_bps: 0,
             fee_pkh: [0u8; 20],
             precommit_root: None,
+            role_ticket_proofs: None,
         };
         let none = base();
         let mut some = base();
@@ -1777,6 +1824,86 @@ mod tests {
     }
 
     #[test]
+    fn phase20_ext_ticket_section_roundtrip_backward_compatible() {
+        let prev = [0x44u8; 32];
+        let base = || Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+        };
+        let proofs = [
+            TicketProof::new(
+                1,
+                60,
+                ROLE_COMPUTE_CONTRIBUTOR,
+                [0xC1u8; 20],
+                1,
+                200,
+                [0x02u8; 33],
+                [0x11u8; 32],
+                0,
+            ),
+            TicketProof::new(
+                1,
+                60,
+                ROLE_VERIFY_CONTRIBUTOR,
+                [0xC2u8; 20],
+                1,
+                200,
+                [0x02u8; 33],
+                [0x12u8; 32],
+                0,
+            ),
+            TicketProof::new(
+                1,
+                60,
+                ROLE_SUPPORT_CONTRIBUTOR,
+                [0xC3u8; 20],
+                1,
+                200,
+                [0x02u8; 33],
+                [0x13u8; 32],
+                0,
+            ),
+        ];
+        // (1) ticket ABSENT == byte-identical (no TPK1 magic; round-trips).
+        let none = base();
+        let none_bytes = none.serialize();
+        assert!(
+            none_bytes.windows(4).all(|w| w != TICKET_SECTION_MAGIC),
+            "no ticket magic when absent"
+        );
+        assert_eq!(Phase20ReceiptExt::deserialize(&none_bytes).unwrap(), none);
+        // (2) ticket PRESENT (precommit None): +1 precommit flag +4 magic +3*proof.
+        let mut t = base();
+        t.role_ticket_proofs = Some(proofs.clone());
+        let tb = t.serialize();
+        assert_eq!(tb.len(), none_bytes.len() + 1 + 4 + 3 * TICKET_PROOF_WIRE);
+        assert_eq!(Phase20ReceiptExt::deserialize(&tb).unwrap(), t);
+        assert_ne!(none.digest(), t.digest(), "ticket section changes digest");
+        // (3) precommit Some + ticket Some round-trips.
+        let mut pt = base();
+        pt.precommit_root = Some([0xABu8; 32]);
+        pt.role_ticket_proofs = Some(proofs.clone());
+        assert_eq!(Phase20ReceiptExt::deserialize(&pt.serialize()).unwrap(), pt);
+        // (4) precommit Some + ticket None unchanged (no magic).
+        let mut p_only = base();
+        p_only.precommit_root = Some([0xABu8; 32]);
+        let pob = p_only.serialize();
+        assert!(pob.windows(4).all(|w| w != TICKET_SECTION_MAGIC));
+        assert_eq!(Phase20ReceiptExt::deserialize(&pob).unwrap(), p_only);
+    }
+
+    #[test]
     fn phase20_block_receipt_v3_element_roundtrip() {
         let prev = [0x44u8; 32];
         let mk_ext = || Phase20ReceiptExt {
@@ -1791,6 +1918,7 @@ mod tests {
             fee_bps: 0,
             fee_pkh: [0u8; 20],
             precommit_root: None,
+            role_ticket_proofs: None,
         };
         // no-ext v3 element == v2 element + a single 0 flag byte (present-only).
         let r = make_test_receipt(9);
@@ -1826,6 +1954,7 @@ mod tests {
             fee_bps,
             fee_pkh,
             precommit_root: None,
+            role_ticket_proofs: None,
         };
 
         // Base mode-0 receipt with a production extension attached.

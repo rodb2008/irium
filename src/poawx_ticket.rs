@@ -296,6 +296,252 @@ pub fn tickets_required() -> bool {
         .unwrap_or(false)
 }
 
+/// Ticket enforcement is ON only when the gate is active at `height` AND the
+/// required flag is set. Mainnet hard-off (both inputs are). When off, connect_block
+/// ignores ticket proofs (old Phase 20 behavior unchanged).
+pub fn tickets_enforced(height: u64) -> bool {
+    tickets_active(height) && tickets_required()
+}
+
+// ── Phase 21B: compact role-ticket proof (binds a ticket to a Phase 20 role) ──
+//
+// A `TicketProof` is the compact, self-verifiable binding carried in the Phase 20
+// ext (one per rewarded role) when the ticket gate is enabled. It binds
+// network/height/role/miner-pkh and carries the sybil-work (nonce + digest) so a
+// validator can independently recompute the sybil digest + check the threshold,
+// plus a deterministic `ticket_digest` over the binding fields (recomputable, so
+// "digest matches canonical" is enforceable from the proof alone). No private key.
+
+pub const TICKET_PROOF_DOMAIN: &[u8] = b"IRIUM_POAWX_TICKET_PROOF_V1";
+pub const TICKET_PROOF_WIRE: usize = 1 + 8 + 1 + 20 + 8 + 8 + 33 + 32 + 32 + 1 + 32; // 176
+/// Magic prefixing the optional trailing ticket section in `Phase20ReceiptExt`.
+pub const TICKET_SECTION_MAGIC: &[u8; 4] = b"TPK1";
+
+/// High-trust roles (VERIFY + SUPPORT/finality). COMPUTE is not high-trust.
+pub fn is_high_trust_role(role_id: u8) -> bool {
+    role_id == crate::poawx::ROLE_VERIFY_CONTRIBUTOR
+        || role_id == crate::poawx::ROLE_SUPPORT_CONTRIBUTOR
+}
+
+/// Deterministic, recomputable digest over the proof's binding fields.
+pub fn compute_ticket_proof_digest(
+    network_id: u8,
+    target_height: u64,
+    role_id: u8,
+    miner_pkh: &[u8; 20],
+    epoch: u64,
+    expiry_height: u64,
+    assignment_public_key: &[u8; 33],
+    sybil_work_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(TICKET_PROOF_DOMAIN);
+    h.update([network_id]);
+    h.update(target_height.to_le_bytes());
+    h.update([role_id]);
+    h.update(miner_pkh);
+    h.update(epoch.to_le_bytes());
+    h.update(expiry_height.to_le_bytes());
+    h.update(assignment_public_key);
+    h.update(sybil_work_digest);
+    h.finalize().into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketProof {
+    pub network_id: u8,
+    pub target_height: u64,
+    pub role_id: u8,
+    pub miner_pkh: [u8; 20],
+    pub epoch: u64,
+    pub expiry_height: u64,
+    pub assignment_public_key: [u8; 33],
+    pub sybil_work_nonce: [u8; 32],
+    pub sybil_work_digest: [u8; 32],
+    pub penalty_status: u8,
+    pub ticket_digest: [u8; 32],
+}
+
+impl TicketProof {
+    /// Build a proof for `role_id` at `height` from the miner's identity + a sybil
+    /// nonce. Computes the sybil digest + deterministic ticket digest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        network_id: u8,
+        target_height: u64,
+        role_id: u8,
+        miner_pkh: [u8; 20],
+        epoch: u64,
+        expiry_height: u64,
+        assignment_public_key: [u8; 33],
+        sybil_work_nonce: [u8; 32],
+        penalty_status: u8,
+    ) -> Self {
+        let sybil_work_digest = compute_sybil_digest(
+            network_id,
+            &miner_pkh,
+            epoch,
+            &assignment_public_key,
+            &sybil_work_nonce,
+        );
+        let ticket_digest = compute_ticket_proof_digest(
+            network_id,
+            target_height,
+            role_id,
+            &miner_pkh,
+            epoch,
+            expiry_height,
+            &assignment_public_key,
+            &sybil_work_digest,
+        );
+        Self {
+            network_id,
+            target_height,
+            role_id,
+            miner_pkh,
+            epoch,
+            expiry_height,
+            assignment_public_key,
+            sybil_work_nonce,
+            sybil_work_digest,
+            penalty_status,
+            ticket_digest,
+        }
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(TICKET_PROOF_WIRE);
+        out.push(self.network_id);
+        out.extend_from_slice(&self.target_height.to_le_bytes());
+        out.push(self.role_id);
+        out.extend_from_slice(&self.miner_pkh);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.expiry_height.to_le_bytes());
+        out.extend_from_slice(&self.assignment_public_key);
+        out.extend_from_slice(&self.sybil_work_nonce);
+        out.extend_from_slice(&self.sybil_work_digest);
+        out.push(self.penalty_status);
+        out.extend_from_slice(&self.ticket_digest);
+        out
+    }
+
+    pub fn deserialize(b: &[u8]) -> Result<Self, String> {
+        if b.len() != TICKET_PROOF_WIRE {
+            return Err(format!(
+                "ticket proof: bad len {} (want {})",
+                b.len(),
+                TICKET_PROOF_WIRE
+            ));
+        }
+        let mut p = 0usize;
+        let rd = |p: &mut usize, n: usize| {
+            let s = b[*p..*p + n].to_vec();
+            *p += n;
+            s
+        };
+        let network_id = b[p];
+        p += 1;
+        let target_height = u64::from_le_bytes(rd(&mut p, 8).try_into().unwrap());
+        let role_id = b[p];
+        p += 1;
+        let mut miner_pkh = [0u8; 20];
+        miner_pkh.copy_from_slice(&rd(&mut p, 20));
+        let epoch = u64::from_le_bytes(rd(&mut p, 8).try_into().unwrap());
+        let expiry_height = u64::from_le_bytes(rd(&mut p, 8).try_into().unwrap());
+        let mut assignment_public_key = [0u8; 33];
+        assignment_public_key.copy_from_slice(&rd(&mut p, 33));
+        let mut sybil_work_nonce = [0u8; 32];
+        sybil_work_nonce.copy_from_slice(&rd(&mut p, 32));
+        let mut sybil_work_digest = [0u8; 32];
+        sybil_work_digest.copy_from_slice(&rd(&mut p, 32));
+        let penalty_status = b[p];
+        p += 1;
+        let mut ticket_digest = [0u8; 32];
+        ticket_digest.copy_from_slice(&rd(&mut p, 32));
+        Ok(Self {
+            network_id,
+            target_height,
+            role_id,
+            miner_pkh,
+            epoch,
+            expiry_height,
+            assignment_public_key,
+            sybil_work_nonce,
+            sybil_work_digest,
+            penalty_status,
+            ticket_digest,
+        })
+    }
+
+    /// Validate the proof against block context + the rewarded role's solver pkh.
+    /// `require_sybil_bits` enforces the sybil cost when > 0; `penalty_enforced`
+    /// blocks suspended/slashed identities from high-trust roles.
+    pub fn validate(
+        &self,
+        expected_network: u8,
+        height: u64,
+        role_id: u8,
+        role_solver_pkh: &[u8; 20],
+        require_sybil_bits: u32,
+        penalty_enforced: bool,
+    ) -> Result<(), String> {
+        if expected_network == 0 {
+            return Err("ticket proof: mainnet hard-off".to_string());
+        }
+        if self.network_id != expected_network {
+            return Err("ticket proof: network mismatch".to_string());
+        }
+        if self.target_height != height {
+            return Err("ticket proof: height mismatch".to_string());
+        }
+        if self.role_id != role_id {
+            return Err("ticket proof: role mismatch".to_string());
+        }
+        if &self.miner_pkh != role_solver_pkh {
+            return Err("ticket proof: miner pkh != role solver".to_string());
+        }
+        if self.expiry_height <= height {
+            return Err("ticket proof: expired".to_string());
+        }
+        let recomputed_sybil = compute_sybil_digest(
+            self.network_id,
+            &self.miner_pkh,
+            self.epoch,
+            &self.assignment_public_key,
+            &self.sybil_work_nonce,
+        );
+        if recomputed_sybil != self.sybil_work_digest {
+            return Err("ticket proof: sybil digest mismatch".to_string());
+        }
+        if require_sybil_bits > 0
+            && !meets_sybil_target(&self.sybil_work_digest, require_sybil_bits)
+        {
+            return Err("ticket proof: insufficient sybil work".to_string());
+        }
+        let expect_digest = compute_ticket_proof_digest(
+            self.network_id,
+            self.target_height,
+            self.role_id,
+            &self.miner_pkh,
+            self.epoch,
+            self.expiry_height,
+            &self.assignment_public_key,
+            &self.sybil_work_digest,
+        );
+        if expect_digest != self.ticket_digest {
+            return Err("ticket proof: ticket_digest mismatch".to_string());
+        }
+        let pen = crate::poawx_penalty::PenaltyStatus::from_id(self.penalty_status)
+            .ok_or("ticket proof: bad penalty status")?;
+        if penalty_enforced && is_high_trust_role(role_id) && !pen.eligible_for_high_trust_role() {
+            return Err(
+                "ticket proof: penalized identity ineligible for high-trust role".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +662,121 @@ mod tests {
         // validate() already enforces mainnet hard-off via expected_network==0:
         let t = mk(1, 10, 100);
         assert!(t.validate(0, 50, 0).is_err(), "validate mainnet hard-off");
+    }
+
+    #[test]
+    fn ticket_proof_roundtrip_and_validate() {
+        use crate::poawx::{ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR};
+        let net = 1u8;
+        let solver = [0xC7u8; 20];
+        let apk = [0x02u8; 33];
+        let p = TicketProof::new(
+            net,
+            5,
+            ROLE_VERIFY_CONTRIBUTOR,
+            solver,
+            2,
+            100,
+            apk,
+            [0x44u8; 32],
+            0,
+        );
+        // wire round-trip (fixed size).
+        let b = p.serialize();
+        assert_eq!(b.len(), TICKET_PROOF_WIRE);
+        assert_eq!(TicketProof::deserialize(&b).unwrap(), p);
+        // valid against matching context.
+        assert!(p
+            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .is_ok());
+        // rejects: wrong net / height / role / solver / expired / mainnet.
+        assert!(p
+            .validate(2, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .is_err());
+        assert!(p
+            .validate(net, 6, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .is_err());
+        assert!(p
+            .validate(net, 5, ROLE_SUPPORT_CONTRIBUTOR, &solver, 0, false)
+            .is_err());
+        assert!(p
+            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &[0u8; 20], 0, false)
+            .is_err());
+        assert!(p
+            .validate(0, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .is_err());
+        let exp = TicketProof::new(
+            net,
+            5,
+            ROLE_VERIFY_CONTRIBUTOR,
+            solver,
+            2,
+            5,
+            apk,
+            [0x44u8; 32],
+            0,
+        );
+        assert!(
+            exp.validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+                .is_err(),
+            "expired"
+        );
+        // tampered sybil nonce -> digest mismatch.
+        let mut bad = p.clone();
+        bad.sybil_work_nonce[0] ^= 1;
+        assert!(bad
+            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .is_err());
+        // insufficient sybil work at a high required threshold.
+        assert!(p
+            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 28, false)
+            .is_err());
+        // penalty enforcement: suspended ineligible for high-trust role.
+        let susp = TicketProof::new(
+            net,
+            5,
+            ROLE_VERIFY_CONTRIBUTOR,
+            solver,
+            2,
+            100,
+            apk,
+            [0x44u8; 32],
+            crate::poawx_penalty::PenaltyStatus::SuspendedForEpoch.id(),
+        );
+        assert!(
+            susp.validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, true)
+                .is_err(),
+            "suspended high-trust"
+        );
+        // ...but penalty not enforced -> accepts; and suspended COMPUTE (not high-trust) accepts.
+        assert!(susp
+            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .is_ok());
+        let susp_c = TicketProof::new(
+            net,
+            5,
+            crate::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+            solver,
+            2,
+            100,
+            apk,
+            [0x44u8; 32],
+            crate::poawx_penalty::PenaltyStatus::SuspendedForEpoch.id(),
+        );
+        assert!(
+            susp_c
+                .validate(
+                    net,
+                    5,
+                    crate::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+                    &solver,
+                    0,
+                    true
+                )
+                .is_ok(),
+            "compute not high-trust"
+        );
+        // malformed.
+        assert!(TicketProof::deserialize(b"short").is_err());
     }
 }

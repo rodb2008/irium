@@ -160,6 +160,24 @@ pub fn penalty_state_active(height: u64) -> bool {
     penalty_gate(network_id_byte(), penalty_state_activation_height(), height)
 }
 
+/// Whether penalty enforcement is REQUIRED (`IRIUM_POAWX_PENALTY_STATE_REQUIRED=1`).
+/// Mainnet hard-off.
+pub fn penalty_state_required() -> bool {
+    if network_id_byte() == 0 {
+        return false;
+    }
+    std::env::var("IRIUM_POAWX_PENALTY_STATE_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Penalty enforcement is ON only when active at `height` AND required. Mainnet
+/// hard-off. Used by the Phase 21B ticket-proof validator to block suspended/
+/// slashed identities from high-trust roles.
+pub fn penalty_state_enforced(height: u64) -> bool {
+    penalty_state_active(height) && penalty_state_required()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
