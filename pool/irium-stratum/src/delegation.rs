@@ -1228,6 +1228,9 @@ pub struct Phase20ReceiptExtMirror {
     /// section; None => byte-identical to pre-21C). Attached when
     /// `pool_anti_domination_enforced(height)`.
     pub role_dominance_weights: Option<[u64; 4]>,
+    /// Phase 21D: optional candidate set (trailing CND1 section; None =>
+    /// byte-identical to pre-21D).
+    pub candidate_set: Option<CandidateSetMirror>,
 }
 
 impl Phase20ReceiptExtMirror {
@@ -1254,7 +1257,10 @@ impl Phase20ReceiptExtMirror {
                 out.extend_from_slice(root);
             }
             None => {
-                if self.role_ticket_proofs.is_some() || self.role_dominance_weights.is_some() {
+                if self.role_ticket_proofs.is_some()
+                    || self.role_dominance_weights.is_some()
+                    || self.candidate_set.is_some()
+                {
                     out.push(0);
                 }
             }
@@ -1272,6 +1278,12 @@ impl Phase20ReceiptExtMirror {
             for w in weights.iter() {
                 out.extend_from_slice(&w.to_le_bytes());
             }
+        }
+        if let Some(cs) = &self.candidate_set {
+            let body = cs.serialize();
+            out.extend_from_slice(CANDIDATE_SECTION_MAGIC);
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
         }
         out
     }
@@ -1508,6 +1520,279 @@ pub fn pool_dominance_weights_for(primary_pkh: &[u8; 20], rr: &RoleRewardMirror)
     pool_role_dominance_weights(primary_pkh, rr, &v, DOMINANCE_BASE_WORK_SCORE)
 }
 
+/// ── Phase 21D: candidate-set + assignment-proof mirror (pool side) ──────────
+/// Byte-identical mirror of node `poawx_candidate` (wire + deterministic math).
+/// `AssignmentProofV1` is a VRF-style placeholder (no VRF lib); the node
+/// re-validates everything, so the pool is one interface, not the owner.
+pub const ASSIGNMENT_PROOF_DOMAIN: &[u8] = b"IRIUM_POAWX_ASSIGNMENT_PROOF_V1";
+pub const CANDIDATE_SET_DOMAIN: &[u8] = b"IRIUM_POAWX_CANDIDATE_SET_V1";
+pub const CANDIDATE_SECTION_MAGIC: &[u8; 4] = b"CND1";
+pub const ROLE_CANDIDATE_WIRE: usize = 1 + 20 + 33 + 32 + 1 + 32 + 8 + 8 + 8 + 32; // 175
+pub const EFFECTIVE_SCORE_SCALE: u128 = 1_000_000;
+
+pub fn compute_assignment_proof_digest(
+    network_id: u8,
+    target_height: u64,
+    role_id: u8,
+    solver_pkh: &[u8; 20],
+    assignment_public_key: &[u8; 33],
+    ticket_digest: &[u8; 32],
+    seed: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ASSIGNMENT_PROOF_DOMAIN);
+    h.update([network_id]);
+    h.update(target_height.to_le_bytes());
+    h.update([role_id]);
+    h.update(solver_pkh);
+    h.update(assignment_public_key);
+    h.update(ticket_digest);
+    h.update(seed);
+    h.finalize().into()
+}
+
+pub fn assignment_score_from_digest(d: &[u8; 32]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&d[0..8]);
+    u64::from_le_bytes(b)
+}
+
+pub fn effective_score(assignment_score: u64, dominance_weight: u64, penalty_weight: u64) -> u64 {
+    let v = (assignment_score as u128)
+        .saturating_mul(dominance_weight as u128)
+        .saturating_mul(penalty_weight as u128)
+        / EFFECTIVE_SCORE_SCALE;
+    v.min(u64::MAX as u128) as u64
+}
+
+/// Mirror of node PenaltyStatus::weight_multiplier_permille.
+pub fn penalty_weight_permille(status: u8) -> u64 {
+    match status {
+        0 | 1 => 1000,
+        2 => 500,
+        _ => 0,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleCandidateMirror {
+    pub role_id: u8,
+    pub solver_pkh: [u8; 20],
+    pub assignment_public_key: [u8; 33],
+    pub ticket_digest: [u8; 32],
+    pub penalty_status: u8,
+    pub assignment_proof_digest: [u8; 32],
+    pub dominance_weight: u64,
+    pub penalty_weight: u64,
+    pub effective_score: u64,
+    pub role_claim_digest: [u8; 32],
+}
+
+impl RoleCandidateMirror {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        network_id: u8,
+        target_height: u64,
+        seed: &[u8; 32],
+        role_id: u8,
+        solver_pkh: [u8; 20],
+        assignment_public_key: [u8; 33],
+        ticket_digest: [u8; 32],
+        penalty_status: u8,
+        dominance_weight: u64,
+        role_claim_digest: [u8; 32],
+    ) -> Self {
+        let assignment_proof_digest = compute_assignment_proof_digest(
+            network_id,
+            target_height,
+            role_id,
+            &solver_pkh,
+            &assignment_public_key,
+            &ticket_digest,
+            seed,
+        );
+        let penalty_weight = penalty_weight_permille(penalty_status);
+        let assignment_score = assignment_score_from_digest(&assignment_proof_digest);
+        let effective_score = effective_score(assignment_score, dominance_weight, penalty_weight);
+        Self {
+            role_id,
+            solver_pkh,
+            assignment_public_key,
+            ticket_digest,
+            penalty_status,
+            assignment_proof_digest,
+            dominance_weight,
+            penalty_weight,
+            effective_score,
+            role_claim_digest,
+        }
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ROLE_CANDIDATE_WIRE);
+        out.push(self.role_id);
+        out.extend_from_slice(&self.solver_pkh);
+        out.extend_from_slice(&self.assignment_public_key);
+        out.extend_from_slice(&self.ticket_digest);
+        out.push(self.penalty_status);
+        out.extend_from_slice(&self.assignment_proof_digest);
+        out.extend_from_slice(&self.dominance_weight.to_le_bytes());
+        out.extend_from_slice(&self.penalty_weight.to_le_bytes());
+        out.extend_from_slice(&self.effective_score.to_le_bytes());
+        out.extend_from_slice(&self.role_claim_digest);
+        out
+    }
+
+    fn sort_key(&self) -> ([u8; 1], [u8; 20], [u8; 32], [u8; 32]) {
+        (
+            [self.role_id],
+            self.solver_pkh,
+            self.ticket_digest,
+            self.assignment_proof_digest,
+        )
+    }
+}
+
+fn candidate_better(a: &RoleCandidateMirror, b: &RoleCandidateMirror) -> bool {
+    if a.effective_score != b.effective_score {
+        return a.effective_score > b.effective_score;
+    }
+    if a.assignment_proof_digest != b.assignment_proof_digest {
+        return a.assignment_proof_digest < b.assignment_proof_digest;
+    }
+    if a.solver_pkh != b.solver_pkh {
+        return a.solver_pkh < b.solver_pkh;
+    }
+    a.ticket_digest < b.ticket_digest
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateSetMirror {
+    pub network_id: u8,
+    pub target_height: u64,
+    pub seed: [u8; 32],
+    pub candidates: Vec<RoleCandidateMirror>,
+}
+
+impl CandidateSetMirror {
+    pub fn new(network_id: u8, target_height: u64, seed: [u8; 32]) -> Self {
+        Self {
+            network_id,
+            target_height,
+            seed,
+            candidates: Vec::new(),
+        }
+    }
+    pub fn push(&mut self, c: RoleCandidateMirror) {
+        self.candidates.push(c);
+    }
+    pub fn sort_canonical(&mut self) {
+        self.candidates
+            .sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    }
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(1 + 8 + 32 + 2 + self.candidates.len() * ROLE_CANDIDATE_WIRE);
+        out.push(self.network_id);
+        out.extend_from_slice(&self.target_height.to_le_bytes());
+        out.extend_from_slice(&self.seed);
+        out.extend_from_slice(&(self.candidates.len() as u16).to_le_bytes());
+        for c in &self.candidates {
+            out.extend_from_slice(&c.serialize());
+        }
+        out
+    }
+    pub fn root(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(CANDIDATE_SET_DOMAIN);
+        h.update(self.serialize());
+        h.finalize().into()
+    }
+    pub fn best_for_role(&self, role_id: u8) -> Option<&RoleCandidateMirror> {
+        let mut best: Option<&RoleCandidateMirror> = None;
+        for c in self.candidates.iter().filter(|c| c.role_id == role_id) {
+            match best {
+                None => best = Some(c),
+                Some(b) if candidate_better(c, b) => best = Some(c),
+                _ => {}
+            }
+        }
+        best
+    }
+}
+
+/// Pool candidate-set enforcement gate (mirror node `candidate_set_enforced`).
+pub fn pool_candidate_set_enforced(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false;
+    }
+    let active = match env::var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    };
+    let required = env::var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    active && required
+}
+
+/// Build a canonical candidate set for the produced ext from the selected role
+/// solvers: ticket digests come from the per-role ticket proofs, dominance weights
+/// from the process-global pool view, penalty Clean. One candidate per selected
+/// role (the node validates "selected == best within the included set"; richer
+/// multi-candidate admission/gossip is future work). Fails closed by returning the
+/// set the node will accept only if it matches the node's persisted state.
+pub fn build_pool_candidate_set(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    rr: &RoleRewardMirror,
+) -> CandidateSetMirror {
+    let tickets = build_role_ticket_proofs(network_id, height, rr);
+    let view = pool_dominance_view()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let base = DOMINANCE_BASE_WORK_SCORE;
+    let mut cs = CandidateSetMirror::new(network_id, height, *prev_hash);
+    let roles = [
+        (
+            ROLE_COMPUTE_CONTRIBUTOR,
+            rr.compute_contributor_pkh,
+            &tickets[0],
+        ),
+        (
+            ROLE_VERIFY_CONTRIBUTOR,
+            rr.verify_contributor_pkh,
+            &tickets[1],
+        ),
+        (
+            ROLE_SUPPORT_CONTRIBUTOR,
+            rr.support_contributor_pkh,
+            &tickets[2],
+        ),
+    ];
+    for (role_id, solver, tk) in roles {
+        let dom_w = view.weight(base, &solver);
+        cs.push(RoleCandidateMirror::build(
+            network_id,
+            height,
+            prev_hash,
+            role_id,
+            solver,
+            tk.assignment_public_key,
+            tk.ticket_digest,
+            0,
+            dom_w,
+            tk.ticket_digest,
+        ));
+    }
+    cs.sort_canonical();
+    cs
+}
+
 pub fn build_synthetic_phase20_ext(
     network_id: u8,
     height: u64,
@@ -1592,6 +1877,18 @@ pub fn build_synthetic_phase20_ext(
     } else {
         None
     };
+    // Phase 21D: attach the candidate set when enforcement is on (else None =>
+    // byte-identical; node fails closed when required).
+    let candidate_set = if pool_candidate_set_enforced(height) {
+        Some(build_pool_candidate_set(
+            network_id,
+            height,
+            prev_hash,
+            &role_reward,
+        ))
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim,
@@ -1602,6 +1899,7 @@ pub fn build_synthetic_phase20_ext(
         precommit_root,
         role_ticket_proofs,
         role_dominance_weights,
+        candidate_set,
     })
 }
 
@@ -1967,6 +2265,7 @@ pub fn build_collected_phase20_ext(
     height: u64,
     fee: Option<(u16, [u8; 20])>,
     primary_pkh: &[u8; 20],
+    prev_hash: &[u8; 32],
 ) -> Option<Phase20ReceiptExtMirror> {
     if network_id == 0 || !role_protocol_enabled() {
         return None;
@@ -1995,6 +2294,18 @@ pub fn build_collected_phase20_ext(
     } else {
         None
     };
+    // Phase 21D: attach the candidate set when enforcement is on (else None =>
+    // byte-identical; node fails closed when required).
+    let candidate_set = if pool_candidate_set_enforced(height) {
+        Some(build_pool_candidate_set(
+            network_id,
+            height,
+            prev_hash,
+            &role_reward,
+        ))
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim: reveals[0].claim.clone(),
@@ -2005,6 +2316,7 @@ pub fn build_collected_phase20_ext(
         precommit_root: Some(next_root),
         role_ticket_proofs,
         role_dominance_weights,
+        candidate_set,
     })
 }
 
@@ -3616,6 +3928,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
         let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
             role_reward: node_rr,
@@ -3627,6 +3940,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
         assert_eq!(
             ext.serialize(),
@@ -3640,6 +3954,99 @@ mod tests {
         // RoleReward pkhs extractable from the hex without full deserialize.
         let (c, v, s) = role_reward_pkhs_from_ext_hex(&hex::encode(ext.serialize())).unwrap();
         assert_eq!((c, v, s), ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]));
+    }
+
+    #[test]
+    fn phase21d_pool_candidate_set_parity() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        let net = network_id_from_env();
+        assert!(pool_candidate_set_enforced(1), "enforced on testnet");
+        assert!(!pool_candidate_set_enforced(0), "below activation off");
+
+        let h = 5u64;
+        let prev = [0x44u8; 32];
+        let (cc, vv, ss) = ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]);
+        let rr = RoleRewardMirror {
+            compute_contributor_pkh: cc,
+            verify_contributor_pkh: vv,
+            support_contributor_pkh: ss,
+        };
+        let cs = build_pool_candidate_set(net, h, &prev, &rr);
+        assert_eq!(cs.candidates.len(), 3);
+
+        // candidate-set wire + root + best_for_role parity with the node lib.
+        let node_cs =
+            irium_node_rs::poawx_candidate::CandidateSet::deserialize(&cs.serialize()).unwrap();
+        assert_eq!(
+            node_cs.serialize(),
+            cs.serialize(),
+            "candidate set wire parity"
+        );
+        assert_eq!(node_cs.root(), cs.root(), "candidate set root parity");
+        for role in [1u8, 2, 3] {
+            assert_eq!(
+                node_cs.best_for_role(role).unwrap().solver_pkh,
+                cs.best_for_role(role).unwrap().solver_pkh,
+                "best-for-role parity"
+            );
+        }
+        // assignment-proof digest parity (VRF-style placeholder is recomputable).
+        let c0 = &cs.candidates[0];
+        let nd = irium_node_rs::poawx_candidate::compute_assignment_proof_digest(
+            net,
+            h,
+            c0.role_id,
+            &c0.solver_pkh,
+            &c0.assignment_public_key,
+            &c0.ticket_digest,
+            &prev,
+        );
+        assert_eq!(
+            nd, c0.assignment_proof_digest,
+            "assignment proof digest parity"
+        );
+
+        // full ext: pool attaches CND1 when enforced; node reads it back.
+        let primary = [0xA0u8; 20];
+        let ext = build_synthetic_phase20_ext(net, h, &prev, &primary, &[], None).expect("ext");
+        assert!(
+            ext.candidate_set.is_some(),
+            "candidate set attached when enforced"
+        );
+        let node_ext =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        assert_eq!(
+            node_ext.candidate_set.as_ref().unwrap().root(),
+            ext.candidate_set.as_ref().unwrap().root(),
+            "node reads pool CND1 section"
+        );
+
+        // gate off => no candidate set (byte-identical pre-21D).
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED");
+        let ext_off = build_synthetic_phase20_ext(net, h, &prev, &primary, &[], None).expect("ext");
+        assert!(
+            ext_off.candidate_set.is_none(),
+            "no candidate set when gate off"
+        );
+        assert!(
+            ext_off
+                .serialize()
+                .windows(4)
+                .all(|w| w != &CANDIDATE_SECTION_MAGIC[..]),
+            "no CND1 magic when absent"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!pool_candidate_set_enforced(1), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
     }
 
     #[test]
@@ -3702,6 +4109,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: Some(weights),
+            candidate_set: None,
         };
         // node lib reads the pool DOM1 weights back identically (wire parity).
         let node_ext =
@@ -4412,7 +4820,7 @@ mod tests {
                 .unwrap();
         }
         // COLLECTED production ext for height 2.
-        let ext = build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20])
+        let ext = build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20], &[0x33u8; 32])
             .expect("collected ext");
         assert_eq!(
             ext.precommit_root,
@@ -4462,19 +4870,21 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            build_collected_phase20_ext(&store2, net, 2, None, &[0x11u8; 20]).is_none(),
+            build_collected_phase20_ext(&store2, net, 2, None, &[0x11u8; 20], &[0x33u8; 32])
+                .is_none(),
             "missing role => fail closed"
         );
 
         // off-path: role protocol disabled => None (falls back to synthetic upstream).
         std::env::remove_var("IRIUM_POAWX_ROLE_PROTOCOL_ENABLED");
         assert!(
-            build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20]).is_none(),
+            build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20], &[0x33u8; 32])
+                .is_none(),
             "disabled => None"
         );
         // mainnet hard-off.
         assert!(
-            build_collected_phase20_ext(&store, 0, 2, None, &[0x11u8; 20]).is_none(),
+            build_collected_phase20_ext(&store, 0, 2, None, &[0x11u8; 20], &[0x33u8; 32]).is_none(),
             "mainnet hard-off"
         );
         assert!(!role_protocol_enabled(), "gate off");
@@ -4817,7 +5227,7 @@ mod tests {
         // (20) collected gossip precommits build the parent precommit_root.
         let root2 = store.precommit_root_for(2).expect("root2 from gossip");
         // (21) collected gossip reveals build the child ext (official fee-0 / 23).
-        let ext = build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20])
+        let ext = build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20], &[0x33u8; 32])
             .expect("collected ext");
         assert_eq!(ext.fee_bps, 0, "official fee-0");
         assert_eq!(ext.precommit_root, store.precommit_root_for(3));
@@ -4843,9 +5253,15 @@ mod tests {
 
         // (24) third-party fee still works from gossip-collected data.
         let fee_pkh = [0x7Fu8; 20];
-        let ext_fee =
-            build_collected_phase20_ext(&store, net, 2, Some((200, fee_pkh)), &[0x11u8; 20])
-                .expect("collected fee ext");
+        let ext_fee = build_collected_phase20_ext(
+            &store,
+            net,
+            2,
+            Some((200, fee_pkh)),
+            &[0x11u8; 20],
+            &[0x33u8; 32],
+        )
+        .expect("collected fee ext");
         assert_eq!(ext_fee.fee_bps, 200);
         assert_eq!(ext_fee.fee_pkh, fee_pkh);
 
@@ -4863,7 +5279,7 @@ mod tests {
 
         // (26) mainnet hard-off: build returns None and ingest rejects.
         assert!(
-            build_collected_phase20_ext(&store, 0, 2, None, &[0x11u8; 20]).is_none(),
+            build_collected_phase20_ext(&store, 0, 2, None, &[0x11u8; 20], &[0x33u8; 32]).is_none(),
             "mainnet build None"
         );
         let pc0 = RolePrecommitGossip::new(mk_precommit_dto(
@@ -4977,8 +5393,9 @@ mod tests {
                     .unwrap();
             }
             // build collected ext from the fetched data; node validator accepts.
-            let ext = build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20])
-                .expect("collected from fetched");
+            let ext =
+                build_collected_phase20_ext(&store, net, 2, None, &[0x11u8; 20], &[0x33u8; 32])
+                    .expect("collected from fetched");
             let node_ext =
                 irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
             let mut leaves = Vec::new();
@@ -5005,6 +5422,7 @@ mod tests {
                 2,
                 Some((200, [0x7Fu8; 20])),
                 &[0x11u8; 20],
+                &[0x33u8; 32],
             )
             .expect("fee ext");
             assert_eq!(ext_fee.fee_bps, 200);
@@ -5121,6 +5539,7 @@ mod tests {
                 precommit_root: root,
                 role_ticket_proofs: None,
                 role_dominance_weights: None,
+                candidate_set: None,
             };
         let fpkh = [0x7Fu8; 20];
         // Pre-6A (no precommit_root): fee parses correctly.
@@ -5232,6 +5651,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: Some(build_role_ticket_proofs(net, h, &rr)),
             role_dominance_weights: None,
+            candidate_set: None,
         };
         let node_ext =
             irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();

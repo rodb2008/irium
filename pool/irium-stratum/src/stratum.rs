@@ -1473,6 +1473,7 @@ fn build_session_poawx_receipts(
                     ctx.block_height,
                     fee,
                     pkh,
+                    &job.prev_hash,
                 );
                 let chosen = match collected {
                     Some(ext) => {

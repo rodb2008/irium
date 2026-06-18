@@ -459,6 +459,7 @@ mod tests {
             precommit_root: None,
             role_ticket_proofs: None,
             role_dominance_weights: None,
+            candidate_set: None,
         };
         let worker_pkh = [0xabu8; 20];
         let sol = [0x01u8; 8];
