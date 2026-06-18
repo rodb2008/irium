@@ -1,4 +1,16 @@
-# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (hidden-precommit commitment root in Step 6A; role collection in Step 6B; role gossip plumbing in Step 6C; live cross-process node↔pool bridge in Step 6D; public/two-VPS live E2E pending)
+# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (Step 6A hidden-precommit root; 6B role collection; 6C role gossip plumbing; 6D live node↔pool bridge; 6E loopback live E2E PASS; 6F two-VPS live E2E PASS; only public/external miner test remains)
+
+> **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has
+> been validated live, end-to-end, twice. **Step 6E** (single-VPS loopback) and **Step 6F**
+> (two-VPS, role gossip over real cross-VPS P2P with an observer node validating byte-identical)
+> each produced an official fee-0 block (height 2) and a third-party-fee block (height 3) from
+> **collected role-gossip data with synthetic fallback OFF**, with hidden-precommit enforcement
+> and restart/reload preservation. Step 6E found and fixed a real pool-only bug
+> (`fee_terms_from_ext_hex` × the Step 6A trailing `precommit_root`) in commit `cdbe24c`.
+> Details: `poaw-x-phase20-step6e-loopback-role-gossip-e2e.md`,
+> `poaw-x-phase20-step6f-two-vps-role-gossip-e2e.md`. **Remaining:** public/external
+> non-self-operated miner test; remote slow-cpuminer low-devnet PoW caveat. Mainnet remains
+> disabled; chain difficulty remains LWMA-144 automatic.
 
 **Status (updated Step 6A, 2026-06-18):** Deterministic lane assignment, role-claim
 reveal/validation primitives, the 34/33/33 distribution, serialization, and activation gates

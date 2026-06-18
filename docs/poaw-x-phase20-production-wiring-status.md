@@ -1,6 +1,17 @@
-# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 + 6A + 6B + 6C + 6D COMPLETE: extension threaded + consensus-enforced + root-committed + official+third-party-fee production + hidden-precommit root + local/testnet role collection + role gossip plumbing + live cross-process node↔pool bridge; public/two-VPS live E2E follow-up)
+# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 + 6A + 6B + 6C + 6D + 6E + 6F COMPLETE: extension threaded + consensus-enforced + root-committed + official+third-party-fee production + hidden-precommit root + role collection + role gossip plumbing + live node↔pool bridge + loopback live E2E + two-VPS live E2E; only public/external miner test remains)
 
-## Step 6D (this pass) — live cross-process node↔pool role-gossip bridge: COMPLETE (loopback bridge + P2P receive/rebroadcast wired; public live E2E = follow-up)
+## Step status summary (PoAW-X role/fairness track)
+- **Step 6A — hidden-precommit commitment root: COMPLETE** (primitives + connect_block enforcement, mainnet hard-off)
+- **Step 6B — local/testnet role precommit/reveal collection: COMPLETE** (loopback endpoints + RoleProtocolStore)
+- **Step 6C — role gossip payloads + in-memory relay: COMPLETE** (forward-compat wire types + pool gossip engine)
+- **Step 6D — live cross-process node↔pool bridge: COMPLETE** (P2P receive/rebroadcast + loopback RPC bridge + pool fetch)
+- **Step 6E — local loopback live role-gossip E2E: COMPLETE / PASS** (blocks 2 official + 3 third-party from collected data; restart/reload PASS; found+fixed the `fee_terms_from_ext_hex` × `precommit_root` bug in `cdbe24c`). See `poaw-x-phase20-step6e-loopback-role-gossip-e2e.md`.
+- **Step 6F — two-VPS live role-gossip E2E: COMPLETE / PASS** (role gossip VPS-2 → real P2P → VPS-1 → block production; observer Node B validated both blocks byte-identical; restart/reload PASS; operator-only source-restricted UFW, removed after). See `poaw-x-phase20-step6f-two-vps-role-gossip-e2e.md`.
+- **Remaining:** (1) public/external **non-self-operated** miner test; (2) remote slow-cpuminer low-devnet-height PoW caveat (remote CPU connects/authorizes/receives work but does not land a diff-1 share in-window — environment limitation, not Phase 20 logic).
+
+**Safety (unchanged):** mainnet hard-off on every gate; chain difficulty remains LWMA-144 automatic; delegation/RPC/status/metrics loopback-only; mainnet + production pool untouched throughout. **Not claimed:** mainnet-ready, public activation complete, external miner test complete, or remote cpuminer PoW solved. Nothing pushed (local branch only).
+
+## Step 6D — live cross-process node↔pool role-gossip bridge: COMPLETE (loopback bridge + P2P receive/rebroadcast wired)
 
 Step 6D closes the Step 6C gap: the node P2P bus and the pool `RoleProtocolStore`
 are now joined over loopback so externally-gossiped role data reaches pool

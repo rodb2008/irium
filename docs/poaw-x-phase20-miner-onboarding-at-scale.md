@@ -48,6 +48,19 @@ flow into a repeatable onboarding runbook for additional trusted miners.
 > role-gossip E2E (only with the operator firewall handoff). Production still prefers real
 > (bridged) role data over the synthetic fallback (`IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`).
 
+> **Live validation done (Steps 6E/6F, 2026-06-18).** The role-gossip → Phase 20 production path
+> is validated live: **6E** (single-VPS loopback) and **6F** (two-VPS, role gossip over real
+> cross-VPS P2P with an observer node validating byte-identical) each produced an official fee-0
+> block and a third-party-fee block from **collected role-gossip data, synthetic OFF**, with
+> hidden-precommit enforcement and restart/reload preservation. 6F used an **operator-only,
+> source-restricted** firewall (only stratum + P2P public to the one miner VPS; removed after);
+> delegation/RPC/status/metrics stayed loopback-only. See
+> `poaw-x-phase20-step6e-loopback-role-gossip-e2e.md` and
+> `poaw-x-phase20-step6f-two-vps-role-gossip-e2e.md`. **Still open before any public rollout:** a
+> public/external (non-self-operated) miner test, and the remote slow-cpuminer low-devnet PoW
+> caveat (remote CPU connects/authorizes/receives work but may not land a diff-1 share — an
+> environment limitation, not Phase 20 logic). Mainnet remains disabled; LWMA-144 untouched.
+
 ## 1. Miner requirements
 - A stock SHA-256d CPU miner (`cpuminer`/`minerd`) — unchanged, no version-rolling needed.
 - The Irium wallet binary with `poawx-register --emit-only` (Phase 19B+).
