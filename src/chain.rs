@@ -856,7 +856,9 @@ impl ChainState {
         if crate::poawx_dominance::anti_domination_enforced(expected_height) {
             self.validate_block_dominance_weights(&block, expected_height)?;
         }
-        if crate::poawx_candidate::candidate_set_enforced(expected_height) {
+        if crate::poawx_candidate::candidate_set_enforced(expected_height)
+            || crate::poawx_admission::candidate_admission_enforced(expected_height)
+        {
             self.validate_block_candidate_sets(&block, expected_height)?;
         }
 
@@ -1102,6 +1104,28 @@ impl ChainState {
                         "phase21d: selected role {} solver is not the best candidate",
                         role_id
                     ));
+                }
+            }
+            // Phase 21E: when admission is enforced, the included set must EQUAL
+            // the node's admitted candidates for this height/seed (missing or
+            // extra candidate => mismatch => reject). Fail closed when a selected
+            // role has no admitted candidate. HONEST: best among candidates
+            // admitted to THIS node in the window, not among unseen offline miners.
+            if crate::poawx_admission::candidate_admission_enforced(height) {
+                let cache = crate::poawx_admission::global_admission_cache();
+                let admitted = cache.admitted_candidate_set(net, height, &block.header.prev_hash);
+                if cs.serialize() != admitted.serialize() {
+                    return Err(
+                        "phase21e: candidate set does not match admitted candidates".to_string()
+                    );
+                }
+                for (role_id, _) in selected {
+                    if admitted.best_for_role(role_id).is_none() {
+                        return Err(format!(
+                            "phase21e: no admitted candidate for role {}",
+                            role_id
+                        ));
+                    }
                 }
             }
         }
@@ -8136,6 +8160,148 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK");
+    }
+
+    #[test]
+    fn phase21e_admission_enforcement() {
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_admission::{
+            candidate_admission_enforced, global_admission_cache, CandidateAdmissionV1,
+        };
+        use crate::poawx_candidate::{CandidateSet, RoleCandidate};
+        use crate::poawx_penalty::PenaltyStatus;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1");
+        std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT");
+        assert!(candidate_admission_enforced(1), "enforced on testnet");
+
+        let net = crate::activation::network_id_byte();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let sk = signing_key(0x41);
+        let base_ext = p20_ext(net, height, &parent_hash, 0, [0u8; 20]);
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+
+        let mk = |role: u8, solver: [u8; 20], tag: u8| {
+            RoleCandidate::build(
+                net,
+                height,
+                &parent_hash,
+                role,
+                solver,
+                [0x02u8; 33],
+                [tag; 32],
+                PenaltyStatus::Clean.id(),
+                1000,
+                [tag.wrapping_add(1); 32],
+            )
+        };
+        let c = mk(ROLE_COMPUTE_CONTRIBUTOR, [0xC1u8; 20], 0x11);
+        let v = mk(ROLE_VERIFY_CONTRIBUTOR, [0xC2u8; 20], 0x12);
+        let s = mk(ROLE_SUPPORT_CONTRIBUTOR, [0xC3u8; 20], 0x13);
+        let cx = mk(ROLE_COMPUTE_CONTRIBUTOR, [0xCEu8; 20], 0x55);
+        let mut cs = CandidateSet::new(net, height, parent_hash);
+        for cand in [c.clone(), v.clone(), s.clone()] {
+            cs.push(cand);
+        }
+        cs.sort_canonical();
+
+        let blk = {
+            let mut ext = base_ext.clone();
+            ext.role_reward.compute_contributor_pkh = [0xC1u8; 20];
+            ext.role_reward.verify_contributor_pkh = [0xC2u8; 20];
+            ext.role_reward.support_contributor_pkh = [0xC3u8; 20];
+            ext.candidate_set = Some(cs.clone());
+            let mut r = receipt.clone();
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+
+        let cache = global_admission_cache();
+        let admit = |cand: &RoleCandidate| {
+            let a = CandidateAdmissionV1::new(net, height, parent_hash, cand.clone());
+            cache.set_tip(height);
+            let _ = cache.ingest_bytes(&a.serialize());
+        };
+        let st = base_chain(None);
+
+        // exact admitted set == ext set => accept.
+        cache.clear();
+        cache.set_tip(height);
+        for cand in [&c, &v, &s] {
+            admit(cand);
+        }
+        assert!(
+            st.validate_block_candidate_sets(&blk, height).is_ok(),
+            "exact admitted set accepts"
+        );
+        // missing admitted candidate (support not admitted) => reject.
+        cache.clear();
+        for cand in [&c, &v] {
+            admit(cand);
+        }
+        assert!(
+            st.validate_block_candidate_sets(&blk, height).is_err(),
+            "missing admitted candidate rejects"
+        );
+        // extra non-admitted candidate (cx admitted but not in ext) => reject.
+        cache.clear();
+        for cand in [&c, &v, &s, &cx] {
+            admit(cand);
+        }
+        assert!(
+            st.validate_block_candidate_sets(&blk, height).is_err(),
+            "extra admitted candidate not in ext rejects"
+        );
+        // no admitted candidates => fail closed.
+        cache.clear();
+        assert!(
+            st.validate_block_candidate_sets(&blk, height).is_err(),
+            "no admitted candidates fails closed"
+        );
+
+        // admission gate OFF => old 21D behavior (cs present + best) accepts.
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED");
+        cache.clear();
+        assert!(
+            !candidate_admission_enforced(height),
+            "admission not enforced when REQUIRED unset"
+        );
+        assert!(
+            st.validate_block_candidate_sets(&blk, height).is_ok(),
+            "gate off: 21D candidate-set behavior unchanged"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!candidate_admission_enforced(height), "mainnet hard-off");
+
+        cache.clear();
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT");
     }
 
     #[test]
