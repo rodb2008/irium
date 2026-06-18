@@ -1,9 +1,20 @@
-# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated enforcement)
+# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement)
 
 **Status: Phase 21A implemented the FOUNDATION primitives (data-only); Phase 21B now wires ticket
 + penalty enforcement into the Phase 20 consensus/pool/wallet path behind explicit testnet/devnet
 gates (mainnet hard-off; old behavior unchanged when gates off).** Public testnet with outside
 miners, independent security audit, and community vote remain **out of scope**.
+
+**Phase 21C (this pass)** makes anti-domination **persistent + reorg-safe + enforced**: a per-(miner,
+window) reward-bucket state in `ChainState` (exact apply/revert, deterministic rebuild-from-chain),
+updated in connect_block / reverted in disconnect_tip_block from Phase 20 reward events (fee +
+delegate never credited; official fee-0 and third-party fee yield identical role amounts); an optional
+trailing `DOM1` ext section (byte-identical when absent) carrying 4 per-role fairness weights that the
+node re-validates against its persisted state when
+`IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT`+`_REQUIRED=1` (mainnet hard-off, fail-closed); pool
+mirror + fairness selection among collected candidates. Global-best-among-unseen-candidate selection
+is **Phase 21D pending** (candidate-set/VRF), not faked. Details:
+`poaw-x-phase21c-anti-domination-enforcement.md`.
 
 ## Phase 21B — gated enforcement (this pass)
 - **Ticket proof binding (`src/poawx_ticket.rs` + `src/poawx.rs`):** a compact, self-verifiable
@@ -119,7 +130,7 @@ unaffected. Chain difficulty remains **LWMA-144 automatic**.
 |---|---|
 | Miner Work Tickets | **PARTIAL** — primitive + sybil-work + validation + tests (data-only; enforcement = 21B) |
 | Stronger Sybil resistance | **PARTIAL** — ticket sybil-work cost primitive (gated, off by default) |
-| Anti-domination / recent reward history | **PARTIAL** — tracker + fairness weight + Phase20-feed test (not yet applied to assignment) |
+| Anti-domination / recent reward history | **21C** — persistent + reorg-safe per-(miner,window) state, connect/disconnect/reorg/restart, gated ext weight binding + node validation, pool selection weighting (global-best candidate optimality = 21D) |
 | Adaptive mining/security modes | **PARTIAL** — deterministic mode/policy state machine (not yet consumed by node) |
 | Penalty / fraud state | **PARTIAL** — status enum + record/escalation/expiry (slashing placeholder only) |
 | Fuller private assignment / VRF eligibility | **PENDING** — only an `assignment_public_key` placeholder field exists |
