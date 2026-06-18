@@ -14210,6 +14210,108 @@ fn verify_delegated_pending_receipt(
         .map_err(|_| "signer sig verification failed".to_string())
 }
 
+// ── Phase 20 Step 6D: loopback-only role-gossip bridge endpoints ─────────────
+// POST: pool submits a role-precommit/reveal gossip envelope; the node validates
+// /dedupes/stores it in the role-gossip cache and (best-effort) rebroadcasts to
+// P2P peers. GET: pool fetches the node-collected payloads for a target height.
+// All four are loopback-only + mainnet-hard-off + disabled unless role gossip is
+// enabled. No consensus effect (Step 6A enforcement stays block-driven).
+
+#[derive(Debug, serde::Deserialize)]
+struct RoleGossipHeightQuery {
+    target_height: u64,
+}
+
+fn role_gossip_bridge_guard(addr: &SocketAddr) -> Result<(), StatusCode> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !irium_node_rs::poawx_gossip::role_gossip_enabled() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+async fn poawx_role_gossip_precommit_post(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, StatusCode> {
+    role_gossip_bridge_guard(&addr)?;
+    let cache = irium_node_rs::poawx_gossip::global_cache();
+    cache.prune(state.status_height_cache.load(Ordering::Relaxed));
+    match cache.ingest_precommit_bytes(body.as_ref()) {
+        irium_node_rs::poawx_gossip::GossipOutcome::AcceptedNew => {
+            if let Some(ref p2p) = state.p2p {
+                p2p.broadcast_role_precommit(body.as_ref()).await;
+            }
+            Ok(Json(json!({"status":"accepted"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Duplicate => {
+            Ok(Json(json!({"status":"duplicate"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Rejected(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn poawx_role_gossip_reveal_post(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, StatusCode> {
+    role_gossip_bridge_guard(&addr)?;
+    let cache = irium_node_rs::poawx_gossip::global_cache();
+    cache.prune(state.status_height_cache.load(Ordering::Relaxed));
+    match cache.ingest_reveal_bytes(body.as_ref()) {
+        irium_node_rs::poawx_gossip::GossipOutcome::AcceptedNew => {
+            if let Some(ref p2p) = state.p2p {
+                p2p.broadcast_role_reveal(body.as_ref()).await;
+            }
+            Ok(Json(json!({"status":"accepted"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Duplicate => {
+            Ok(Json(json!({"status":"duplicate"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Rejected(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn poawx_role_gossip_precommits_get(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Query(q): Query<RoleGossipHeightQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    role_gossip_bridge_guard(&addr)?;
+    let cache = irium_node_rs::poawx_gossip::global_cache();
+    let tip = state.status_height_cache.load(Ordering::Relaxed);
+    cache.set_tip(tip);
+    let window = irium_node_rs::poawx_gossip::role_gossip_window();
+    if q.target_height < tip.saturating_sub(window) || q.target_height > tip.saturating_add(window)
+    {
+        return Ok(Json(json!({ "precommits": [] })));
+    }
+    let v = serde_json::to_value(cache.precommits_for(q.target_height)).unwrap_or(Value::Null);
+    Ok(Json(json!({ "precommits": v })))
+}
+
+async fn poawx_role_gossip_reveals_get(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Query(q): Query<RoleGossipHeightQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    role_gossip_bridge_guard(&addr)?;
+    let cache = irium_node_rs::poawx_gossip::global_cache();
+    let tip = state.status_height_cache.load(Ordering::Relaxed);
+    cache.set_tip(tip);
+    let window = irium_node_rs::poawx_gossip::role_gossip_window();
+    if q.target_height < tip.saturating_sub(window) || q.target_height > tip.saturating_add(window)
+    {
+        return Ok(Json(json!({ "reveals": [] })));
+    }
+    let v = serde_json::to_value(cache.reveals_for(q.target_height)).unwrap_or(Value::Null);
+    Ok(Json(json!({ "reveals": v })))
+}
+
 async fn poawx_get_assignment(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -18770,6 +18872,24 @@ async fn main() {
         .route("/rpc/submit_block_extended", post(submit_block_extended))
         .route("/poawx/assignment", get(poawx_get_assignment))
         .route("/poawx/receipt", post(poawx_post_receipt))
+        // Phase 20 Step 6D: loopback-only role-gossip bridge (testnet/devnet,
+        // mainnet-hard-off, disabled unless role gossip enabled).
+        .route(
+            "/poawx/role-gossip/precommit",
+            post(poawx_role_gossip_precommit_post),
+        )
+        .route(
+            "/poawx/role-gossip/reveal",
+            post(poawx_role_gossip_reveal_post),
+        )
+        .route(
+            "/poawx/role-gossip/precommits",
+            get(poawx_role_gossip_precommits_get),
+        )
+        .route(
+            "/poawx/role-gossip/reveals",
+            get(poawx_role_gossip_reveals_get),
+        )
         .route("/rpc/submit_tx", post(submit_tx))
         // Fix D: pending-tx introspection + per-address pending-spent
         // outpoints. Both are public (rate-limited only) so the wallet's
