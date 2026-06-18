@@ -2329,6 +2329,8 @@ fn usage() {
     eprintln!("  irium-wallet poawx-ticket-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --epoch <N> --expiry-height <N> [--assignment-pubkey <66hex>] [--sybil-nonce <64hex>] [--penalty-status <0..4>]");
     eprintln!("  irium-wallet poawx-assignment-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--assignment-pubkey <66hex>]  (VRF-style placeholder; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-candidate-admission --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--role-claim-digest <64hex>] [--penalty-status <0..4>] [--dominance-weight <N>] [--assignment-pubkey <66hex>]  (emits wire_hex to POST to /poawx/candidate-admission; testnet/devnet only; no private key)");
+    eprintln!("  irium-wallet poawx-puzzle-challenge --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> [--ticket-digest <64hex>] [--assignment-proof-digest <64hex>] [--candidate-digest <64hex>] [--seed <64hex>]  (assigned-work puzzle, NOT chain PoW; testnet/devnet only; no private key)");
+    eprintln!("  irium-wallet poawx-puzzle-solve <same flags as poawx-puzzle-challenge>  (emits solution wire_hex; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3776,6 +3778,161 @@ fn cmd_poawx_role_emit(args: &[String], reveal: bool) -> Result<(), String> {
 
 /// Phase 21B: emit a PoAW-X miner work-ticket PROOF bound to a role + height
 /// (testnet/devnet only; mainnet hard-off). Prints JSON only — no private key.
+/// Phase 21F: parse the shared puzzle-challenge inputs (testable). No private key.
+/// Mainnet hard-off (network_id 0).
+fn parse_puzzle_challenge(
+    args: &[String],
+) -> Result<irium_node_rs::poawx_puzzle::PuzzleChallengeV1, String> {
+    use irium_node_rs::poawx_puzzle::{default_profile, PuzzleChallengeV1};
+    let mut network_id: Option<u8> = None;
+    let mut target_height: Option<u64> = None;
+    let mut role: Option<u8> = None;
+    let mut solver: Option<[u8; 20]> = None;
+    let mut ticket_digest = [0u8; 32];
+    let mut assignment_proof_digest = [0u8; 32];
+    let mut candidate_digest = [0u8; 32];
+    let mut seed = [0u8; 32];
+    let hex_into = |s: &str, out: &mut [u8]| -> Result<(), String> {
+        let b = hex::decode(s.trim()).map_err(|_| "invalid hex".to_string())?;
+        if b.len() != out.len() {
+            return Err(format!("expected {} bytes", out.len()));
+        }
+        out.copy_from_slice(&b);
+        Ok(())
+    };
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--network-id" => {
+                network_id = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --network-id".to_string())?,
+                )
+            }
+            "--target-height" => {
+                target_height = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --target-height".to_string())?,
+                )
+            }
+            "--role" => {
+                let r = next_flag_value(args, &mut i)?;
+                role = Some(match r.to_ascii_lowercase().as_str() {
+                    "compute" | "1" => irium_node_rs::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+                    "verify" | "2" => irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR,
+                    "support" | "3" => irium_node_rs::poawx::ROLE_SUPPORT_CONTRIBUTOR,
+                    other => return Err(format!("invalid --role {other}")),
+                });
+            }
+            "--solver" => solver = Some(resolve_fee_pkh_arg(&next_flag_value(args, &mut i)?)?),
+            "--ticket-digest" => hex_into(&next_flag_value(args, &mut i)?, &mut ticket_digest)?,
+            "--assignment-proof-digest" => hex_into(
+                &next_flag_value(args, &mut i)?,
+                &mut assignment_proof_digest,
+            )?,
+            "--candidate-digest" => {
+                hex_into(&next_flag_value(args, &mut i)?, &mut candidate_digest)?
+            }
+            "--seed" | "--prev-hash" => hex_into(&next_flag_value(args, &mut i)?, &mut seed)?,
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    let network_id = network_id.ok_or("--network-id required")?;
+    if network_id == 0 {
+        return Err("puzzle work is mainnet-hard-off (network_id 0)".to_string());
+    }
+    let target_height = target_height.ok_or("--target-height required")?;
+    let role = role.ok_or("--role required")?;
+    let solver = solver.ok_or("--solver <addr|40hex> required")?;
+    Ok(PuzzleChallengeV1::build(
+        network_id,
+        target_height,
+        role,
+        solver,
+        ticket_digest,
+        assignment_proof_digest,
+        candidate_digest,
+        seed,
+        default_profile(),
+    ))
+}
+
+fn puzzle_mode_name(m: irium_node_rs::poawx_puzzle::PuzzleMode) -> &'static str {
+    use irium_node_rs::poawx_puzzle::PuzzleMode::*;
+    match m {
+        Sha256dAnchor => "sha256d_anchor",
+        RandomMemory => "random_memory",
+        ParallelCompute => "parallel_compute",
+        VerificationWork => "verification_work",
+        FinalityWorkPlaceholder => "finality_work_placeholder",
+    }
+}
+
+fn puzzle_challenge_json(args: &[String]) -> Result<serde_json::Value, String> {
+    let c = parse_puzzle_challenge(args)?;
+    Ok(serde_json::json!({
+        "challenge": {
+            "network_id": c.network_id,
+            "target_height": c.target_height,
+            "role_id": c.role_id,
+            "solver_pkh": hex::encode(c.solver_pkh),
+            "ticket_digest": hex::encode(c.ticket_digest),
+            "assignment_proof_digest": hex::encode(c.assignment_proof_digest),
+            "candidate_digest": hex::encode(c.candidate_digest),
+            "seed": hex::encode(c.seed),
+            "mode": c.mode.id(),
+            "mode_name": puzzle_mode_name(c.mode),
+            "profile": {
+                "anchor_bits": c.profile.anchor_bits,
+                "mem_words": c.profile.mem_words,
+                "lanes": c.profile.lanes,
+                "iterations": c.profile.iterations,
+            },
+        },
+        "challenge_digest": hex::encode(c.challenge_digest),
+        "note": "assigned-work puzzle (NOT chain PoW); testnet/devnet only; no signing key needed",
+    }))
+}
+
+fn puzzle_solve_json(args: &[String]) -> Result<serde_json::Value, String> {
+    use irium_node_rs::poawx_puzzle::{solve_dev, verify_solution};
+    let c = parse_puzzle_challenge(args)?;
+    let sol = solve_dev(&c).ok_or("no solution found within bounded grind".to_string())?;
+    let valid = verify_solution(&c, &sol).is_valid();
+    Ok(serde_json::json!({
+        "mode": sol.mode,
+        "mode_name": puzzle_mode_name(c.mode),
+        "nonce": sol.nonce,
+        "proof_digest": hex::encode(sol.proof_digest),
+        "wire_hex": hex::encode(sol.serialize()),
+        "challenge_digest": hex::encode(c.challenge_digest),
+        "valid": valid,
+        "note": "assigned-work solution (NOT chain PoW); testnet/devnet only; no signing key needed",
+    }))
+}
+
+fn cmd_poawx_puzzle_challenge(args: &[String]) -> Result<(), String> {
+    let v = puzzle_challenge_json(args)?;
+    println!(
+        "{}",
+        serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?
+    );
+    eprintln!("[puzzle-challenge] assigned-work puzzle (NOT chain PoW); testnet/devnet only; no private key.");
+    Ok(())
+}
+
+fn cmd_poawx_puzzle_solve(args: &[String]) -> Result<(), String> {
+    let v = puzzle_solve_json(args)?;
+    println!(
+        "{}",
+        serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?
+    );
+    eprintln!("[puzzle-solve] assigned-work solution (NOT chain PoW); testnet/devnet only; no private key.");
+    Ok(())
+}
+
 /// Phase 21E: build the candidate-admission JSON (+ wire hex). Pure + testable;
 /// no private key, no seed phrase. Mainnet hard-off (network_id 0).
 fn candidate_admission_json(args: &[String]) -> Result<serde_json::Value, String> {
@@ -15752,6 +15909,62 @@ mod tests {
         o
     }
 
+    fn puz_args(v: &[&str]) -> Vec<String> {
+        let mut o = vec!["poawx-puzzle-solve".to_string()];
+        o.extend(v.iter().map(|s| s.to_string()));
+        o
+    }
+
+    #[test]
+    fn phase21f_puzzle_challenge_and_solve_no_secret_mainnet_off() {
+        std::env::set_var("IRIUM_POAWX_PUZZLE_BITS", "4");
+        let sv = "aa".repeat(20);
+        let sd = "22".repeat(32);
+        let base = [
+            "--network-id",
+            "1",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            sv.as_str(),
+            "--seed",
+            sd.as_str(),
+        ];
+        // challenge JSON.
+        let ch = puzzle_challenge_json(&puz_args(&base)).expect("challenge");
+        let cs = serde_json::to_string(&ch).unwrap();
+        assert!(cs.contains("challenge_digest"));
+        assert!(cs.contains("mode_name"));
+        // solve JSON: valid + compact wire.
+        let so = puzzle_solve_json(&puz_args(&base)).expect("solve");
+        let ss = serde_json::to_string(&so).unwrap();
+        assert_eq!(so["valid"], serde_json::json!(true));
+        assert!(ss.contains("wire_hex"));
+        // no key material.
+        for s in [&cs, &ss] {
+            assert!(!s.to_lowercase().contains("private"));
+            assert!(!s.to_lowercase().contains("mnemonic"));
+            assert!(!s.to_lowercase().contains("secret"));
+        }
+        // mainnet hard-off.
+        let m = puz_args(&[
+            "--network-id",
+            "0",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            sv.as_str(),
+            "--seed",
+            sd.as_str(),
+        ]);
+        assert!(puzzle_solve_json(&m).is_err(), "mainnet hard-off");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_BITS");
+    }
+
     #[test]
     fn phase21e_candidate_admission_emit_json_no_secret_mainnet_off() {
         let td = "11".repeat(32);
@@ -26301,6 +26514,18 @@ fn main() {
         }
         "poawx-candidate-admission" => {
             if let Err(e) = cmd_poawx_candidate_admission_emit(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        "poawx-puzzle-challenge" => {
+            if let Err(e) = cmd_poawx_puzzle_challenge(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        "poawx-puzzle-solve" => {
+            if let Err(e) = cmd_poawx_puzzle_solve(&args) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
