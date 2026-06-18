@@ -325,6 +325,17 @@ impl NodeCandidateAdmissionCache {
         cs
     }
 
+    /// All admissions for a target height (any seed), for RPC export.
+    pub fn admissions_for_height(&self, target_height: u64) -> Vec<CandidateAdmissionV1> {
+        self.admissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|((h, _, _), _)| *h == target_height)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+
     pub fn admission_count(&self, target_height: u64) -> usize {
         self.admissions
             .lock()

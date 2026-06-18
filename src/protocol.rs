@@ -97,6 +97,11 @@ pub enum MessageType {
     /// receiver can reconstruct the commitment and validate the claim). Same
     /// drop-safe forward-compat rules as `PoawxRolePrecommit`.
     PoawxRoleReveal = 27,
+    /// Gossip: PoAW-X candidate admission (Phase 21E). Payload: canonical
+    /// `CandidateAdmissionV1` wire bytes (opaque here; the node admission cache
+    /// validates + stores). Same drop-safe forward-compat rules as the role
+    /// gossip types; mainnet/older peers drop it via the receive-side catch-all.
+    PoawxCandidateAdmission = 28,
     Disconnect = 99,
 }
 
@@ -134,6 +139,7 @@ impl TryFrom<u8> for MessageType {
             25 => OfferBroadcast,
             26 => PoawxRolePrecommit,
             27 => PoawxRoleReveal,
+            28 => PoawxCandidateAdmission,
             99 => Disconnect,
             other => return Err(format!("Unknown message type: {}", other)),
         };
@@ -882,9 +888,53 @@ impl PoawxRoleRevealPayload {
     }
 }
 
+/// Wire payload for `MessageType::PoawxCandidateAdmission` (Phase 21E). Opaque
+/// bytes here (same pattern as the role-gossip payloads); the node candidate
+/// admission cache owns validation + storage + the rebroadcast decision.
+pub struct PoawxCandidateAdmissionPayload {
+    pub admission_bytes: Vec<u8>,
+}
+
+impl PoawxCandidateAdmissionPayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::PoawxCandidateAdmission,
+            payload: self.admission_bytes.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::PoawxCandidateAdmission {
+            return Err("Not a poawx candidate admission".to_string());
+        }
+        Ok(PoawxCandidateAdmissionPayload {
+            admission_bytes: msg.payload.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_type_try_from_candidate_admission_28() {
+        assert_eq!(
+            MessageType::try_from(28u8).unwrap(),
+            MessageType::PoawxCandidateAdmission
+        );
+        let m = PoawxCandidateAdmissionPayload {
+            admission_bytes: vec![1, 2, 3],
+        }
+        .to_message();
+        assert_eq!(m.msg_type, MessageType::PoawxCandidateAdmission);
+        assert_eq!(
+            PoawxCandidateAdmissionPayload::from_message(&m)
+                .unwrap()
+                .admission_bytes,
+            vec![1, 2, 3]
+        );
+    }
 
     #[test]
     fn message_type_try_from_offer_broadcast_25() {

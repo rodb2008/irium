@@ -4079,6 +4079,17 @@ impl P2PNode {
         let _ = broadcast_raw(&self.peers, &serialized).await;
     }
 
+    /// Phase 21E: broadcast a PoAW-X candidate-admission (canonical wire bytes)
+    /// to all peers (best-effort flood; receivers validate/dedupe before
+    /// re-broadcast). Testnet/devnet only; mainnet hard-off via the gate.
+    pub async fn broadcast_candidate_admission(&self, admission_bytes: &[u8]) {
+        let payload = crate::protocol::PoawxCandidateAdmissionPayload {
+            admission_bytes: admission_bytes.to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
     /// Phase 1A+1B: drain accumulated incoming offer JSON strings. Called
     /// by iriumd offer-watcher, which writes each JSON to
     /// ~/.irium/offers/<id>.json so /offers/feed serves it locally.
@@ -6459,6 +6470,25 @@ impl P2PNode {
                             }
                         }
                     }
+                    MessageType::PoawxCandidateAdmission => {
+                        if crate::poawx_admission::candidate_admission_gossip_enabled() {
+                            if let Ok(p) =
+                                crate::protocol::PoawxCandidateAdmissionPayload::from_message(&msg)
+                            {
+                                if crate::poawx_admission::global_admission_cache()
+                                    .ingest_bytes(&p.admission_bytes)
+                                    .should_rebroadcast()
+                                {
+                                    let bytes = crate::protocol::PoawxCandidateAdmissionPayload {
+                                        admission_bytes: p.admission_bytes,
+                                    }
+                                    .to_message()
+                                    .serialize();
+                                    let _ = broadcast_raw(&peers_vec, &bytes).await;
+                                }
+                            }
+                        }
+                    }
                     MessageType::DisputeRaisedNotification => {
                         if let Ok(p) =
                             crate::protocol::DisputeRaisedNotificationPayload::from_message(&msg)
@@ -8787,6 +8817,25 @@ async fn handle_incoming_with_sybil(
                         {
                             let bytes = crate::protocol::PoawxRoleRevealPayload {
                                 gossip_json: p.gossip_json,
+                            }
+                            .to_message()
+                            .serialize();
+                            let _ = broadcast_raw(&peers, &bytes).await;
+                        }
+                    }
+                }
+            }
+            MessageType::PoawxCandidateAdmission => {
+                if crate::poawx_admission::candidate_admission_gossip_enabled() {
+                    if let Ok(p) =
+                        crate::protocol::PoawxCandidateAdmissionPayload::from_message(&msg)
+                    {
+                        if crate::poawx_admission::global_admission_cache()
+                            .ingest_bytes(&p.admission_bytes)
+                            .should_rebroadcast()
+                        {
+                            let bytes = crate::protocol::PoawxCandidateAdmissionPayload {
+                                admission_bytes: p.admission_bytes,
                             }
                             .to_message()
                             .serialize();

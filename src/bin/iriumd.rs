@@ -14232,6 +14232,18 @@ fn role_gossip_bridge_guard(addr: &SocketAddr) -> Result<(), StatusCode> {
     Ok(())
 }
 
+/// Phase 21E: loopback-only guard for the candidate-admission bridge
+/// (testnet/devnet, mainnet hard-off, disabled unless the admission gate is set).
+fn candidate_admission_bridge_guard(addr: &SocketAddr) -> Result<(), StatusCode> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !irium_node_rs::poawx_admission::candidate_admission_gossip_enabled() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
 async fn poawx_role_gossip_precommit_post(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -14310,6 +14322,54 @@ async fn poawx_role_gossip_reveals_get(
     }
     let v = serde_json::to_value(cache.reveals_for(q.target_height)).unwrap_or(Value::Null);
     Ok(Json(json!({ "reveals": v })))
+}
+
+/// Phase 21E: loopback-only POST a candidate admission (canonical wire bytes);
+/// validate+store in the node cache and rebroadcast if newly accepted.
+async fn poawx_candidate_admission_post(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, StatusCode> {
+    candidate_admission_bridge_guard(&addr)?;
+    let cache = irium_node_rs::poawx_admission::global_admission_cache();
+    cache.prune(state.status_height_cache.load(Ordering::Relaxed));
+    match cache.ingest_bytes(body.as_ref()) {
+        irium_node_rs::poawx_gossip::GossipOutcome::AcceptedNew => {
+            if let Some(ref p2p) = state.p2p {
+                p2p.broadcast_candidate_admission(body.as_ref()).await;
+            }
+            Ok(Json(json!({"status":"accepted"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Duplicate => {
+            Ok(Json(json!({"status":"duplicate"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Rejected(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+/// Phase 21E: loopback-only GET admitted candidate admissions for a height
+/// (hex-encoded canonical wire bytes). The pool filters by seed locally.
+async fn poawx_candidate_admissions_get(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Query(q): Query<RoleGossipHeightQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    candidate_admission_bridge_guard(&addr)?;
+    let cache = irium_node_rs::poawx_admission::global_admission_cache();
+    let tip = state.status_height_cache.load(Ordering::Relaxed);
+    cache.set_tip(tip);
+    let window = irium_node_rs::poawx_admission::candidate_admission_window();
+    if q.target_height < tip.saturating_sub(window) || q.target_height > tip.saturating_add(window)
+    {
+        return Ok(Json(json!({ "admissions": [] })));
+    }
+    let hexes: Vec<String> = cache
+        .admissions_for_height(q.target_height)
+        .iter()
+        .map(|a| hex::encode(a.serialize()))
+        .collect();
+    Ok(Json(json!({ "admissions": hexes })))
 }
 
 async fn poawx_get_assignment(
@@ -18889,6 +18949,16 @@ async fn main() {
         .route(
             "/poawx/role-gossip/reveals",
             get(poawx_role_gossip_reveals_get),
+        )
+        // Phase 21E: loopback-only candidate-admission bridge (testnet/devnet,
+        // mainnet hard-off, disabled unless the admission gate is configured).
+        .route(
+            "/poawx/candidate-admission",
+            post(poawx_candidate_admission_post),
+        )
+        .route(
+            "/poawx/candidate-admissions",
+            get(poawx_candidate_admissions_get),
         )
         .route("/rpc/submit_tx", post(submit_tx))
         // Fix D: pending-tx introspection + per-address pending-spent
