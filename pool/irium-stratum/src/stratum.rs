@@ -1603,6 +1603,7 @@ fn is_small_buffer_firmware(user_agent: &str) -> bool {
         || ua.contains("bitaxe")
         || ua.contains("esp-miner")
         || ua.contains("bm1370")
+        || ua.contains("nmaxegamma")
 }
 
 fn is_whatsminer_firmware(user_agent: &str) -> bool {
