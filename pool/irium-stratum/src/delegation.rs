@@ -1231,6 +1231,9 @@ pub struct Phase20ReceiptExtMirror {
     /// Phase 21D: optional candidate set (trailing CND1 section; None =>
     /// byte-identical to pre-21D).
     pub candidate_set: Option<CandidateSetMirror>,
+    /// Phase 21F: optional per-role puzzle solutions (trailing PZL1 section;
+    /// None => byte-identical to pre-21F).
+    pub role_puzzle_proofs: Option<[PuzzleSolutionMirror; 3]>,
 }
 
 impl Phase20ReceiptExtMirror {
@@ -1260,6 +1263,7 @@ impl Phase20ReceiptExtMirror {
                 if self.role_ticket_proofs.is_some()
                     || self.role_dominance_weights.is_some()
                     || self.candidate_set.is_some()
+                    || self.role_puzzle_proofs.is_some()
                 {
                     out.push(0);
                 }
@@ -1284,6 +1288,12 @@ impl Phase20ReceiptExtMirror {
             out.extend_from_slice(CANDIDATE_SECTION_MAGIC);
             out.extend_from_slice(&(body.len() as u32).to_le_bytes());
             out.extend_from_slice(&body);
+        }
+        if let Some(sols) = &self.role_puzzle_proofs {
+            out.extend_from_slice(PUZZLE_SECTION_MAGIC);
+            for sol in sols.iter() {
+                out.extend_from_slice(&sol.serialize());
+            }
         }
         out
     }
@@ -1966,6 +1976,326 @@ pub async fn refresh_pool_admitted_cache(rpc_base: &str, rpc_token: &str, height
     cache.retain(|h, _| *h >= keep_floor);
 }
 
+/// ── Phase 21F: assigned puzzle work modes (pool mirror) ─────────────────────
+/// Byte-identical mirror of node `poawx_puzzle` so the pool can SOLVE the assigned
+/// puzzle for each selected candidate and attach a node-verifiable solution.
+/// Assigned-work proofs only; NOT chain PoW. The node re-verifies everything.
+pub const PUZZLE_SECTION_MAGIC: &[u8; 4] = b"PZL1";
+pub const PUZZLE_SOLUTION_WIRE: usize = 1 + 8 + 32;
+const PZ_MODE_DOMAIN: &[u8] = b"IRIUM_POAWX_PUZZLE_MODE_V1";
+const PZ_CHALLENGE_DOMAIN: &[u8] = b"IRIUM_POAWX_PUZZLE_CHALLENGE_V1";
+const PZ_ANCHOR_DOMAIN: &[u8] = b"IRIUM_POAWX_PUZZLE_ANCHOR_V1";
+const PZ_MEM_DOMAIN: &[u8] = b"IRIUM_POAWX_PUZZLE_MEM_V1";
+const PZ_PAR_DOMAIN: &[u8] = b"IRIUM_POAWX_PUZZLE_PAR_V1";
+const PZ_VERIFY_DOMAIN: &[u8] = b"IRIUM_POAWX_PUZZLE_VERIFY_V1";
+const PZ_FINALITY_DOMAIN: &[u8] = b"IRIUM_POAWX_PUZZLE_FINALITY_V1";
+const PZ_MAX_MEM_WORDS: u32 = 4096;
+const PZ_MAX_LANES: u8 = 16;
+const PZ_MAX_ITER: u32 = 4096;
+const PZ_MAX_BITS: u8 = 24;
+const PZ_SOLVE_CAP: u64 = 1 << 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PuzzleProfileMirror {
+    pub anchor_bits: u8,
+    pub mem_words: u32,
+    pub lanes: u8,
+    pub iterations: u32,
+}
+impl PuzzleProfileMirror {
+    fn clamped(self) -> Self {
+        Self {
+            anchor_bits: self.anchor_bits.min(PZ_MAX_BITS),
+            mem_words: self.mem_words.clamp(1, PZ_MAX_MEM_WORDS),
+            lanes: self.lanes.clamp(1, PZ_MAX_LANES),
+            iterations: self.iterations.min(PZ_MAX_ITER),
+        }
+    }
+    fn serialize(&self) -> [u8; 10] {
+        let c = self.clamped();
+        let mut o = [0u8; 10];
+        o[0] = c.anchor_bits;
+        o[1..5].copy_from_slice(&c.mem_words.to_le_bytes());
+        o[5] = c.lanes;
+        o[6..10].copy_from_slice(&c.iterations.to_le_bytes());
+        o
+    }
+}
+pub fn puzzle_default_profile() -> PuzzleProfileMirror {
+    let mut p = PuzzleProfileMirror {
+        anchor_bits: 8,
+        mem_words: 64,
+        lanes: 4,
+        iterations: 16,
+    };
+    if let Some(b) = env::var("IRIUM_POAWX_PUZZLE_BITS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+    {
+        p.anchor_bits = b;
+    }
+    p.clamped()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PuzzleSolutionMirror {
+    pub mode: u8,
+    pub nonce: u64,
+    pub proof_digest: [u8; 32],
+}
+impl PuzzleSolutionMirror {
+    pub fn serialize(&self) -> [u8; PUZZLE_SOLUTION_WIRE] {
+        let mut o = [0u8; PUZZLE_SOLUTION_WIRE];
+        o[0] = self.mode;
+        o[1..9].copy_from_slice(&self.nonce.to_le_bytes());
+        o[9..41].copy_from_slice(&self.proof_digest);
+        o
+    }
+}
+
+fn pz_leading_zero_bits(d: &[u8; 32]) -> u32 {
+    let mut n = 0u32;
+    for b in d {
+        if *b == 0 {
+            n += 8;
+        } else {
+            n += b.leading_zeros();
+            break;
+        }
+    }
+    n
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pz_assign_mode(
+    net: u8,
+    h: u64,
+    role: u8,
+    solver: &[u8; 20],
+    ticket: &[u8; 32],
+    apd: &[u8; 32],
+    seed: &[u8; 32],
+) -> u8 {
+    let mut hsh = Sha256::new();
+    hsh.update(PZ_MODE_DOMAIN);
+    hsh.update([net]);
+    hsh.update(h.to_le_bytes());
+    hsh.update([role]);
+    hsh.update(solver);
+    hsh.update(ticket);
+    hsh.update(apd);
+    hsh.update(seed);
+    let d: [u8; 32] = hsh.finalize().into();
+    d[0] % 5
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pz_challenge_digest(
+    net: u8,
+    h: u64,
+    role: u8,
+    solver: &[u8; 20],
+    ticket: &[u8; 32],
+    apd: &[u8; 32],
+    cand: &[u8; 32],
+    seed: &[u8; 32],
+    mode: u8,
+    profile: &PuzzleProfileMirror,
+) -> [u8; 32] {
+    let mut hsh = Sha256::new();
+    hsh.update(PZ_CHALLENGE_DOMAIN);
+    hsh.update([net]);
+    hsh.update(h.to_le_bytes());
+    hsh.update([role]);
+    hsh.update(solver);
+    hsh.update(ticket);
+    hsh.update(apd);
+    hsh.update(cand);
+    hsh.update(seed);
+    hsh.update([mode]);
+    hsh.update(profile.serialize());
+    hsh.finalize().into()
+}
+
+fn pz_sha256d(parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p);
+    }
+    let a: [u8; 32] = h.finalize().into();
+    let mut h2 = Sha256::new();
+    h2.update(a);
+    h2.finalize().into()
+}
+fn pz_anchor(cd: &[u8; 32], nonce: u64) -> [u8; 32] {
+    pz_sha256d(&[PZ_ANCHOR_DOMAIN, cd, &nonce.to_le_bytes()])
+}
+fn pz_memory(cd: &[u8; 32], nonce: u64, p: &PuzzleProfileMirror) -> [u8; 32] {
+    let p = p.clamped();
+    let n = p.mem_words as usize;
+    let mut scratch = vec![0u64; n];
+    let mut s8 = [0u8; 8];
+    s8.copy_from_slice(&cd[0..8]);
+    let mut acc = u64::from_le_bytes(s8) ^ nonce;
+    for (i, slot) in scratch.iter_mut().enumerate() {
+        acc = acc
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407 ^ (i as u64));
+        *slot = acc;
+    }
+    for _ in 0..(p.iterations as usize) {
+        let idx = (acc as usize) % n;
+        acc = acc.rotate_left(13) ^ scratch[idx].wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        scratch[idx] = acc;
+    }
+    let mut h = Sha256::new();
+    h.update(PZ_MEM_DOMAIN);
+    h.update(cd);
+    h.update(nonce.to_le_bytes());
+    h.update(acc.to_le_bytes());
+    h.finalize().into()
+}
+fn pz_parallel(cd: &[u8; 32], nonce: u64, p: &PuzzleProfileMirror) -> [u8; 32] {
+    let p = p.clamped();
+    let mut h = Sha256::new();
+    h.update(PZ_PAR_DOMAIN);
+    h.update(cd);
+    h.update(nonce.to_le_bytes());
+    for lane in 0..p.lanes {
+        let mut lh = Sha256::new();
+        lh.update(cd);
+        lh.update(nonce.to_le_bytes());
+        lh.update([lane]);
+        let d: [u8; 32] = lh.finalize().into();
+        h.update(d);
+    }
+    h.finalize().into()
+}
+fn pz_verify_digest(cd: &[u8; 32], cand: &[u8; 32], apd: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(PZ_VERIFY_DOMAIN);
+    h.update(cd);
+    h.update(cand);
+    h.update(apd);
+    h.finalize().into()
+}
+fn pz_finality_digest(cd: &[u8; 32], seed: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(PZ_FINALITY_DOMAIN);
+    h.update(cd);
+    h.update(seed);
+    h.finalize().into()
+}
+
+/// Solve the assigned puzzle for one candidate (mirror of node solve_dev).
+fn pz_solve_for_candidate(
+    net: u8,
+    h: u64,
+    role: u8,
+    cand: &RoleCandidateMirror,
+    seed: &[u8; 32],
+    profile: &PuzzleProfileMirror,
+) -> Option<PuzzleSolutionMirror> {
+    let candidate_digest: [u8; 32] = {
+        let mut hh = Sha256::new();
+        hh.update(cand.serialize());
+        hh.finalize().into()
+    };
+    let mode = pz_assign_mode(
+        net,
+        h,
+        role,
+        &cand.solver_pkh,
+        &cand.ticket_digest,
+        &cand.assignment_proof_digest,
+        seed,
+    );
+    let cd = pz_challenge_digest(
+        net,
+        h,
+        role,
+        &cand.solver_pkh,
+        &cand.ticket_digest,
+        &cand.assignment_proof_digest,
+        &candidate_digest,
+        seed,
+        mode,
+        profile,
+    );
+    match mode {
+        3 => Some(PuzzleSolutionMirror {
+            mode,
+            nonce: 0,
+            proof_digest: pz_verify_digest(&cd, &candidate_digest, &cand.assignment_proof_digest),
+        }),
+        4 => Some(PuzzleSolutionMirror {
+            mode,
+            nonce: 0,
+            proof_digest: pz_finality_digest(&cd, seed),
+        }),
+        _ => {
+            let bits = profile.anchor_bits as u32;
+            for nonce in 0..PZ_SOLVE_CAP {
+                let out = match mode {
+                    0 => pz_anchor(&cd, nonce),
+                    1 => pz_memory(&cd, nonce, profile),
+                    _ => pz_parallel(&cd, nonce, profile),
+                };
+                if pz_leading_zero_bits(&out) >= bits {
+                    return Some(PuzzleSolutionMirror {
+                        mode,
+                        nonce,
+                        proof_digest: out,
+                    });
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Pool puzzle-work enforcement gate (mirror node `puzzle_work_enforced`).
+pub fn pool_puzzle_work_enforced(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false;
+    }
+    let active = match env::var("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    };
+    let required = env::var("IRIUM_POAWX_PUZZLE_WORK_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    active && required
+}
+
+/// Build the 3 per-role puzzle solutions from the (selected) candidate set. None
+/// if any role lacks a candidate or cannot be solved (caller fails closed).
+pub fn build_pool_puzzle_proofs(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    cs: &CandidateSetMirror,
+) -> Option<[PuzzleSolutionMirror; 3]> {
+    let profile = puzzle_default_profile();
+    let roles = [
+        ROLE_COMPUTE_CONTRIBUTOR,
+        ROLE_VERIFY_CONTRIBUTOR,
+        ROLE_SUPPORT_CONTRIBUTOR,
+    ];
+    let mut out: Vec<PuzzleSolutionMirror> = Vec::with_capacity(3);
+    for role in roles {
+        let cand = cs.best_for_role(role)?;
+        out.push(pz_solve_for_candidate(
+            network_id, height, role, cand, prev_hash, &profile,
+        )?);
+    }
+    Some([out[0], out[1], out[2]])
+}
+
 pub fn build_synthetic_phase20_ext(
     network_id: u8,
     height: u64,
@@ -2069,6 +2399,19 @@ pub fn build_synthetic_phase20_ext(
     } else {
         None
     };
+    // Phase 21F: solve + attach per-role puzzle proofs when enforced; fail
+    // closed (no ext) if the candidate set/solution is unavailable.
+    let role_puzzle_proofs = if pool_puzzle_work_enforced(height) {
+        match candidate_set
+            .as_ref()
+            .and_then(|cs| build_pool_puzzle_proofs(network_id, height, prev_hash, cs))
+        {
+            Some(p) => Some(p),
+            None => return None,
+        }
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim,
@@ -2080,6 +2423,7 @@ pub fn build_synthetic_phase20_ext(
         role_ticket_proofs,
         role_dominance_weights,
         candidate_set,
+        role_puzzle_proofs,
     })
 }
 
@@ -2493,6 +2837,19 @@ pub fn build_collected_phase20_ext(
     } else {
         None
     };
+    // Phase 21F: solve + attach per-role puzzle proofs when enforced; fail
+    // closed (no ext) if the candidate set/solution is unavailable.
+    let role_puzzle_proofs = if pool_puzzle_work_enforced(height) {
+        match candidate_set
+            .as_ref()
+            .and_then(|cs| build_pool_puzzle_proofs(network_id, height, prev_hash, cs))
+        {
+            Some(p) => Some(p),
+            None => return None,
+        }
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim: reveals[0].claim.clone(),
@@ -2504,6 +2861,7 @@ pub fn build_collected_phase20_ext(
         role_ticket_proofs,
         role_dominance_weights,
         candidate_set,
+        role_puzzle_proofs,
     })
 }
 
@@ -4116,6 +4474,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
             role_reward: node_rr,
@@ -4128,6 +4487,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         assert_eq!(
             ext.serialize(),
@@ -4141,6 +4501,108 @@ mod tests {
         // RoleReward pkhs extractable from the hex without full deserialize.
         let (c, v, s) = role_reward_pkhs_from_ext_hex(&hex::encode(ext.serialize())).unwrap();
         assert_eq!((c, v, s), ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]));
+    }
+
+    #[test]
+    fn phase21f_pool_puzzle_proofs_parity_and_failclosed() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_BITS", "4");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        let net = network_id_from_env();
+        assert!(pool_puzzle_work_enforced(1), "enforced on testnet");
+
+        let h = 5u64;
+        let seed = [0x44u8; 32];
+        let rr = RoleRewardMirror {
+            compute_contributor_pkh: [0xC1u8; 20],
+            verify_contributor_pkh: [0xC2u8; 20],
+            support_contributor_pkh: [0xC3u8; 20],
+        };
+        let cs = build_pool_candidate_set(net, h, &seed, &rr);
+        let proofs = build_pool_puzzle_proofs(net, h, &seed, &cs).expect("proofs");
+
+        // each pool-solved puzzle verifies against the node lib (parity).
+        for (i, role) in [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let cand = cs.best_for_role(*role).unwrap();
+            let ncand = irium_node_rs::poawx_candidate::RoleCandidate::build(
+                net,
+                h,
+                &seed,
+                *role,
+                cand.solver_pkh,
+                cand.assignment_public_key,
+                cand.ticket_digest,
+                cand.penalty_status,
+                cand.dominance_weight,
+                cand.role_claim_digest,
+            );
+            let cdg: [u8; 32] = {
+                let mut hh = Sha256::new();
+                hh.update(ncand.serialize());
+                hh.finalize().into()
+            };
+            let nch = irium_node_rs::poawx_puzzle::PuzzleChallengeV1::build(
+                net,
+                h,
+                *role,
+                cand.solver_pkh,
+                cand.ticket_digest,
+                cand.assignment_proof_digest,
+                cdg,
+                seed,
+                irium_node_rs::poawx_puzzle::default_profile(),
+            );
+            let nsol =
+                irium_node_rs::poawx_puzzle::PuzzleSolutionV1::deserialize(&proofs[i].serialize())
+                    .unwrap();
+            assert!(
+                irium_node_rs::poawx_puzzle::verify_solution(&nch, &nsol).is_valid(),
+                "node verifies pool puzzle role {}",
+                role
+            );
+        }
+
+        // build_synthetic attaches candidate set + puzzle proofs when enforced.
+        let ext = build_synthetic_phase20_ext(net, h, &seed, &[0xA0u8; 20], &[], None)
+            .expect("ext with puzzle proofs");
+        assert!(ext.candidate_set.is_some());
+        assert!(ext.role_puzzle_proofs.is_some(), "puzzle proofs attached");
+        let node_ext =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        assert!(
+            node_ext.role_puzzle_proofs.is_some(),
+            "node reads pool PZL1 section"
+        );
+
+        // fail closed: puzzle enforced but no candidate set => None ext.
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT");
+        assert!(
+            build_synthetic_phase20_ext(net, h, &seed, &[0xA0u8; 20], &[], None).is_none(),
+            "fail closed without candidate set"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!pool_puzzle_work_enforced(1), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_WORK_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_BITS");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
     }
 
     #[test]
@@ -4401,6 +4863,7 @@ mod tests {
             role_ticket_proofs: None,
             role_dominance_weights: Some(weights),
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         // node lib reads the pool DOM1 weights back identically (wire parity).
         let node_ext =
@@ -5831,6 +6294,7 @@ mod tests {
                 role_ticket_proofs: None,
                 role_dominance_weights: None,
                 candidate_set: None,
+                role_puzzle_proofs: None,
             };
         let fpkh = [0x7Fu8; 20];
         // Pre-6A (no precommit_root): fee parses correctly.
@@ -5943,6 +6407,7 @@ mod tests {
             role_ticket_proofs: Some(build_role_ticket_proofs(net, h, &rr)),
             role_dominance_weights: None,
             candidate_set: None,
+            role_puzzle_proofs: None,
         };
         let node_ext =
             irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
