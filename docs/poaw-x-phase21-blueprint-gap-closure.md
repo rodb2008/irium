@@ -1,4 +1,4 @@
-# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation; 21E mandatory candidate admission/gossip; 21F puzzle work modes; 21G true-VRF feasibility = OUTCOME B pending)
+# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation; 21E mandatory candidate admission/gossip; 21F puzzle work modes; 21G true-VRF feasibility = OUTCOME B pending; 21H finality committee)
 
 **Status: Phase 21A implemented the FOUNDATION primitives (data-only); Phase 21B now wires ticket
 + penalty enforcement into the Phase 20 consensus/pool/wallet path behind explicit testnet/devnet
@@ -188,7 +188,7 @@ unaffected. Chain difficulty remains **LWMA-144 automatic**.
 | Penalty / fraud state | **PARTIAL** — status enum + record/escalation/expiry (slashing placeholder only) |
 | Fuller private assignment / VRF eligibility | **21D/21E** — candidate-set + AssignmentProofV1 (VRF-STYLE PLACEHOLDER) + admission/gossip + best-among-admitted validation. **True VRF = 21G OUTCOME B (PENDING): no safe VRF dependency/primitive in-tree** (no VRF crate in lockfile/cache; schnorrkel = incompatible Ristretto key model + uncached; witnet vrf = OpenSSL vs rustls-only posture; hand-rolled ECVRF forbidden). AssignmentProofV1 stays placeholder; no consensus change. See `poaw-x-phase21g-true-vrf-feasibility.md` |
 | Puzzle work-mode primitives beyond simplified role path | **21F** — 5 assigned-work modes (sha256d-anchor/random-memory/parallel-compute/verification/finality-placeholder), deterministic mode assignment, fast bounded verify, gated ext PZL1 enforcement; NOT chain PoW (LWMA untouched); finality mode placeholder |
-| Stronger finality-committee integration with the 10% role | **PENDING** — `require_finality` is a placeholder flag |
+| Stronger finality-committee integration with the 10% role | **21H** — real secp256k1 finality committee (SUPPORT-role members), FinalityVoteV1/FinalityProofV1, N-of-M threshold, gated ext FIN1 enforcement; SUPPORT 10% reward requires a valid finality proof; assigned-work-only (LWMA untouched); live vote gossip = follow-up |
 
 ## Remaining next technical steps (Phase 21B+)
 1. VRF / private-assignment integration (replace the `assignment_public_key` placeholder with a

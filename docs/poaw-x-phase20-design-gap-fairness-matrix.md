@@ -47,6 +47,12 @@
 > ECVRF forbidden). AssignmentProofV1 stays a VRF-style PLACEHOLDER; no consensus change.
 > Details: `poaw-x-phase21g-true-vrf-feasibility.md`.
 
+> **Phase 21H (finality committee).** Real secp256k1 finality committee for the 10%
+> SUPPORT/finality role (`src/poawx_finality.rs`): FinalityVoteV1 (ECDSA), FinalityProofV1
+> (canonical N-of-M threshold), gated ext FIN1 the node verifies; the SUPPORT 10% reward
+> requires a valid finality proof. Assigned-work/consensus only — LWMA-144 and block PoW
+> untouched. Details: `poaw-x-phase21h-finality-committee.md`.
+
 > **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has
 > been validated live, end-to-end, twice. **Step 6E** (single-VPS loopback) and **Step 6F**
 > (two-VPS, role gossip over real cross-VPS P2P with an observer node validating byte-identical)
