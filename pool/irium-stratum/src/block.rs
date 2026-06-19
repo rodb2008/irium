@@ -463,6 +463,7 @@ mod tests {
             role_puzzle_proofs: None,
             finality_proof: None,
             committed_admission: None,
+            role_assignment_v2: None,
         };
         let worker_pkh = [0xabu8; 20];
         let sol = [0x01u8; 8];

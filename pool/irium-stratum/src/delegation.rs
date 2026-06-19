@@ -1209,6 +1209,127 @@ impl TicketProofMirror {
     }
 }
 
+/// Phase 22D: opaque mirror of `irium_node_rs::poawx_candidate::AssignmentProofV2`
+/// (a true secp256k1 RFC 9381 ECVRF proof). The pool does NOT verify the VRF (no
+/// `vrf_fun` dependency here) -- it mirrors the 273-byte wire byte-for-byte so it can
+/// bundle miner-produced proofs into the produced ext; the NODE is authoritative and
+/// re-verifies. The parity test below asserts byte-equality vs the canonical type.
+pub const VRF_PROOF_WIRE: usize = 81;
+pub const ASSIGNMENT_PROOF_V2_WIRE: usize =
+    1 + 1 + 8 + 1 + 20 + 33 + 32 + 32 + 32 + VRF_PROOF_WIRE + 32; // 273
+pub const ASSIGNMENT_V2_SECTION_MAGIC: &[u8; 4] = b"AVR2";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentProofV2Mirror {
+    pub version: u8,
+    pub network_id: u8,
+    pub target_height: u64,
+    pub role_id: u8,
+    pub solver_pkh: [u8; 20],
+    pub assignment_public_key: [u8; 33],
+    pub ticket_digest: [u8; 32],
+    pub seed: [u8; 32],
+    pub vrf_output: [u8; 32],
+    pub vrf_proof: [u8; VRF_PROOF_WIRE],
+    pub digest: [u8; 32],
+}
+
+impl AssignmentProofV2Mirror {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut o = Vec::with_capacity(ASSIGNMENT_PROOF_V2_WIRE);
+        o.push(self.version);
+        o.push(self.network_id);
+        o.extend_from_slice(&self.target_height.to_le_bytes());
+        o.push(self.role_id);
+        o.extend_from_slice(&self.solver_pkh);
+        o.extend_from_slice(&self.assignment_public_key);
+        o.extend_from_slice(&self.ticket_digest);
+        o.extend_from_slice(&self.seed);
+        o.extend_from_slice(&self.vrf_output);
+        o.extend_from_slice(&self.vrf_proof);
+        o.extend_from_slice(&self.digest);
+        o
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() != ASSIGNMENT_PROOF_V2_WIRE {
+            return Err("assignment v2 mirror: bad length".to_string());
+        }
+        let mut p = 0usize;
+        let take = |p: &mut usize, n: usize| -> Vec<u8> {
+            let v = raw[*p..*p + n].to_vec();
+            *p += n;
+            v
+        };
+        let version = raw[p];
+        p += 1;
+        let network_id = raw[p];
+        p += 1;
+        let mut h8 = [0u8; 8];
+        h8.copy_from_slice(&take(&mut p, 8));
+        let target_height = u64::from_le_bytes(h8);
+        let role_id = raw[p];
+        p += 1;
+        let mut solver_pkh = [0u8; 20];
+        solver_pkh.copy_from_slice(&take(&mut p, 20));
+        let mut assignment_public_key = [0u8; 33];
+        assignment_public_key.copy_from_slice(&take(&mut p, 33));
+        let mut ticket_digest = [0u8; 32];
+        ticket_digest.copy_from_slice(&take(&mut p, 32));
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&take(&mut p, 32));
+        let mut vrf_output = [0u8; 32];
+        vrf_output.copy_from_slice(&take(&mut p, 32));
+        let mut vrf_proof = [0u8; VRF_PROOF_WIRE];
+        vrf_proof.copy_from_slice(&take(&mut p, VRF_PROOF_WIRE));
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&take(&mut p, 32));
+        Ok(Self {
+            version,
+            network_id,
+            target_height,
+            role_id,
+            solver_pkh,
+            assignment_public_key,
+            ticket_digest,
+            seed,
+            vrf_output,
+            vrf_proof,
+            digest,
+        })
+    }
+}
+
+/// Pool-side true-VRF enforcement gate (mirror node `true_vrf_enforced`): active
+/// height + required flag, mainnet hard-off. When on, the pool will only emit a
+/// production ext if it carries miner-produced V2 proofs (else it fails closed --
+/// the pool holds no VRF secret and never fabricates proofs).
+pub fn pool_true_vrf_enforced(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false; // mainnet
+    }
+    let active = match env::var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    };
+    let required = env::var("IRIUM_POAWX_TRUE_VRF_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    active && required
+}
+
+/// Attach miner-produced V2 proofs [compute, verify, support] to a produced ext.
+/// The pool bundles only; the node re-verifies every proof.
+pub fn attach_true_vrf_section(
+    ext: &mut Phase20ReceiptExtMirror,
+    proofs: [AssignmentProofV2Mirror; 3],
+) {
+    ext.role_assignment_v2 = Some(proofs);
+}
+
 /// Mirror of `irium_node_rs::poawx::Phase20ReceiptExt`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phase20ReceiptExtMirror {
@@ -1240,6 +1361,9 @@ pub struct Phase20ReceiptExtMirror {
     /// Phase 22A: optional committed admission for the next height (CAC1
     /// section; None => byte-identical to pre-22A).
     pub committed_admission: Option<AdmissionCommitmentMirror>,
+    /// Phase 22D: optional per-role true-VRF assignment proofs [compute, verify,
+    /// support] (trailing AVR2 section; None => byte-identical to pre-22D).
+    pub role_assignment_v2: Option<[AssignmentProofV2Mirror; 3]>,
 }
 
 impl Phase20ReceiptExtMirror {
@@ -1272,6 +1396,7 @@ impl Phase20ReceiptExtMirror {
                     || self.role_puzzle_proofs.is_some()
                     || self.finality_proof.is_some()
                     || self.committed_admission.is_some()
+                    || self.role_assignment_v2.is_some()
                 {
                     out.push(0);
                 }
@@ -1312,6 +1437,14 @@ impl Phase20ReceiptExtMirror {
         if let Some(ca) = &self.committed_admission {
             out.extend_from_slice(COMMITTED_ADMISSION_SECTION_MAGIC);
             out.extend_from_slice(&ca.serialize());
+        }
+        // Phase 22D trailing AVR2 true-VRF section (present-only); byte-identical to
+        // node poawx::Phase20ReceiptExt::serialize when absent.
+        if let Some(proofs) = &self.role_assignment_v2 {
+            out.extend_from_slice(ASSIGNMENT_V2_SECTION_MAGIC);
+            for pr in proofs.iter() {
+                out.extend_from_slice(&pr.serialize());
+            }
         }
         out
     }
@@ -2640,6 +2773,13 @@ pub fn build_synthetic_phase20_ext(
     if network_id == 0 || !synthetic_role_claims_enabled() {
         return None;
     }
+    // Phase 22D: the pool holds no VRF secret and never fabricates V2 proofs; under
+    // true-VRF enforcement, miner-produced proofs must be attached by the caller via
+    // attach_true_vrf_section after build. This synthetic self-test path cannot do
+    // that, so it fails closed rather than emit a node-invalid (V2-less) ext.
+    if pool_true_vrf_enforced(height) {
+        return None;
+    }
     // Fee terms: official (None) => 0/zero; third-party => only when valid (cap +
     // nonzero pkh), else fail closed to official 0%.
     let (fee_bps, fee_pkh) = match fee {
@@ -2780,6 +2920,7 @@ pub fn build_synthetic_phase20_ext(
         role_puzzle_proofs,
         finality_proof,
         committed_admission,
+        role_assignment_v2: None,
     })
 }
 
@@ -3150,6 +3291,11 @@ pub fn build_collected_phase20_ext(
     if network_id == 0 || !role_protocol_enabled() {
         return None;
     }
+    // Phase 22D: fail closed under true-VRF enforcement (pool fabricates no proofs;
+    // miner proofs are attached post-build via attach_true_vrf_section).
+    if pool_true_vrf_enforced(height) {
+        return None;
+    }
     let reveals = store.select_reveals(height)?;
     let next_root = store.precommit_root_for(height + 1)?;
     let (fee_bps, fee_pkh) = match fee {
@@ -3241,6 +3387,7 @@ pub fn build_collected_phase20_ext(
         role_puzzle_proofs,
         finality_proof,
         committed_admission,
+        role_assignment_v2: None,
     })
 }
 
@@ -4856,6 +5003,7 @@ mod tests {
             role_puzzle_proofs: None,
             finality_proof: None,
             committed_admission: None,
+            role_assignment_v2: None,
         };
         let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
             role_reward: node_rr,
@@ -4871,6 +5019,7 @@ mod tests {
             role_puzzle_proofs: None,
             finality_proof: None,
             committed_admission: None,
+            role_assignment_v2: None,
         };
         assert_eq!(
             ext.serialize(),
@@ -4884,6 +5033,147 @@ mod tests {
         // RoleReward pkhs extractable from the hex without full deserialize.
         let (c, v, s) = role_reward_pkhs_from_ext_hex(&hex::encode(ext.serialize())).unwrap();
         assert_eq!((c, v, s), ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]));
+    }
+
+    #[test]
+    fn phase22d_pool_true_vrf_parity_and_failclosed() {
+        // (a) proof-level wire parity vs the canonical node AssignmentProofV2.
+        let proof = irium_node_rs::poawx_candidate::AssignmentProofV2::prove(
+            &[7u8; 32],
+            1,
+            10,
+            1,
+            [0xAAu8; 20],
+            [0x11u8; 32],
+            [0x22u8; 32],
+        )
+        .expect("node prove");
+        let canon = proof.serialize();
+        assert_eq!(canon.len(), ASSIGNMENT_PROOF_V2_WIRE);
+        let mir = AssignmentProofV2Mirror::deserialize(&canon).unwrap();
+        assert_eq!(mir.serialize(), canon, "mirror re-serialize == node wire");
+        let back = irium_node_rs::poawx_candidate::AssignmentProofV2::deserialize(&mir.serialize())
+            .unwrap();
+        assert_eq!(back, proof, "node round-trips the mirror bytes");
+        assert_eq!(
+            ASSIGNMENT_V2_SECTION_MAGIC,
+            irium_node_rs::poawx_candidate::ASSIGNMENT_V2_SECTION_MAGIC,
+            "AVR2 magic parity"
+        );
+
+        // (b) ext-with-AVR2 wire + digest parity (3 proofs).
+        let mk = |secret: u8, role: u8, solver: [u8; 20]| {
+            irium_node_rs::poawx_candidate::AssignmentProofV2::prove(
+                &[secret; 32],
+                1,
+                11,
+                role,
+                solver,
+                [role; 32],
+                [0x55u8; 32],
+            )
+            .unwrap()
+        };
+        let np = [
+            mk(7, 1, [0xC1u8; 20]),
+            mk(8, 2, [0xC2u8; 20]),
+            mk(9, 3, [0xC3u8; 20]),
+        ];
+        let mp = [
+            AssignmentProofV2Mirror::deserialize(&np[0].serialize()).unwrap(),
+            AssignmentProofV2Mirror::deserialize(&np[1].serialize()).unwrap(),
+            AssignmentProofV2Mirror::deserialize(&np[2].serialize()).unwrap(),
+        ];
+        let claim_pool = |role: u8| PoawxRoleClaimMirror {
+            role_id: role,
+            lane_id: LANE_GPU_PARALLEL,
+            solver_pkh: [role; 20],
+            nonce: [role; 32],
+            secret: [role.wrapping_add(1); 32],
+            claim_digest: [role.wrapping_add(2); 32],
+            commitment_hash: None,
+        };
+        let claim_node = |role: u8| irium_node_rs::poawx::PoawxRoleClaim {
+            role_id: role,
+            lane_id: LANE_GPU_PARALLEL,
+            solver_pkh: [role; 20],
+            nonce: [role; 32],
+            secret: [role.wrapping_add(1); 32],
+            claim_digest: [role.wrapping_add(2); 32],
+            commitment_hash: None,
+        };
+        let mut pe = Phase20ReceiptExtMirror {
+            role_reward: RoleRewardMirror {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: claim_pool(1),
+            verify_claim: claim_pool(2),
+            support_claim: claim_pool(3),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+            candidate_set: None,
+            role_puzzle_proofs: None,
+            finality_proof: None,
+            committed_admission: None,
+            role_assignment_v2: None,
+        };
+        attach_true_vrf_section(&mut pe, mp);
+        let ne = irium_node_rs::poawx::Phase20ReceiptExt {
+            role_reward: irium_node_rs::poawx::RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: claim_node(1),
+            verify_claim: claim_node(2),
+            support_claim: claim_node(3),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+            candidate_set: None,
+            role_puzzle_proofs: None,
+            finality_proof: None,
+            committed_admission: None,
+            role_assignment_v2: Some([np[0].clone(), np[1].clone(), np[2].clone()]),
+        };
+        assert_eq!(pe.serialize(), ne.serialize(), "ext AVR2 wire parity");
+        assert_eq!(pe.digest(), ne.digest(), "ext AVR2 digest parity");
+        assert_eq!(
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&pe.serialize()).unwrap(),
+            ne,
+            "node deserializes pool AVR2 bytes"
+        );
+
+        // (c) fail-closed: the synthetic builder emits nothing under V2 enforcement
+        // (the pool holds no VRF secret), and mainnet is hard-off.
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1");
+        let net = network_id_from_env();
+        assert!(pool_true_vrf_enforced(5), "enforced on testnet");
+        assert!(
+            build_synthetic_phase20_ext(net, 5, &[0x44u8; 32], &[0xA0u8; 20], &[], None).is_none(),
+            "synthetic builder fails closed under true-VRF"
+        );
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!pool_true_vrf_enforced(5), "mainnet hard-off");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
     }
 
     #[test]
@@ -5419,6 +5709,7 @@ mod tests {
             role_puzzle_proofs: None,
             finality_proof: None,
             committed_admission: None,
+            role_assignment_v2: None,
         };
         // node lib reads the pool DOM1 weights back identically (wire parity).
         let node_ext =
@@ -6852,6 +7143,7 @@ mod tests {
                 role_puzzle_proofs: None,
                 finality_proof: None,
                 committed_admission: None,
+                role_assignment_v2: None,
             };
         let fpkh = [0x7Fu8; 20];
         // Pre-6A (no precommit_root): fee parses correctly.
@@ -6967,6 +7259,7 @@ mod tests {
             role_puzzle_proofs: None,
             finality_proof: None,
             committed_admission: None,
+            role_assignment_v2: None,
         };
         let node_ext =
             irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
