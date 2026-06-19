@@ -8468,6 +8468,159 @@ mod tests {
     }
 
     #[test]
+    fn phase22e_true_vrf_e2e_block() {
+        // End-to-end: with candidate-set + admission + true-VRF ALL enforced, a block
+        // carrying V2 candidates (digest = VRF output) + the AVR2 section must satisfy
+        // BOTH validate_block_candidate_sets (V1 recompute skipped under the gate) AND
+        // validate_block_true_vrf. Proves the Phase 22E reconciliation.
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_admission::{
+            candidate_admission_enforced, global_admission_cache, CandidateAdmissionV1,
+        };
+        use crate::poawx_candidate::{AssignmentProofV2, CandidateSet, RoleCandidate};
+        use crate::poawx_penalty::PenaltyStatus;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1");
+
+        let net = crate::activation::network_id_byte();
+        let height = 1u64;
+        let seed = [0x44u8; 32];
+        let sk = test_signing_key();
+        let base_ext = p20_ext(net, height, &seed, 0, [0u8; 20]);
+        let receipt = make_test_receipt(height, &sk, seed, 1);
+
+        let mk = |secret: u8,
+                  role: u8,
+                  solver: [u8; 20],
+                  ticket: [u8; 32]|
+         -> (AssignmentProofV2, RoleCandidate) {
+            let p =
+                AssignmentProofV2::prove(&[secret; 32], net, height, role, solver, ticket, seed)
+                    .expect("v2 prove");
+            let c =
+                RoleCandidate::from_assignment_v2(&p, PenaltyStatus::Clean.id(), 1000, [role; 32]);
+            (p, c)
+        };
+        let (pc, cc) = mk(7, ROLE_COMPUTE_CONTRIBUTOR, [0xC1u8; 20], [0x11u8; 32]);
+        let (pv, cv) = mk(8, ROLE_VERIFY_CONTRIBUTOR, [0xC2u8; 20], [0x12u8; 32]);
+        let (ps, csup) = mk(9, ROLE_SUPPORT_CONTRIBUTOR, [0xC3u8; 20], [0x13u8; 32]);
+
+        // Node ingest: the global admission cache accepts the valid V2 admissions
+        // (and rejects a mutated one), exactly as the loopback RPC bridge would.
+        let cache = global_admission_cache();
+        cache.clear();
+        cache.set_tip(height);
+        assert!(candidate_admission_enforced(height));
+        for (p, c) in [(&pc, &cc), (&pv, &cv), (&ps, &csup)] {
+            let adm =
+                CandidateAdmissionV1::new_with_v2(net, height, seed, c.clone(), Some(p.clone()));
+            assert!(adm.validate(net, height).is_ok());
+            assert_eq!(
+                cache.ingest_bytes(&adm.serialize()),
+                crate::poawx_gossip::GossipOutcome::AcceptedNew
+            );
+        }
+        // a mutated V2 admission is rejected at ingest.
+        let mut bad =
+            CandidateAdmissionV1::new_with_v2(net, height, seed, cc.clone(), Some(pc.clone()));
+        bad.assignment_proof_v2.as_mut().unwrap().vrf_output[0] ^= 1;
+        bad.digest = crate::poawx_admission::CandidateAdmissionV1::new_with_v2(
+            net,
+            height,
+            seed,
+            cc.clone(),
+            bad.assignment_proof_v2.clone(),
+        )
+        .digest;
+        assert!(matches!(
+            cache.ingest_bytes(&bad.serialize()),
+            crate::poawx_gossip::GossipOutcome::Rejected(_)
+        ));
+
+        // The candidate set the node admitted == what we build for the block ext.
+        let admitted = cache.admitted_candidate_set(net, height, &seed);
+        let mut cs = CandidateSet::new(net, height, seed);
+        for c in [cc, cv, csup] {
+            cs.push(c);
+        }
+        cs.sort_canonical();
+        assert_eq!(
+            cs.serialize(),
+            admitted.serialize(),
+            "block cs == node admitted set"
+        );
+
+        let blk = |with_v2: bool| -> Block {
+            let mut ext = base_ext.clone();
+            ext.role_reward.compute_contributor_pkh = [0xC1u8; 20];
+            ext.role_reward.verify_contributor_pkh = [0xC2u8; 20];
+            ext.role_reward.support_contributor_pkh = [0xC3u8; 20];
+            ext.candidate_set = Some(cs.clone());
+            ext.role_assignment_v2 = if with_v2 {
+                Some([pc.clone(), pv.clone(), ps.clone()])
+            } else {
+                None
+            };
+            let mut r = receipt.clone();
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: seed,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+
+        let st = base_chain(None);
+        let good = blk(true);
+        // V2 candidates satisfy candidate-set validation (V1 recompute skipped) ...
+        assert!(
+            st.validate_block_candidate_sets(&good, height).is_ok(),
+            "candidate-set validation accepts V2 candidates"
+        );
+        // ... and the true-VRF section validates against the selected candidates.
+        assert!(
+            st.validate_block_true_vrf(&good, height).is_ok(),
+            "true-VRF validation accepts the AVR2 section"
+        );
+        // A V1-only block (no AVR2) is rejected under V2 enforcement.
+        assert!(
+            st.validate_block_true_vrf(&blk(false), height).is_err(),
+            "V1-only block rejected when V2 required"
+        );
+
+        cache.clear();
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
+    }
+
+    #[test]
     fn phase22d_true_vrf_enforcement() {
         use crate::poawx::{
             ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
