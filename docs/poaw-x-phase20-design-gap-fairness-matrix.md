@@ -41,6 +41,12 @@
 > and LWMA-144 are untouched; the finality mode is a placeholder. Details:
 > `poaw-x-phase21f-puzzle-work-modes.md`.
 
+> **Phase 21G (true VRF) = OUTCOME B (PENDING).** Feasibility inspection found no safe
+> real-VRF dependency/primitive in-tree (no VRF crate in lockfile/cache; secp256k1 key
+> model; schnorrkel incompatible/heavy/uncached; witnet vrf needs OpenSSL; hand-rolled
+> ECVRF forbidden). AssignmentProofV1 stays a VRF-style PLACEHOLDER; no consensus change.
+> Details: `poaw-x-phase21g-true-vrf-feasibility.md`.
+
 > **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has
 > been validated live, end-to-end, twice. **Step 6E** (single-VPS loopback) and **Step 6F**
 > (two-VPS, role gossip over real cross-VPS P2P with an observer node validating byte-identical)

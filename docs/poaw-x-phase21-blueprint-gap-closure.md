@@ -1,4 +1,4 @@
-# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation; 21E mandatory candidate admission/gossip; 21F puzzle work modes)
+# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation; 21E mandatory candidate admission/gossip; 21F puzzle work modes; 21G true-VRF feasibility = OUTCOME B pending)
 
 **Status: Phase 21A implemented the FOUNDATION primitives (data-only); Phase 21B now wires ticket
 + penalty enforcement into the Phase 20 consensus/pool/wallet path behind explicit testnet/devnet
@@ -56,6 +56,18 @@ verify, fail-closed) behind IRIUM_POAWX_PUZZLE_WORK_{ACTIVATION_HEIGHT,REQUIRED}
 poawx-puzzle-challenge/poawx-puzzle-solve (no key, testnet-only). These are ASSIGNED-WORK
 proofs, NOT chain PoW: block interval/bits/target/LWMA-144 are untouched; the finality mode
 is a deterministic placeholder. Details: `poaw-x-phase21f-puzzle-work-modes.md`.
+
+**Phase 21G (this pass) — true-VRF feasibility = OUTCOME B (PENDING, docs-only).** Per
+the crypto rule (no homemade/unaudited VRF math, no renaming the placeholder), inspection
+found NO safe real-VRF path: no VRF crate in the node/pool lockfile or cargo cache; `k256`
+0.13 has no VRF; the audited `schnorrkel` (sr25519/Ristretto) is incompatible with the
+secp256k1 key model + heavy/uncached; the secp256k1 `vrf` crate requires OpenSSL (against
+the repo's rustls-only, advisory-pinned posture); and a hand-rolled RFC 9381 ECVRF on
+`k256` is forbidden as unaudited homemade VRF math. **No consensus code changed;
+AssignmentProofV1 remains the gated placeholder.** Recommended Outcome-A path (key-model
+decision + reviewed/vendored VRF dependency + AssignmentProofV2 behind
+`IRIUM_POAWX_TRUE_VRF_{ACTIVATION_HEIGHT,REQUIRED}`) is documented in
+`poaw-x-phase21g-true-vrf-feasibility.md`.
 
 ## Phase 21B — gated enforcement (this pass)
 - **Ticket proof binding (`src/poawx_ticket.rs` + `src/poawx.rs`):** a compact, self-verifiable
@@ -174,7 +186,7 @@ unaffected. Chain difficulty remains **LWMA-144 automatic**.
 | Anti-domination / recent reward history | **21C** — persistent + reorg-safe per-(miner,window) state, connect/disconnect/reorg/restart, gated ext weight binding + node validation, pool selection weighting (global-best candidate optimality = 21D) |
 | Adaptive mining/security modes | **PARTIAL** — deterministic mode/policy state machine (not yet consumed by node) |
 | Penalty / fraud state | **PARTIAL** — status enum + record/escalation/expiry (slashing placeholder only) |
-| Fuller private assignment / VRF eligibility | **21D** — candidate-set commitment + AssignmentProofV1 (VRF-STYLE PLACEHOLDER, not true VRF) + node best-within-included-set validation; true VRF = future; mandatory candidate admission/gossip = **21E** |
+| Fuller private assignment / VRF eligibility | **21D/21E** — candidate-set + AssignmentProofV1 (VRF-STYLE PLACEHOLDER) + admission/gossip + best-among-admitted validation. **True VRF = 21G OUTCOME B (PENDING): no safe VRF dependency/primitive in-tree** (no VRF crate in lockfile/cache; schnorrkel = incompatible Ristretto key model + uncached; witnet vrf = OpenSSL vs rustls-only posture; hand-rolled ECVRF forbidden). AssignmentProofV1 stays placeholder; no consensus change. See `poaw-x-phase21g-true-vrf-feasibility.md` |
 | Puzzle work-mode primitives beyond simplified role path | **21F** — 5 assigned-work modes (sha256d-anchor/random-memory/parallel-compute/verification/finality-placeholder), deterministic mode assignment, fast bounded verify, gated ext PZL1 enforcement; NOT chain PoW (LWMA untouched); finality mode placeholder |
 | Stronger finality-committee integration with the 10% role | **PENDING** — `require_finality` is a placeholder flag |
 
