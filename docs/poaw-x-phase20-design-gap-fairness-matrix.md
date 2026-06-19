@@ -59,6 +59,13 @@
 > pool/node-signed; the node re-verifies every vote + the bundled proof. Gated + mainnet
 > hard-off; LWMA-144 untouched. Details: `poaw-x-phase21i-finality-vote-gossip.md`.
 
+> **Phase 22A (chain-committed admission).** The admitted candidate-set root is committed in
+> block H-1 (`AdmissionCommitmentV1`, freeze seed = grandparent hash); block H's candidate
+> set must reproduce that exact committed root, so the producer cannot add/omit candidates
+> and all nodes validate against one chain-committed root (not local caches). Does NOT prove
+> offline miners existed; gated + mainnet hard-off; LWMA untouched. Details:
+> `poaw-x-phase22a-committed-admission.md`.
+
 > **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has
 > been validated live, end-to-end, twice. **Step 6E** (single-VPS loopback) and **Step 6F**
 > (two-VPS, role gossip over real cross-VPS P2P with an observer node validating byte-identical)

@@ -156,3 +156,11 @@ git push -u origin testnet/poawx-phase20-blueprint-completion-local
 ```
 
 Do **not** merge to `main`, tag, release, or activate mainnet from this branch.
+
+## Update — Phase 22A
+
+Phase 22A (chain-committed candidate admission) has since been added on top of this audit
+(commits `2e97f5e`..`de43acf` + docs): admitted candidate-set roots are now chain-committed
+in the parent block and re-validated at the target block (gated, mainnet hard-off). It
+strengthens 21E without claiming offline-miner discovery; true VRF remains pending. See
+`poaw-x-phase22a-committed-admission.md` and `poaw-x-blueprint-completion-gap-audit.md`.

@@ -1,4 +1,4 @@
-# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation; 21E mandatory candidate admission/gossip; 21F puzzle work modes; 21G true-VRF feasibility = OUTCOME B pending; 21H finality committee; 21I live finality-vote gossip)
+# PoAW-X Phase 21 — Blueprint Gap Closure (21A foundation primitives; 21B gated ticket/penalty enforcement; 21C persistent reorg-safe anti-domination enforcement; 21D candidate-set + VRF-style assignment-proof foundation; 21E mandatory candidate admission/gossip; 21F puzzle work modes; 21G true-VRF feasibility = OUTCOME B pending; 21H finality committee; 21I live finality-vote gossip; 22A chain-committed candidate admission)
 
 **Status: Phase 21A implemented the FOUNDATION primitives (data-only); Phase 21B now wires ticket
 + penalty enforcement into the Phase 20 consensus/pool/wallet path behind explicit testnet/devnet
