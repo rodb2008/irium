@@ -1234,6 +1234,9 @@ pub struct Phase20ReceiptExtMirror {
     /// Phase 21F: optional per-role puzzle solutions (trailing PZL1 section;
     /// None => byte-identical to pre-21F).
     pub role_puzzle_proofs: Option<[PuzzleSolutionMirror; 3]>,
+    /// Phase 21H: optional bundled finality proof (trailing FIN1 section;
+    /// None => byte-identical to pre-21H).
+    pub finality_proof: Option<FinalityProofMirror>,
 }
 
 impl Phase20ReceiptExtMirror {
@@ -1264,6 +1267,7 @@ impl Phase20ReceiptExtMirror {
                     || self.role_dominance_weights.is_some()
                     || self.candidate_set.is_some()
                     || self.role_puzzle_proofs.is_some()
+                    || self.finality_proof.is_some()
                 {
                     out.push(0);
                 }
@@ -1294,6 +1298,12 @@ impl Phase20ReceiptExtMirror {
             for sol in sols.iter() {
                 out.extend_from_slice(&sol.serialize());
             }
+        }
+        if let Some(fp) = &self.finality_proof {
+            let body = fp.serialize();
+            out.extend_from_slice(FINALITY_SECTION_MAGIC);
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
         }
         out
     }
@@ -2296,6 +2306,156 @@ pub fn build_pool_puzzle_proofs(
     Some([out[0], out[1], out[2]])
 }
 
+/// ── Phase 21H: finality-committee proof bundling (pool side) ────────────────
+/// The pool does NOT sign votes (no member keys) and does NOT verify finality
+/// (the node is authoritative). It BUNDLES collected member-signed votes into a
+/// byte-identical FinalityProofMirror and attaches it; fail-closed if none. Votes
+/// are real member secp256k1 signatures collected out-of-band / via RPC.
+pub const FINALITY_SECTION_MAGIC: &[u8; 4] = b"FIN1";
+pub const FINALITY_VOTE_WIRE: usize = 1 + 1 + 8 + 32 + 32 + 8 + 20 + 33 + 32 + 1 + 64; // 232
+const FIN_VOTE_MEMBER_PKH_OFF: usize = 1 + 1 + 8 + 32 + 32 + 8; // 82
+const FIN_VOTE_PARENT_OFF: usize = 1 + 1 + 8 + 32; // 42
+const FIN_VOTE_EPOCH_OFF: usize = 1 + 1 + 8 + 32 + 32; // 74
+const FIN_VOTE_HEIGHT_OFF: usize = 2;
+const FIN_VOTE_BLOCK_OFF: usize = 10;
+
+/// Pool finality-committee enforcement gate (mirror node).
+pub fn pool_finality_committee_enforced(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false;
+    }
+    let active = match env::var("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    };
+    let required = env::var("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    active && required
+}
+
+/// Mirror of node finality threshold (num, den), default 1/1.
+pub fn pool_finality_threshold() -> (u16, u16) {
+    let num = env::var("IRIUM_POAWX_FINALITY_THRESHOLD_NUM")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1);
+    let den = env::var("IRIUM_POAWX_FINALITY_THRESHOLD_DEN")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|d| *d >= 1)
+        .unwrap_or(1);
+    (num, den)
+}
+
+/// A bundled finality proof (byte-identical to node FinalityProofV1 wire). Votes
+/// are stored as raw 232-byte records (sorted canonical by member_pkh, deduped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalityProofMirror {
+    pub network_id: u8,
+    pub target_height: u64,
+    pub block_hash: [u8; 32],
+    pub parent_hash: [u8; 32],
+    pub committee_epoch: u64,
+    pub threshold_num: u16,
+    pub threshold_den: u16,
+    votes: Vec<[u8; FINALITY_VOTE_WIRE]>,
+}
+
+impl FinalityProofMirror {
+    pub fn vote_count(&self) -> usize {
+        self.votes.len()
+    }
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut o = Vec::with_capacity(88 + self.votes.len() * FINALITY_VOTE_WIRE);
+        o.push(1u8); // version
+        o.push(self.network_id);
+        o.extend_from_slice(&self.target_height.to_le_bytes());
+        o.extend_from_slice(&self.block_hash);
+        o.extend_from_slice(&self.parent_hash);
+        o.extend_from_slice(&self.committee_epoch.to_le_bytes());
+        o.extend_from_slice(&self.threshold_num.to_le_bytes());
+        o.extend_from_slice(&self.threshold_den.to_le_bytes());
+        o.extend_from_slice(&(self.votes.len() as u16).to_le_bytes());
+        for v in &self.votes {
+            o.extend_from_slice(v);
+        }
+        o
+    }
+}
+
+/// Process-global pool finality-vote cache: hex vote records keyed by height.
+pub fn pool_finality_vote_cache() -> &'static std::sync::Mutex<BTreeMap<u64, Vec<String>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<BTreeMap<u64, Vec<String>>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Bundle collected member votes for (height, block_hash) into a canonical proof.
+/// None if no matching vote (caller fails closed; the node enforces the threshold).
+pub fn build_pool_finality_proof(
+    network_id: u8,
+    height: u64,
+    block_hash: &[u8; 32],
+    num: u16,
+    den: u16,
+) -> Option<FinalityProofMirror> {
+    let cache = pool_finality_vote_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hexes = cache.get(&height).cloned().unwrap_or_default();
+    drop(cache);
+    let mut by_member: BTreeMap<[u8; 20], [u8; FINALITY_VOTE_WIRE]> = BTreeMap::new();
+    let mut parent_hash = [0u8; 32];
+    let mut committee_epoch = 0u64;
+    let mut have_any = false;
+    for hx in &hexes {
+        let bytes = match hex::decode(hx.trim()) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if bytes.len() != FINALITY_VOTE_WIRE || bytes[0] != 1 || bytes[1] != network_id {
+            continue;
+        }
+        let mut h8 = [0u8; 8];
+        h8.copy_from_slice(&bytes[FIN_VOTE_HEIGHT_OFF..FIN_VOTE_HEIGHT_OFF + 8]);
+        if u64::from_le_bytes(h8) != height {
+            continue;
+        }
+        if &bytes[FIN_VOTE_BLOCK_OFF..FIN_VOTE_BLOCK_OFF + 32] != block_hash {
+            continue;
+        }
+        let mut rec = [0u8; FINALITY_VOTE_WIRE];
+        rec.copy_from_slice(&bytes);
+        let mut pkh = [0u8; 20];
+        pkh.copy_from_slice(&bytes[FIN_VOTE_MEMBER_PKH_OFF..FIN_VOTE_MEMBER_PKH_OFF + 20]);
+        if !have_any {
+            parent_hash.copy_from_slice(&bytes[FIN_VOTE_PARENT_OFF..FIN_VOTE_PARENT_OFF + 32]);
+            h8.copy_from_slice(&bytes[FIN_VOTE_EPOCH_OFF..FIN_VOTE_EPOCH_OFF + 8]);
+            committee_epoch = u64::from_le_bytes(h8);
+            have_any = true;
+        }
+        by_member.entry(pkh).or_insert(rec); // dedup by member; BTreeMap => sorted
+    }
+    if by_member.is_empty() {
+        return None;
+    }
+    Some(FinalityProofMirror {
+        network_id,
+        target_height: height,
+        block_hash: *block_hash,
+        parent_hash,
+        committee_epoch,
+        threshold_num: num,
+        threshold_den: den,
+        votes: by_member.into_values().collect(),
+    })
+}
+
 pub fn build_synthetic_phase20_ext(
     network_id: u8,
     height: u64,
@@ -2412,6 +2572,17 @@ pub fn build_synthetic_phase20_ext(
     } else {
         None
     };
+    // Phase 21H: bundle + attach the finality proof when enforced; fail closed
+    // (no ext) if no collected committee votes are available.
+    let finality_proof = if pool_finality_committee_enforced(height) {
+        let (fnum, fden) = pool_finality_threshold();
+        match build_pool_finality_proof(network_id, height, prev_hash, fnum, fden) {
+            Some(p) => Some(p),
+            None => return None,
+        }
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim,
@@ -2424,6 +2595,7 @@ pub fn build_synthetic_phase20_ext(
         role_dominance_weights,
         candidate_set,
         role_puzzle_proofs,
+        finality_proof,
     })
 }
 
@@ -2850,6 +3022,17 @@ pub fn build_collected_phase20_ext(
     } else {
         None
     };
+    // Phase 21H: bundle + attach the finality proof when enforced; fail closed
+    // (no ext) if no collected committee votes are available.
+    let finality_proof = if pool_finality_committee_enforced(height) {
+        let (fnum, fden) = pool_finality_threshold();
+        match build_pool_finality_proof(network_id, height, prev_hash, fnum, fden) {
+            Some(p) => Some(p),
+            None => return None,
+        }
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim: reveals[0].claim.clone(),
@@ -2862,6 +3045,7 @@ pub fn build_collected_phase20_ext(
         role_dominance_weights,
         candidate_set,
         role_puzzle_proofs,
+        finality_proof,
     })
 }
 
@@ -4475,6 +4659,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
             role_reward: node_rr,
@@ -4488,6 +4673,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         assert_eq!(
             ext.serialize(),
@@ -4501,6 +4687,82 @@ mod tests {
         // RoleReward pkhs extractable from the hex without full deserialize.
         let (c, v, s) = role_reward_pkhs_from_ext_hex(&hex::encode(ext.serialize())).unwrap();
         assert_eq!((c, v, s), ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]));
+    }
+
+    #[test]
+    fn phase21h_pool_finality_proof_parity_and_failclosed() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1");
+        std::env::set_var("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        let net = network_id_from_env();
+        assert!(pool_finality_committee_enforced(1), "enforced on testnet");
+
+        let h = 5u64;
+        let seed = [0x44u8; 32];
+        use irium_node_rs::poawx_finality::{
+            FinalityProofV1 as NP, FinalityVoteType as NVT, FinalityVoteV1 as NV,
+        };
+        let member = k256::ecdsa::SigningKey::from_slice(&[0x21u8; 32]).unwrap();
+        let vote = NV::signed(
+            &member,
+            net,
+            h,
+            seed,
+            [0u8; 32],
+            0,
+            [0x11u8; 32],
+            NVT::Commit,
+        );
+        let member_pkh = vote.member_pkh;
+        pool_finality_vote_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(h, vec![hex::encode(vote.serialize())]);
+
+        // pool bundles -> node verifies the bundled proof (parity, 1-of-1).
+        let proof = build_pool_finality_proof(net, h, &seed, 1, 1).expect("proof");
+        let node_proof = NP::deserialize(&proof.serialize()).unwrap();
+        assert!(
+            node_proof.validate(net, h, &seed, &[member_pkh]).is_ok(),
+            "node accepts pool-bundled finality proof"
+        );
+
+        // build_synthetic attaches the finality proof + node reads FIN1.
+        let ext = build_synthetic_phase20_ext(net, h, &seed, &[0xA0u8; 20], &[], None)
+            .expect("ext with finality proof");
+        assert!(ext.finality_proof.is_some(), "finality proof attached");
+        let node_ext =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        assert!(node_ext.finality_proof.is_some(), "node reads pool FIN1");
+
+        // fail-closed: no collected votes => None proof => None ext.
+        pool_finality_vote_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        assert!(
+            build_pool_finality_proof(net, h, &seed, 1, 1).is_none(),
+            "no votes => None"
+        );
+        assert!(
+            build_synthetic_phase20_ext(net, h, &seed, &[0xA0u8; 20], &[], None).is_none(),
+            "fail closed without collected votes"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!pool_finality_committee_enforced(1), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_THRESHOLD_NUM");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_THRESHOLD_DEN");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
     }
 
     #[test]
@@ -4864,6 +5126,7 @@ mod tests {
             role_dominance_weights: Some(weights),
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         // node lib reads the pool DOM1 weights back identically (wire parity).
         let node_ext =
@@ -6295,6 +6558,7 @@ mod tests {
                 role_dominance_weights: None,
                 candidate_set: None,
                 role_puzzle_proofs: None,
+                finality_proof: None,
             };
         let fpkh = [0x7Fu8; 20];
         // Pre-6A (no precommit_root): fee parses correctly.
@@ -6408,6 +6672,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let node_ext =
             irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();

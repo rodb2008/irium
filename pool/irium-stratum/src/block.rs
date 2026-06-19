@@ -461,6 +461,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let worker_pkh = [0xabu8; 20];
         let sol = [0x01u8; 8];
