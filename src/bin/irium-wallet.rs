@@ -2331,6 +2331,7 @@ fn usage() {
     eprintln!("  irium-wallet poawx-candidate-admission --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--role-claim-digest <64hex>] [--penalty-status <0..4>] [--dominance-weight <N>] [--assignment-pubkey <66hex>]  (emits wire_hex to POST to /poawx/candidate-admission; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-puzzle-challenge --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> [--ticket-digest <64hex>] [--assignment-proof-digest <64hex>] [--candidate-digest <64hex>] [--seed <64hex>]  (assigned-work puzzle, NOT chain PoW; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-puzzle-solve <same flags as poawx-puzzle-challenge>  (emits solution wire_hex; testnet/devnet only; no private key)");
+    eprintln!("  irium-wallet poawx-finality-vote --network-id <id> --target-height <H> --block-hash <64hex> [--parent-hash <64hex>] [--committee-epoch <N>] [--ticket-digest <64hex>] [--vote-type precommit|commit|checkpoint] --secret-hex <64hex>  (real secp256k1 vote; testnet/devnet only; signing key is input-only, never echoed)");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3778,6 +3779,129 @@ fn cmd_poawx_role_emit(args: &[String], reveal: bool) -> Result<(), String> {
 
 /// Phase 21B: emit a PoAW-X miner work-ticket PROOF bound to a role + height
 /// (testnet/devnet only; mainnet hard-off). Prints JSON only — no private key.
+/// Phase 21H: build + sign a finality-committee vote (testable). The signing key
+/// is an INPUT (--secret-hex, testnet throwaway) and is NEVER echoed; the output
+/// carries only the public key, signature, digest, and wire. Mainnet hard-off.
+fn finality_vote_json(args: &[String]) -> Result<serde_json::Value, String> {
+    use irium_node_rs::poawx_finality::{FinalityVoteType, FinalityVoteV1};
+    let mut network_id: Option<u8> = None;
+    let mut target_height: Option<u64> = None;
+    let mut block_hash = [0u8; 32];
+    let mut parent_hash = [0u8; 32];
+    let mut committee_epoch: u64 = 0;
+    let mut ticket_digest = [0u8; 32];
+    let mut vote_type = FinalityVoteType::Commit;
+    let mut secret: Option<[u8; 32]> = None;
+    let mut have_block = false;
+    let hex_into = |s: &str, out: &mut [u8]| -> Result<(), String> {
+        let b = hex::decode(s.trim()).map_err(|_| "invalid hex".to_string())?;
+        if b.len() != out.len() {
+            return Err(format!("expected {} bytes", out.len()));
+        }
+        out.copy_from_slice(&b);
+        Ok(())
+    };
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--network-id" => {
+                network_id = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --network-id".to_string())?,
+                )
+            }
+            "--target-height" => {
+                target_height = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --target-height".to_string())?,
+                )
+            }
+            "--block-hash" | "--finalized-hash" => {
+                hex_into(&next_flag_value(args, &mut i)?, &mut block_hash)?;
+                have_block = true;
+            }
+            "--parent-hash" => hex_into(&next_flag_value(args, &mut i)?, &mut parent_hash)?,
+            "--committee-epoch" => {
+                committee_epoch = next_flag_value(args, &mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --committee-epoch".to_string())?
+            }
+            "--ticket-digest" => hex_into(&next_flag_value(args, &mut i)?, &mut ticket_digest)?,
+            "--vote-type" => {
+                let t = next_flag_value(args, &mut i)?;
+                vote_type = match t.to_ascii_lowercase().as_str() {
+                    "precommit" | "0" => FinalityVoteType::Precommit,
+                    "commit" | "1" => FinalityVoteType::Commit,
+                    "checkpoint" | "2" => FinalityVoteType::Checkpoint,
+                    other => return Err(format!("invalid --vote-type {other}")),
+                };
+            }
+            "--secret-hex" => {
+                let mut sk = [0u8; 32];
+                hex_into(&next_flag_value(args, &mut i)?, &mut sk)?;
+                secret = Some(sk);
+            }
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    let network_id = network_id.ok_or("--network-id required")?;
+    if network_id == 0 {
+        return Err("finality vote is mainnet-hard-off (network_id 0)".to_string());
+    }
+    let target_height = target_height.ok_or("--target-height required")?;
+    if !have_block {
+        return Err("--block-hash <64hex> required".to_string());
+    }
+    let sk_bytes = secret.ok_or("--secret-hex <64hex> required (testnet throwaway)")?;
+    let sk = k256::ecdsa::SigningKey::from_slice(&sk_bytes)
+        .map_err(|_| "invalid --secret-hex".to_string())?;
+    let vote = FinalityVoteV1::signed(
+        &sk,
+        network_id,
+        target_height,
+        block_hash,
+        parent_hash,
+        committee_epoch,
+        ticket_digest,
+        vote_type,
+    );
+    let vt_name = match vote.vote_type {
+        0 => "precommit",
+        1 => "commit",
+        _ => "checkpoint",
+    };
+    Ok(serde_json::json!({
+        "vote": {
+            "network_id": vote.network_id,
+            "target_height": vote.target_height,
+            "block_hash": hex::encode(vote.block_hash),
+            "parent_hash": hex::encode(vote.parent_hash),
+            "committee_epoch": vote.committee_epoch,
+            "member_pkh": hex::encode(vote.member_pkh),
+            "member_pubkey": hex::encode(vote.member_pubkey),
+            "ticket_digest": hex::encode(vote.ticket_digest),
+            "vote_type": vote.vote_type,
+            "vote_type_name": vt_name,
+        },
+        "vote_digest": hex::encode(vote.digest()),
+        "signature": hex::encode(vote.signature),
+        "wire_hex": hex::encode(vote.serialize()),
+        "note": "real secp256k1 finality vote; testnet/devnet only; the signing key is an input and is never echoed; POST wire_hex to the pool/operator finality collector",
+    }))
+}
+
+fn cmd_poawx_finality_vote(args: &[String]) -> Result<(), String> {
+    let v = finality_vote_json(args)?;
+    println!(
+        "{}",
+        serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?
+    );
+    eprintln!("[finality-vote] real secp256k1 vote; testnet/devnet only; signing key input is never echoed.");
+    Ok(())
+}
+
 /// Phase 21F: parse the shared puzzle-challenge inputs (testable). No private key.
 /// Mainnet hard-off (network_id 0).
 fn parse_puzzle_challenge(
@@ -15915,6 +16039,60 @@ mod tests {
         o
     }
 
+    fn fvote_args(v: &[&str]) -> Vec<String> {
+        let mut o = vec!["poawx-finality-vote".to_string()];
+        o.extend(v.iter().map(|s| s.to_string()));
+        o
+    }
+
+    #[test]
+    fn phase21h_finality_vote_emit_no_secret_mainnet_off() {
+        let bh = "44".repeat(32);
+        let sec = "21".repeat(32);
+        let args = fvote_args(&[
+            "--network-id",
+            "1",
+            "--target-height",
+            "10",
+            "--block-hash",
+            bh.as_str(),
+            "--vote-type",
+            "commit",
+            "--secret-hex",
+            sec.as_str(),
+        ]);
+        let v = finality_vote_json(&args).expect("vote");
+        let js = serde_json::to_string(&v).unwrap();
+        assert!(js.contains("signature"));
+        assert!(js.contains("wire_hex"));
+        assert!(js.contains("member_pubkey"));
+        // signing key (secret-hex) must NEVER appear in the output.
+        assert!(
+            !js.contains(&"21".repeat(32)),
+            "secret key must not be echoed"
+        );
+        assert!(!js.to_lowercase().contains("private"));
+        assert!(!js.to_lowercase().contains("mnemonic"));
+        // wire_hex deserializes + verifies via the node lib.
+        let wire = hex::decode(v["wire_hex"].as_str().unwrap()).unwrap();
+        let nv = irium_node_rs::poawx_finality::FinalityVoteV1::deserialize(&wire).unwrap();
+        let mut bhb = [0u8; 32];
+        bhb.copy_from_slice(&hex::decode(&bh).unwrap());
+        assert!(nv.verify(1, 10, &bhb).is_ok(), "node verifies wallet vote");
+        // mainnet hard-off.
+        let m = fvote_args(&[
+            "--network-id",
+            "0",
+            "--target-height",
+            "10",
+            "--block-hash",
+            bh.as_str(),
+            "--secret-hex",
+            sec.as_str(),
+        ]);
+        assert!(finality_vote_json(&m).is_err(), "mainnet hard-off");
+    }
+
     #[test]
     fn phase21f_puzzle_challenge_and_solve_no_secret_mainnet_off() {
         std::env::set_var("IRIUM_POAWX_PUZZLE_BITS", "4");
@@ -26526,6 +26704,12 @@ fn main() {
         }
         "poawx-puzzle-solve" => {
             if let Err(e) = cmd_poawx_puzzle_solve(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        "poawx-finality-vote" => {
+            if let Err(e) = cmd_poawx_finality_vote(&args) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
