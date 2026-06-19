@@ -4382,7 +4382,7 @@ fn candidate_admission_json(args: &[String]) -> Result<serde_json::Value, String
         "admission_digest": hex::encode(adm.digest),
         "true_vrf": v2.is_some(),
         "wire_hex": hex::encode(adm.serialize()),
-        "note": "testnet/devnet only; with --secret-hex a true-VRF AssignmentProofV2 is bound (secret never echoed); POST wire_hex to /poawx/candidate-admission",
+        "note": "testnet/devnet only; provide a VRF key to bind a true-VRF AssignmentProofV2 (the key is input-only and never echoed); POST wire_hex to /poawx/candidate-admission",
     }))
 }
 
