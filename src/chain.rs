@@ -864,6 +864,9 @@ impl ChainState {
         if crate::poawx_puzzle::puzzle_work_enforced(expected_height) {
             self.validate_block_puzzle_proofs(&block, expected_height)?;
         }
+        if crate::poawx_finality::finality_committee_enforced(expected_height) {
+            self.validate_block_finality(&block, expected_height)?;
+        }
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1024,6 +1027,49 @@ impl ChainState {
             ));
         }
         events
+    }
+
+    /// Phase 21H: when finality-committee enforcement is on, every production
+    /// receipt must carry a finality proof finalizing the PARENT block
+    /// (block_hash = the block's prev_hash). The committee is the SUPPORT-role
+    /// candidates in the candidate set; the proof must use the node-authoritative
+    /// threshold and meet it with valid committee Commit votes. The SUPPORT/
+    /// finality 10% reward therefore stands only with a valid finality proof.
+    /// Fails closed. The Phase 21F FinalityWorkPlaceholder puzzle alone is NOT
+    /// sufficient when finality is required (the full committee proof is required).
+    fn validate_block_finality(&self, block: &Block, height: u64) -> Result<(), String> {
+        use crate::poawx::ROLE_SUPPORT_CONTRIBUTOR;
+        use crate::poawx_finality::finality_threshold;
+        let net = crate::activation::network_id_byte();
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let (num, den) = finality_threshold();
+        for r in receipts {
+            let ext = match &r.phase20_ext {
+                Some(e) => e,
+                None => continue,
+            };
+            let fp = ext
+                .finality_proof
+                .as_ref()
+                .ok_or_else(|| "phase21h: missing required finality proof".to_string())?;
+            let cs = ext.candidate_set.as_ref().ok_or_else(|| {
+                "phase21h: finality enforcement requires candidate set".to_string()
+            })?;
+            let committee: Vec<[u8; 20]> = cs
+                .candidates
+                .iter()
+                .filter(|c| c.role_id == ROLE_SUPPORT_CONTRIBUTOR)
+                .map(|c| c.solver_pkh)
+                .collect();
+            if fp.threshold_num != num || fp.threshold_den != den {
+                return Err("phase21h: finality threshold mismatch".to_string());
+            }
+            fp.validate(net, height, &block.header.prev_hash, &committee)?;
+        }
+        Ok(())
     }
 
     /// Phase 21F: when puzzle-work enforcement is on, every production receipt
@@ -7750,6 +7796,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         }
     }
 
@@ -8235,6 +8282,138 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK");
+    }
+
+    #[test]
+    fn phase21h_finality_enforcement() {
+        use crate::poawx::ROLE_SUPPORT_CONTRIBUTOR;
+        use crate::poawx_candidate::{CandidateSet, RoleCandidate};
+        use crate::poawx_finality::{
+            finality_committee_enforced, FinalityProofV1, FinalityVoteType, FinalityVoteV1,
+        };
+        use crate::poawx_penalty::PenaltyStatus;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "2");
+        std::env::set_var("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "3");
+        assert!(finality_committee_enforced(1), "enforced on testnet");
+
+        let net = crate::activation::network_id_byte();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let sk = signing_key(0x41);
+        let base_ext = p20_ext(net, height, &parent_hash, 0, [0u8; 20]);
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+
+        // committee = 3 SUPPORT candidates keyed by 3 secp256k1 keys.
+        let members = [signing_key(0xA1), signing_key(0xB2), signing_key(0xC3)];
+        let mut cs = CandidateSet::new(net, height, parent_hash);
+        for (i, m) in members.iter().enumerate() {
+            cs.push(RoleCandidate::build(
+                net,
+                height,
+                &parent_hash,
+                ROLE_SUPPORT_CONTRIBUTOR,
+                key_hash(m),
+                [0x02u8; 33],
+                [(0x30 + i as u8); 32],
+                PenaltyStatus::Clean.id(),
+                1000,
+                [(0x40 + i as u8); 32],
+            ));
+        }
+        cs.sort_canonical();
+
+        // finality proof finalizing the parent (block_hash = prev_hash).
+        let mk_proof = |signers: usize| -> FinalityProofV1 {
+            let mut p = FinalityProofV1::new(net, height, parent_hash, [0u8; 32], 0, 2, 3);
+            for m in members.iter().take(signers) {
+                p.push(FinalityVoteV1::signed(
+                    m,
+                    net,
+                    height,
+                    parent_hash,
+                    [0u8; 32],
+                    0,
+                    [0x11u8; 32],
+                    FinalityVoteType::Commit,
+                ));
+            }
+            p.sort_canonical();
+            p
+        };
+
+        let blk = |proof: Option<FinalityProofV1>, with_cs: bool| -> Block {
+            let mut ext = base_ext.clone();
+            ext.candidate_set = if with_cs { Some(cs.clone()) } else { None };
+            ext.finality_proof = proof;
+            let mut r = receipt.clone();
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+
+        let st = base_chain(None);
+        // 2-of-3 commit votes => threshold met => accept.
+        assert!(
+            st.validate_block_finality(&blk(Some(mk_proof(2)), true), height)
+                .is_ok(),
+            "2-of-3 finality proof accepts"
+        );
+        // 1 vote => below threshold => reject.
+        assert!(
+            st.validate_block_finality(&blk(Some(mk_proof(1)), true), height)
+                .is_err(),
+            "insufficient threshold rejects"
+        );
+        // missing finality proof => reject (placeholder/puzzle alone NOT enough).
+        assert!(
+            st.validate_block_finality(&blk(None, true), height)
+                .is_err(),
+            "missing finality proof rejects"
+        );
+        // missing candidate set (no committee source) => reject.
+        assert!(
+            st.validate_block_finality(&blk(Some(mk_proof(2)), false), height)
+                .is_err(),
+            "missing candidate set rejects"
+        );
+        // producer-weakened threshold (1/1 vs configured 2/3) => reject.
+        let mut weak = mk_proof(1);
+        weak.threshold_num = 1;
+        weak.threshold_den = 1;
+        weak.sort_canonical();
+        assert!(
+            st.validate_block_finality(&blk(Some(weak), true), height)
+                .is_err(),
+            "weakened threshold rejects"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!finality_committee_enforced(1), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_THRESHOLD_NUM");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_THRESHOLD_DEN");
     }
 
     #[test]
@@ -9164,6 +9343,7 @@ mod tests {
                 role_dominance_weights: None,
                 candidate_set: None,
                 role_puzzle_proofs: None,
+                finality_proof: None,
             }
         };
         let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {

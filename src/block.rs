@@ -985,6 +985,7 @@ mod fix2a_boundary_tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let mut r = make_receipt(7);
         r.phase20_ext = Some(ext);

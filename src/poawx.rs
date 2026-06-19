@@ -5,6 +5,7 @@
 use crate::block::Block;
 use crate::poawx_candidate::{CandidateSet, CANDIDATE_SECTION_MAGIC};
 use crate::poawx_dominance::{DOMINANCE_SECTION_MAGIC, DOMINANCE_WEIGHTS_WIRE};
+use crate::poawx_finality::{FinalityProofV1, FINALITY_SECTION_MAGIC};
 use crate::poawx_puzzle::{PuzzleSolutionV1, PUZZLE_SECTION_MAGIC, PUZZLE_SOLUTION_WIRE};
 use crate::poawx_ticket::{TicketProof, TICKET_PROOF_WIRE, TICKET_SECTION_MAGIC};
 use sha2::{Digest, Sha256};
@@ -632,6 +633,10 @@ pub struct Phase20ReceiptExt {
     /// to pre-21F). Required + validated in connect_block when the puzzle-work
     /// gate is enforced. Assigned-work proofs only; NOT chain PoW.
     pub role_puzzle_proofs: Option<[PuzzleSolutionV1; 3]>,
+    /// Phase 21H: optional finality-committee proof finalizing the parent
+    /// block (trailing FIN1 section; None => byte-identical to pre-21H).
+    /// Required + validated in connect_block when the finality gate is enforced.
+    pub finality_proof: Option<FinalityProofV1>,
 }
 
 impl Phase20ReceiptExt {
@@ -665,6 +670,7 @@ impl Phase20ReceiptExt {
                     || self.role_dominance_weights.is_some()
                     || self.candidate_set.is_some()
                     || self.role_puzzle_proofs.is_some()
+                    || self.finality_proof.is_some()
                 {
                     out.push(0);
                 }
@@ -699,6 +705,14 @@ impl Phase20ReceiptExt {
             for sol in sols.iter() {
                 out.extend_from_slice(&sol.serialize());
             }
+        }
+        // Phase 21H trailing FIN1 finality-proof section (present-only): magic +
+        // u32 length + finality-proof bytes. Absent => byte-identical to pre-21H.
+        if let Some(fp) = &self.finality_proof {
+            let body = fp.serialize();
+            out.extend_from_slice(FINALITY_SECTION_MAGIC);
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
         }
         out
     }
@@ -765,6 +779,7 @@ impl Phase20ReceiptExt {
         let mut role_dominance_weights: Option<[u64; 4]> = None;
         let mut candidate_set: Option<CandidateSet> = None;
         let mut role_puzzle_proofs: Option<[PuzzleSolutionV1; 3]> = None;
+        let mut finality_proof: Option<FinalityProofV1> = None;
         while off < raw.len() {
             need(off, 4, "trailing section magic")?;
             let magic = &raw[off..off + 4];
@@ -822,6 +837,17 @@ impl Phase20ReceiptExt {
                     off += PUZZLE_SOLUTION_WIRE;
                 }
                 role_puzzle_proofs = Some([sols[0], sols[1], sols[2]]);
+            } else if magic == FINALITY_SECTION_MAGIC {
+                if finality_proof.is_some() {
+                    return Err("phase20 ext: duplicate finality section".to_string());
+                }
+                off += 4;
+                need(off, 4, "finality section length")?;
+                let len = u32::from_le_bytes(raw[off..off + 4].try_into().expect("len 4")) as usize;
+                off += 4;
+                need(off, len, "finality section body")?;
+                finality_proof = Some(FinalityProofV1::deserialize(&raw[off..off + len])?);
+                off += len;
             } else {
                 return Err("phase20 ext: unknown trailing section magic".to_string());
             }
@@ -838,6 +864,7 @@ impl Phase20ReceiptExt {
             role_dominance_weights,
             candidate_set,
             role_puzzle_proofs,
+            finality_proof,
         })
     }
 
@@ -1796,6 +1823,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let bytes = ext.serialize();
         let ext2 = Phase20ReceiptExt::deserialize(&bytes).expect("deserialize");
@@ -1909,6 +1937,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let none = base();
         let mut some = base();
@@ -1949,6 +1978,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let proofs = [
             TicketProof::new(
@@ -2014,6 +2044,80 @@ mod tests {
     }
 
     #[test]
+    fn phase21h_ext_finality_section_roundtrip_backward_compatible() {
+        use crate::poawx_finality::{FinalityProofV1, FinalityVoteType, FinalityVoteV1};
+        let prev = [0x44u8; 32];
+        let base = || Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+            candidate_set: None,
+            role_puzzle_proofs: None,
+            finality_proof: None,
+        };
+        let sk = k256::ecdsa::SigningKey::from_slice(&[0x21u8; 32]).unwrap();
+        let mut fp = FinalityProofV1::new(1, 60, prev, [0u8; 32], 0, 1, 1);
+        fp.push(FinalityVoteV1::signed(
+            &sk,
+            1,
+            60,
+            prev,
+            [0u8; 32],
+            0,
+            [0x11u8; 32],
+            FinalityVoteType::Commit,
+        ));
+        fp.sort_canonical();
+        // (1) absent => no FIN1 magic, byte-identical, round-trips.
+        let none = base();
+        let nb = none.serialize();
+        assert!(
+            nb.windows(4)
+                .all(|w| w != &crate::poawx_finality::FINALITY_SECTION_MAGIC[..]),
+            "no FIN1 magic when absent"
+        );
+        assert_eq!(Phase20ReceiptExt::deserialize(&nb).unwrap(), none);
+        // (2) present => round-trips and changes the ext digest.
+        let mut p = base();
+        p.finality_proof = Some(fp.clone());
+        assert_eq!(Phase20ReceiptExt::deserialize(&p.serialize()).unwrap(), p);
+        assert_ne!(
+            none.digest(),
+            p.digest(),
+            "finality section changes ext digest"
+        );
+        // (3) mutation changes the ext digest.
+        let mut p2 = base();
+        let mut fp2 = fp.clone();
+        fp2.votes[0].signature[0] ^= 1;
+        p2.finality_proof = Some(fp2);
+        assert_ne!(
+            p.digest(),
+            p2.digest(),
+            "finality mutation changes ext digest"
+        );
+        // (4) finality together with candidate set + puzzle round-trips.
+        let mut all = base();
+        all.role_dominance_weights = Some([1000, 900, 800, 700]);
+        all.finality_proof = Some(fp);
+        let ab = all.serialize();
+        assert!(ab
+            .windows(4)
+            .any(|w| w == &crate::poawx_finality::FINALITY_SECTION_MAGIC[..]));
+        assert_eq!(Phase20ReceiptExt::deserialize(&ab).unwrap(), all);
+    }
+
+    #[test]
     fn phase21f_ext_puzzle_section_roundtrip_backward_compatible() {
         use crate::poawx_puzzle::{PuzzleSolutionV1, PUZZLE_SECTION_MAGIC};
         let prev = [0x44u8; 32];
@@ -2033,6 +2137,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let sol = |m: u8, n: u64, t: u8| PuzzleSolutionV1 {
             mode: m,
@@ -2097,6 +2202,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let mut cs = CandidateSet::new(1, 60, prev);
         cs.push(RoleCandidate::build(
@@ -2167,6 +2273,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         let weights = [1000u64, 800, 900, 950];
         // (1) absent => no DOM1 magic, byte-identical, round-trips.
@@ -2264,6 +2371,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
         // no-ext v3 element == v2 element + a single 0 flag byte (present-only).
         let r = make_test_receipt(9);
@@ -2303,6 +2411,7 @@ mod tests {
             role_dominance_weights: None,
             candidate_set: None,
             role_puzzle_proofs: None,
+            finality_proof: None,
         };
 
         // Base mode-0 receipt with a production extension attached.
