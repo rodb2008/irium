@@ -1280,6 +1280,14 @@ pub fn irx1_root_from_block_receipts_gated(
     outer.finalize().into()
 }
 
+/// Process-global lock serialising all PoAW-X lib tests that mutate global env
+/// (IRIUM_NETWORK etc.) so the parallel `cargo test --lib poawx` run is race-free.
+#[cfg(test)]
+pub(crate) fn poawx_test_env_lock() -> &'static std::sync::Mutex<()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

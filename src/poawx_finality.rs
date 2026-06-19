@@ -912,6 +912,9 @@ mod tests {
 
     #[test]
     fn finality_gossip_cache_ingest_dedupe_window_prune() {
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_NETWORK", "testnet");
         std::env::set_var("IRIUM_POAWX_FINALITY_GOSSIP_ACTIVATION_HEIGHT", "1");
         let net = network_id_byte();

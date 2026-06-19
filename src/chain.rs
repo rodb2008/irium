@@ -6557,8 +6557,10 @@ mod tests {
     }
 
     fn chain_poawx_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        // Phase 21J: delegate to the single crate-wide PoAW-X test env lock so
+        // chain + poawx-module env-mutating tests serialise together (race-free
+        // under the full parallel `cargo test --lib`).
+        crate::poawx::poawx_test_env_lock()
     }
 
     fn make_poawx_test_block(coinbase_script: Vec<u8>) -> Block {

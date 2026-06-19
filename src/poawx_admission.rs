@@ -414,6 +414,9 @@ mod tests {
 
     #[test]
     fn cache_ingest_dedupe_window_and_root() {
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_NETWORK", "testnet");
         std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1");
         let net = network_id_byte();

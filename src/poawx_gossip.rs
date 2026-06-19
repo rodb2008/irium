@@ -479,8 +479,7 @@ mod tests {
 
     // env-mutating tests serialize on this lock (IRIUM_NETWORK etc.).
     fn env_lock() -> &'static Mutex<()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
+        crate::poawx::poawx_test_env_lock()
     }
 
     fn enable() {
