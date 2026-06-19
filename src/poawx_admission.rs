@@ -238,8 +238,14 @@ impl CandidateAdmissionV1 {
         if self.target_height != target_height {
             return Err("candidate admission: wrong height".to_string());
         }
-        self.candidate
-            .validate_self(self.network_id, self.target_height, &self.seed)?;
+        // Phase 22E: candidate self-consistency -- under the true-VRF gate the digest
+        // is the VRF output (verified below), so check scoring only.
+        if true_vrf_active(self.target_height) {
+            self.candidate.validate_scoring()?;
+        } else {
+            self.candidate
+                .validate_self(self.network_id, self.target_height, &self.seed)?;
+        }
         // Phase 22E: under the true-VRF gate the admission MUST carry a valid V2
         // proof bound to the candidate (the V1 placeholder is not accepted).
         if true_vrf_active(self.target_height) {
@@ -467,6 +473,13 @@ mod tests {
 
     #[test]
     fn admission_wire_roundtrip_and_digest_sensitivity() {
+        // Gate-off path: serialize vs the V2 tests and ensure the true-VRF gate is
+        // off so a V1 admission validates deterministically.
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
         let seed = [0x22u8; 32];
         let a = CandidateAdmissionV1::new(1, 10, seed, cand(1, [0xC1u8; 20], 0x11, &seed));
         let b = a.serialize();

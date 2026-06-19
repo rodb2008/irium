@@ -345,24 +345,25 @@ impl RoleCandidate {
         target_height: u64,
         seed: &[u8; 32],
     ) -> Result<(), String> {
-        // Under the true-VRF gate, assignment_proof_digest carries the VRF output
-        // (not the V1 placeholder hash); the VRF binding is verified via the
-        // AssignmentProofV2 at admission ingest and block acceptance, so skip the
-        // placeholder recompute here. Penalty + effective-score checks still apply.
-        if !true_vrf_active(target_height) {
-            let expect_digest = compute_assignment_proof_digest(
-                network_id,
-                target_height,
-                self.role_id,
-                &self.solver_pkh,
-                &self.assignment_public_key,
-                &self.ticket_digest,
-                seed,
-            );
-            if expect_digest != self.assignment_proof_digest {
-                return Err("candidate: assignment proof digest mismatch".to_string());
-            }
+        let expect_digest = compute_assignment_proof_digest(
+            network_id,
+            target_height,
+            self.role_id,
+            &self.solver_pkh,
+            &self.assignment_public_key,
+            &self.ticket_digest,
+            seed,
+        );
+        if expect_digest != self.assignment_proof_digest {
+            return Err("candidate: assignment proof digest mismatch".to_string());
         }
+        self.validate_scoring()
+    }
+
+    /// Phase 22E: penalty + effective-score consistency only (no assignment-proof
+    /// digest recompute). Used under the true-VRF gate, where assignment_proof_digest
+    /// is the VRF output (verified via AssignmentProofV2), not the V1 placeholder.
+    pub fn validate_scoring(&self) -> Result<(), String> {
         let ps =
             PenaltyStatus::from_id(self.penalty_status).ok_or("candidate: bad penalty status")?;
         if self.penalty_weight != ps.weight_multiplier_permille() as u64 {

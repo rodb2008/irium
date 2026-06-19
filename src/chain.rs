@@ -1367,7 +1367,14 @@ impl ChainState {
                 return Err("phase21d: candidate set not canonical".to_string());
             }
             for cand in &cs.candidates {
-                cand.validate_self(net, height, &cs.seed)?;
+                // Phase 22E: under the true-VRF gate the candidate digest is the VRF
+                // output (verified via the AVR2 section), so check scoring only;
+                // otherwise recompute the V1 placeholder digest.
+                if crate::poawx_candidate::true_vrf_active(height) {
+                    cand.validate_scoring()?;
+                } else {
+                    cand.validate_self(net, height, &cs.seed)?;
+                }
                 if dom_active {
                     let expect =
                         self.dominance
