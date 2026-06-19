@@ -8468,6 +8468,80 @@ mod tests {
     }
 
     #[test]
+    fn phase22e_wrong_candidate_score_rejects() {
+        // (26) a block whose candidate digest does NOT equal the VRF output is rejected
+        // by validate_block_true_vrf, even with a self-valid AVR2 proof attached.
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_candidate::{AssignmentProofV2, CandidateSet, RoleCandidate};
+        use crate::poawx_penalty::PenaltyStatus;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1");
+        let net = crate::activation::network_id_byte();
+        let height = 1u64;
+        let seed = [0x44u8; 32];
+        let sk = test_signing_key();
+        let base_ext = p20_ext(net, height, &seed, 0, [0u8; 20]);
+        let receipt = make_test_receipt(height, &sk, seed, 1);
+        let mk = |secret: u8,
+                  role: u8,
+                  solver: [u8; 20],
+                  ticket: [u8; 32]|
+         -> (AssignmentProofV2, RoleCandidate) {
+            let p =
+                AssignmentProofV2::prove(&[secret; 32], net, height, role, solver, ticket, seed)
+                    .expect("v2 prove");
+            let c =
+                RoleCandidate::from_assignment_v2(&p, PenaltyStatus::Clean.id(), 1000, [role; 32]);
+            (p, c)
+        };
+        let (pc, mut cc) = mk(7, ROLE_COMPUTE_CONTRIBUTOR, [0xC1u8; 20], [0x11u8; 32]);
+        let (pv, cv) = mk(8, ROLE_VERIFY_CONTRIBUTOR, [0xC2u8; 20], [0x12u8; 32]);
+        let (ps, csup) = mk(9, ROLE_SUPPORT_CONTRIBUTOR, [0xC3u8; 20], [0x13u8; 32]);
+        // tamper: candidate digest no longer equals the VRF output.
+        cc.assignment_proof_digest[0] ^= 1;
+        let mut cs = CandidateSet::new(net, height, seed);
+        for c in [cc, cv, csup] {
+            cs.push(c);
+        }
+        cs.sort_canonical();
+        let mut ext = base_ext.clone();
+        ext.role_reward.compute_contributor_pkh = [0xC1u8; 20];
+        ext.role_reward.verify_contributor_pkh = [0xC2u8; 20];
+        ext.role_reward.support_contributor_pkh = [0xC3u8; 20];
+        ext.candidate_set = Some(cs);
+        ext.role_assignment_v2 = Some([pc, pv, ps]);
+        let mut r = receipt.clone();
+        r.phase20_ext = Some(ext);
+        let blk = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: seed,
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![r]),
+        };
+        let st = base_chain(None);
+        assert!(
+            st.validate_block_true_vrf(&blk, height).is_err(),
+            "candidate score not derived from VRF output -> reject"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
+    }
+
+    #[test]
     fn phase22e_true_vrf_e2e_block() {
         // End-to-end: with candidate-set + admission + true-VRF ALL enforced, a block
         // carrying V2 candidates (digest = VRF output) + the AVR2 section must satisfy
