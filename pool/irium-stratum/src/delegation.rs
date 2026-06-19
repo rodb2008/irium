@@ -2004,6 +2004,82 @@ pub fn build_pool_candidate_set(
 /// candidates (fetched via loopback RPC) so it matches what the node validates.
 /// The node remains authoritative; the pool is one interface, not the owner.
 pub const CANDIDATE_ADMISSION_WIRE: usize = 1 + 1 + 8 + 32 + 175 + 32; // 249
+/// Phase 22E: admission wire length with a trailing true-VRF proof appended.
+pub const CANDIDATE_ADMISSION_V2_WIRE: usize = CANDIDATE_ADMISSION_WIRE + ASSIGNMENT_PROOF_V2_WIRE;
+
+/// Phase 22E: decode one admission wire (hex) -> (height, seed, role, solver, V2
+/// proof) when it carries a trailing true-VRF proof. None on malformed / V1-only.
+pub fn decode_admission_v2(
+    hexstr: &str,
+) -> Option<(u64, [u8; 32], u8, [u8; 20], AssignmentProofV2Mirror)> {
+    let bytes = hex::decode(hexstr.trim()).ok()?;
+    if bytes.len() != CANDIDATE_ADMISSION_V2_WIRE || bytes[0] != 1 {
+        return None;
+    }
+    let mut hb = [0u8; 8];
+    hb.copy_from_slice(&bytes[2..10]);
+    let height = u64::from_le_bytes(hb);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes[10..42]);
+    let cand = RoleCandidateMirror::deserialize(&bytes[42..42 + 175]).ok()?;
+    let proof = AssignmentProofV2Mirror::deserialize(
+        &bytes[CANDIDATE_ADMISSION_WIRE..CANDIDATE_ADMISSION_V2_WIRE],
+    )
+    .ok()?;
+    Some((height, seed, cand.role_id, cand.solver_pkh, proof))
+}
+
+/// Phase 22E: map (role_id, solver_pkh) -> admitted true-VRF proof for (height,
+/// seed). The pool bundles these; it never verifies or fabricates them.
+pub fn build_admitted_v2_proofs(
+    hexes: &[String],
+    height: u64,
+    seed: &[u8; 32],
+) -> BTreeMap<(u8, [u8; 20]), AssignmentProofV2Mirror> {
+    let mut m: BTreeMap<(u8, [u8; 20]), AssignmentProofV2Mirror> = BTreeMap::new();
+    for h in hexes {
+        if let Some((hh, ss, role, solver, proof)) = decode_admission_v2(h) {
+            if hh == height && &ss == seed {
+                m.insert((role, solver), proof);
+            }
+        }
+    }
+    m
+}
+
+/// Phase 22E: build the AVR2 section [compute, verify, support] for a produced ext
+/// from the pool admitted cache, using the proofs of the SELECTED candidates. None
+/// (fail closed) if any selected role lacks an admitted V2 proof. The pool only
+/// bundles miner-supplied proofs; it never signs or generates VRF proofs.
+pub fn build_pool_true_vrf_section(
+    height: u64,
+    seed: &[u8; 32],
+    role_reward: &RoleRewardMirror,
+) -> Option<[AssignmentProofV2Mirror; 3]> {
+    let hexes = pool_admitted_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&height)
+        .cloned()
+        .unwrap_or_default();
+    let map = build_admitted_v2_proofs(&hexes, height, seed);
+    let compute = map
+        .get(&(
+            ROLE_COMPUTE_CONTRIBUTOR,
+            role_reward.compute_contributor_pkh,
+        ))?
+        .clone();
+    let verify = map
+        .get(&(ROLE_VERIFY_CONTRIBUTOR, role_reward.verify_contributor_pkh))?
+        .clone();
+    let support = map
+        .get(&(
+            ROLE_SUPPORT_CONTRIBUTOR,
+            role_reward.support_contributor_pkh,
+        ))?
+        .clone();
+    Some([compute, verify, support])
+}
 
 /// Pool candidate-admission enforcement gate (mirror node).
 pub fn pool_candidate_admission_enforced(height: u64) -> bool {
@@ -2026,7 +2102,9 @@ pub fn pool_candidate_admission_enforced(height: u64) -> bool {
 /// Decode one admission wire (hex) -> (height, seed, candidate). None on malformed.
 pub fn decode_admission_candidate(hexstr: &str) -> Option<(u64, [u8; 32], RoleCandidateMirror)> {
     let bytes = hex::decode(hexstr.trim()).ok()?;
-    if bytes.len() != CANDIDATE_ADMISSION_WIRE || bytes[0] != 1 {
+    if (bytes.len() != CANDIDATE_ADMISSION_WIRE && bytes.len() != CANDIDATE_ADMISSION_V2_WIRE)
+        || bytes[0] != 1
+    {
         return None;
     }
     let mut hb = [0u8; 8];
@@ -2773,13 +2851,6 @@ pub fn build_synthetic_phase20_ext(
     if network_id == 0 || !synthetic_role_claims_enabled() {
         return None;
     }
-    // Phase 22D: the pool holds no VRF secret and never fabricates V2 proofs; under
-    // true-VRF enforcement, miner-produced proofs must be attached by the caller via
-    // attach_true_vrf_section after build. This synthetic self-test path cannot do
-    // that, so it fails closed rather than emit a node-invalid (V2-less) ext.
-    if pool_true_vrf_enforced(height) {
-        return None;
-    }
     // Fee terms: official (None) => 0/zero; third-party => only when valid (cap +
     // nonzero pkh), else fail closed to official 0%.
     let (fee_bps, fee_pkh) = match fee {
@@ -2906,6 +2977,16 @@ pub fn build_synthetic_phase20_ext(
     } else {
         None
     };
+    // Phase 22E: under true-VRF enforcement, bundle the SELECTED candidates'
+    // miner-supplied proofs from the admitted cache; fail closed if any is missing.
+    let role_assignment_v2 = if pool_true_vrf_enforced(height) {
+        match build_pool_true_vrf_section(height, prev_hash, &role_reward) {
+            Some(p) => Some(p),
+            None => return None,
+        }
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim,
@@ -2920,7 +3001,7 @@ pub fn build_synthetic_phase20_ext(
         role_puzzle_proofs,
         finality_proof,
         committed_admission,
-        role_assignment_v2: None,
+        role_assignment_v2,
     })
 }
 
@@ -3291,11 +3372,6 @@ pub fn build_collected_phase20_ext(
     if network_id == 0 || !role_protocol_enabled() {
         return None;
     }
-    // Phase 22D: fail closed under true-VRF enforcement (pool fabricates no proofs;
-    // miner proofs are attached post-build via attach_true_vrf_section).
-    if pool_true_vrf_enforced(height) {
-        return None;
-    }
     let reveals = store.select_reveals(height)?;
     let next_root = store.precommit_root_for(height + 1)?;
     let (fee_bps, fee_pkh) = match fee {
@@ -3373,6 +3449,15 @@ pub fn build_collected_phase20_ext(
     } else {
         None
     };
+    // Phase 22E: bundle SELECTED candidates' miner-supplied proofs; fail closed.
+    let role_assignment_v2 = if pool_true_vrf_enforced(height) {
+        match build_pool_true_vrf_section(height, prev_hash, &role_reward) {
+            Some(p) => Some(p),
+            None => return None,
+        }
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim: reveals[0].claim.clone(),
@@ -3387,7 +3472,7 @@ pub fn build_collected_phase20_ext(
         role_puzzle_proofs,
         finality_proof,
         committed_admission,
-        role_assignment_v2: None,
+        role_assignment_v2,
     })
 }
 
@@ -5033,6 +5118,150 @@ mod tests {
         // RoleReward pkhs extractable from the hex without full deserialize.
         let (c, v, s) = role_reward_pkhs_from_ext_hex(&hex::encode(ext.serialize())).unwrap();
         assert_eq!((c, v, s), ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]));
+    }
+
+    #[test]
+    fn phase22e_pool_e2e_bundle_and_failclosed() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1");
+        let net = network_id_from_env();
+        let height = 5u64;
+        let seed = [0x44u8; 32];
+        let primary = [0xA0u8; 20];
+
+        // Miner/wallet supplies V2 proofs; build admission wires (node lib) for the 3
+        // roles, all solver == primary (matches build_synthetic's role_reward solvers
+        // with empty workers).
+        let roles = [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ];
+        let mk_adm = |secret: u8, role: u8| -> String {
+            let proof = irium_node_rs::poawx_candidate::AssignmentProofV2::prove(
+                &[secret; 32],
+                net,
+                height,
+                role,
+                primary,
+                [role; 32],
+                seed,
+            )
+            .unwrap();
+            let cand = irium_node_rs::poawx_candidate::RoleCandidate::from_assignment_v2(
+                &proof,
+                irium_node_rs::poawx_penalty::PenaltyStatus::Clean.id(),
+                1000,
+                [role; 32],
+            );
+            let adm = irium_node_rs::poawx_admission::CandidateAdmissionV1::new_with_v2(
+                net,
+                height,
+                seed,
+                cand,
+                Some(proof),
+            );
+            hex::encode(adm.serialize())
+        };
+        let hexes: Vec<String> = roles
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| mk_adm(7 + i as u8, r))
+            .collect();
+
+        // (17) pool extracts the admitted V2 proofs.
+        let proofs = build_admitted_v2_proofs(&hexes, height, &seed);
+        assert_eq!(proofs.len(), 3, "3 admitted V2 proofs extracted");
+        // (18) pool builds a candidate set whose digests are the VRF outputs (score
+        // derives from the VRF output).
+        let cs = build_admitted_candidate_set(&hexes, net, height, &seed).expect("cs");
+        assert_eq!(cs.candidates.len(), 3);
+        for c in &cs.candidates {
+            let p = proofs.get(&(c.role_id, c.solver_pkh)).unwrap();
+            assert_eq!(
+                c.assignment_proof_digest, p.vrf_output,
+                "candidate digest == VRF output"
+            );
+        }
+
+        // Populate the pool admitted cache (as refresh_pool_admitted_cache would).
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(height, hexes.clone());
+
+        let rr = RoleRewardMirror {
+            compute_contributor_pkh: primary,
+            verify_contributor_pkh: primary,
+            support_contributor_pkh: primary,
+        };
+        // (19) pool builds the AVR2 section for the selected candidates.
+        assert!(
+            build_pool_true_vrf_section(height, &seed, &rr).is_some(),
+            "AVR2 section built"
+        );
+
+        // (21) official fee-0 production attaches AVR2; node deserializes the bytes.
+        let off = build_synthetic_phase20_ext(net, height, &seed, &primary, &[], None)
+            .expect("official ext");
+        assert_eq!(off.fee_bps, 0, "official fee-0");
+        let v2 = off
+            .role_assignment_v2
+            .as_ref()
+            .expect("AVR2 attached (official)");
+        assert_eq!(v2.len(), 3);
+        let node_off =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&off.serialize()).unwrap();
+        assert!(
+            node_off.role_assignment_v2.is_some(),
+            "node parses AVR2 (official)"
+        );
+        // (22) third-party fee production also attaches AVR2 and preserves the fee.
+        let tp = build_synthetic_phase20_ext(
+            net,
+            height,
+            &seed,
+            &primary,
+            &[],
+            Some((100, [0xFEu8; 20])),
+        )
+        .expect("third-party ext");
+        assert_eq!(tp.fee_bps, 100, "third-party fee preserved");
+        assert!(
+            tp.role_assignment_v2.is_some(),
+            "AVR2 attached (third-party)"
+        );
+
+        // (20) fail-closed: drop one role's proof -> builder emits nothing.
+        let missing: Vec<String> = hexes[..2].to_vec();
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(height, missing);
+        assert!(
+            build_pool_true_vrf_section(height, &seed, &rr).is_none(),
+            "fail closed (missing proof)"
+        );
+        assert!(
+            build_synthetic_phase20_ext(net, height, &seed, &primary, &[], None).is_none(),
+            "synthetic builder fails closed when a selected V2 proof is missing"
+        );
+
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
     }
 
     #[test]
