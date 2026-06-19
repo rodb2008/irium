@@ -547,6 +547,8 @@ pub const VRF_PROOF_WIRE: usize = 81;
 pub const ASSIGNMENT_PROOF_V2_WIRE: usize =
     1 + 1 + 8 + 1 + 20 + 33 + 32 + 32 + 32 + VRF_PROOF_WIRE + 32; // 273
 const ASSIGNMENT_V2_DOMAIN: &[u8] = b"IRIUM_POAWX_ASSIGNMENT_PROOF_V2";
+/// 4-byte trailing-section magic for the V2 assignment proofs in the Phase 20 ext.
+pub const ASSIGNMENT_V2_SECTION_MAGIC: &[u8; 4] = b"AVR2";
 const VRF_MESSAGE_DOMAIN: &[u8] = b"IRIUM_POAWX_VRF_MESSAGE_V2";
 
 fn vrf_bincode_config() -> impl bincode::config::Config {

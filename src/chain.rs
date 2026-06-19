@@ -870,6 +870,9 @@ impl ChainState {
         if crate::poawx_committed_admission::committed_admission_enforced(expected_height) {
             self.validate_block_committed_admission(&block, previous, expected_height)?;
         }
+        if crate::poawx_candidate::true_vrf_enforced(expected_height) {
+            self.validate_block_true_vrf(&block, expected_height)?;
+        }
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1246,6 +1249,86 @@ impl ChainState {
                     );
                 }
                 // activation-height grace: the parent predates the gate.
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 22D: when the true-VRF gate is enforced, every production receipt
+    /// must carry per-role AssignmentProofV2 (real secp256k1 RFC 9381 ECVRF) for
+    /// the SELECTED candidates -- the V1 placeholder is NOT accepted. Each V2
+    /// proof is VRF-verified and bound to its role's selected candidate (role,
+    /// solver, ticket digest, assignment public key, candidate-set seed), and the
+    /// candidate's assignment_proof_digest must equal the V2 VRF output (so the
+    /// effective score derives from the VRF output). Fails closed.
+    fn validate_block_true_vrf(&self, block: &Block, height: u64) -> Result<(), String> {
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        let net = crate::activation::network_id_byte();
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        for r in receipts {
+            let ext = match &r.phase20_ext {
+                Some(e) => e,
+                None => continue,
+            };
+            let proofs = ext.role_assignment_v2.as_ref().ok_or_else(|| {
+                "phase22d: missing required V2 assignment proofs (V1 not accepted)".to_string()
+            })?;
+            let cs = ext
+                .candidate_set
+                .as_ref()
+                .ok_or_else(|| "phase22d: true-VRF requires a candidate set".to_string())?;
+            let roles = [
+                (
+                    0usize,
+                    ROLE_COMPUTE_CONTRIBUTOR,
+                    ext.role_reward.compute_contributor_pkh,
+                ),
+                (
+                    1usize,
+                    ROLE_VERIFY_CONTRIBUTOR,
+                    ext.role_reward.verify_contributor_pkh,
+                ),
+                (
+                    2usize,
+                    ROLE_SUPPORT_CONTRIBUTOR,
+                    ext.role_reward.support_contributor_pkh,
+                ),
+            ];
+            for (i, role, sel) in roles {
+                let cand = cs
+                    .best_for_role(role)
+                    .ok_or_else(|| format!("phase22d: no candidate for role {}", role))?;
+                if cand.solver_pkh != sel {
+                    return Err(format!(
+                        "phase22d: role {} selected != best candidate",
+                        role
+                    ));
+                }
+                let pr = &proofs[i];
+                pr.validate(net, height)?;
+                if pr.role_id != role {
+                    return Err("phase22d: v2 proof wrong role".to_string());
+                }
+                if pr.solver_pkh != cand.solver_pkh {
+                    return Err("phase22d: v2 proof wrong solver".to_string());
+                }
+                if pr.ticket_digest != cand.ticket_digest {
+                    return Err("phase22d: v2 proof wrong ticket digest".to_string());
+                }
+                if pr.assignment_public_key != cand.assignment_public_key {
+                    return Err("phase22d: v2 proof wrong assignment key".to_string());
+                }
+                if pr.seed != cs.seed {
+                    return Err("phase22d: v2 proof wrong seed".to_string());
+                }
+                if pr.vrf_output != cand.assignment_proof_digest {
+                    return Err("phase22d: candidate score not derived from VRF output".to_string());
+                }
             }
         }
         Ok(())
@@ -7896,6 +7979,7 @@ mod tests {
             role_puzzle_proofs: None,
             finality_proof: None,
             committed_admission: None,
+            role_assignment_v2: None,
         }
     }
 
@@ -8381,6 +8465,134 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK");
+    }
+
+    #[test]
+    fn phase22d_true_vrf_enforcement() {
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_candidate::{
+            assignment_v2_score_from_output, effective_score, true_vrf_enforced, AssignmentProofV2,
+            CandidateSet, RoleCandidate,
+        };
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1");
+        assert!(true_vrf_enforced(1), "enforced on testnet");
+
+        let net = crate::activation::network_id_byte();
+        let sk = test_signing_key();
+        let height = 1u64;
+        let seed = [0x44u8; 32]; // candidate-set seed
+        let base_ext = p20_ext(net, height, &seed, 0, [0u8; 20]);
+        let receipt = make_test_receipt(height, &sk, seed, 1);
+
+        // For each role: a real V2 proof + a candidate whose assignment_proof_digest is
+        // the VRF output (so the score derives from the VRF output).
+        let mk = |secret: u8,
+                  role: u8,
+                  solver: [u8; 20],
+                  ticket: [u8; 32]|
+         -> (AssignmentProofV2, RoleCandidate) {
+            let pr =
+                AssignmentProofV2::prove(&[secret; 32], net, height, role, solver, ticket, seed)
+                    .expect("v2 prove");
+            let dw = 1000u64;
+            let pw = 1000u64;
+            let es = effective_score(assignment_v2_score_from_output(&pr.vrf_output), dw, pw);
+            let cand = RoleCandidate {
+                role_id: role,
+                solver_pkh: solver,
+                assignment_public_key: pr.assignment_public_key,
+                ticket_digest: ticket,
+                penalty_status: 0,
+                assignment_proof_digest: pr.vrf_output,
+                dominance_weight: dw,
+                penalty_weight: pw,
+                effective_score: es,
+                role_claim_digest: [role; 32],
+            };
+            (pr, cand)
+        };
+        let (pc, cc) = mk(7, ROLE_COMPUTE_CONTRIBUTOR, [0xC1u8; 20], [0x11u8; 32]);
+        let (pv, cv) = mk(8, ROLE_VERIFY_CONTRIBUTOR, [0xC2u8; 20], [0x12u8; 32]);
+        let (ps, csup) = mk(9, ROLE_SUPPORT_CONTRIBUTOR, [0xC3u8; 20], [0x13u8; 32]);
+        let mut cs = CandidateSet::new(net, height, seed);
+        for c in [cc, cv, csup] {
+            cs.push(c);
+        }
+        cs.sort_canonical();
+        let proofs = [pc.clone(), pv.clone(), ps.clone()];
+
+        let blk = |v2: Option<[AssignmentProofV2; 3]>, with_cs: bool| -> Block {
+            let mut ext = base_ext.clone();
+            ext.role_reward.compute_contributor_pkh = [0xC1u8; 20];
+            ext.role_reward.verify_contributor_pkh = [0xC2u8; 20];
+            ext.role_reward.support_contributor_pkh = [0xC3u8; 20];
+            ext.candidate_set = if with_cs { Some(cs.clone()) } else { None };
+            ext.role_assignment_v2 = v2;
+            let mut r = receipt.clone();
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: seed,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+
+        let st = base_chain(None);
+        // valid V2 accepts.
+        assert!(
+            st.validate_block_true_vrf(&blk(Some(proofs.clone()), true), height)
+                .is_ok(),
+            "valid V2 proofs accept"
+        );
+        // V1-only (no V2 section) rejects under V2-required.
+        assert!(
+            st.validate_block_true_vrf(&blk(None, true), height)
+                .is_err(),
+            "missing V2 proofs reject (V1 not accepted)"
+        );
+        // missing candidate set rejects.
+        assert!(
+            st.validate_block_true_vrf(&blk(Some(proofs.clone()), false), height)
+                .is_err(),
+            "missing candidate set rejects"
+        );
+        // mutated VRF proof rejects (digest mismatch and/or VRF-verify failure).
+        let mut bad = proofs.clone();
+        bad[0].vrf_proof[0] ^= 1;
+        assert!(
+            st.validate_block_true_vrf(&blk(Some(bad), true), height)
+                .is_err(),
+            "mutated VRF proof rejects"
+        );
+        // wrong height rejects.
+        assert!(
+            st.validate_block_true_vrf(&blk(Some(proofs.clone()), true), height + 1)
+                .is_err(),
+            "wrong height rejects"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!true_vrf_enforced(1), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
     }
 
     #[test]
@@ -9648,6 +9860,7 @@ mod tests {
                 role_puzzle_proofs: None,
                 finality_proof: None,
                 committed_admission: None,
+                role_assignment_v2: None,
             }
         };
         let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {
