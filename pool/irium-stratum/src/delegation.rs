@@ -1237,6 +1237,9 @@ pub struct Phase20ReceiptExtMirror {
     /// Phase 21H: optional bundled finality proof (trailing FIN1 section;
     /// None => byte-identical to pre-21H).
     pub finality_proof: Option<FinalityProofMirror>,
+    /// Phase 22A: optional committed admission for the next height (CAC1
+    /// section; None => byte-identical to pre-22A).
+    pub committed_admission: Option<AdmissionCommitmentMirror>,
 }
 
 impl Phase20ReceiptExtMirror {
@@ -1268,6 +1271,7 @@ impl Phase20ReceiptExtMirror {
                     || self.candidate_set.is_some()
                     || self.role_puzzle_proofs.is_some()
                     || self.finality_proof.is_some()
+                    || self.committed_admission.is_some()
                 {
                     out.push(0);
                 }
@@ -1304,6 +1308,10 @@ impl Phase20ReceiptExtMirror {
             out.extend_from_slice(FINALITY_SECTION_MAGIC);
             out.extend_from_slice(&(body.len() as u32).to_le_bytes());
             out.extend_from_slice(&body);
+        }
+        if let Some(ca) = &self.committed_admission {
+            out.extend_from_slice(COMMITTED_ADMISSION_SECTION_MAGIC);
+            out.extend_from_slice(&ca.serialize());
         }
         out
     }
@@ -2504,6 +2512,123 @@ pub fn build_pool_finality_proof(
     })
 }
 
+/// ── Phase 22A: chain-committed admission (pool mirror) ──────────────────────
+/// Byte-identical mirror of node AdmissionCommitmentV1 so the pool can build the
+/// committed-admission root the node validates. The pool builds it from its admitted
+/// cache (21E); the node re-validates everything.
+pub const COMMITTED_ADMISSION_SECTION_MAGIC: &[u8; 4] = b"CAC1";
+pub const ADMISSION_COMMITMENT_WIRE: usize = 1 + 1 + 8 + 8 + 32 + 32 + 2 + 8 + 32; // 124
+const COMMITMENT_DOMAIN: &[u8] = b"IRIUM_POAWX_ADMISSION_COMMITMENT_V1";
+pub const DEFAULT_COMMITTED_ADMISSION_WINDOW: u64 = 64;
+
+pub fn committed_admission_window() -> u64 {
+    env::var("IRIUM_POAWX_COMMITTED_ADMISSION_WINDOW")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|w| *w >= 1)
+        .unwrap_or(DEFAULT_COMMITTED_ADMISSION_WINDOW)
+}
+
+/// Pool committed-admission enforcement gate (mirror node).
+pub fn pool_committed_admission_enforced(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false;
+    }
+    let active = match env::var("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    };
+    let required = env::var("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    active && required
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionCommitmentMirror {
+    pub network_id: u8,
+    pub target_height: u64,
+    pub commit_height: u64,
+    pub seed: [u8; 32],
+    pub candidate_admission_root: [u8; 32],
+    pub candidate_count: u16,
+    pub window_id: u64,
+    pub digest: [u8; 32],
+}
+
+impl AdmissionCommitmentMirror {
+    pub fn from_candidate_set(cs: &CandidateSetMirror, commit_height: u64) -> Self {
+        let network_id = cs.network_id;
+        let target_height = cs.target_height;
+        let seed = cs.seed;
+        let candidate_admission_root = cs.root();
+        let candidate_count = cs.candidates.len().min(u16::MAX as usize) as u16;
+        let window_id = target_height / committed_admission_window();
+        let mut h = Sha256::new();
+        h.update(COMMITMENT_DOMAIN);
+        h.update([1u8]); // version
+        h.update([network_id]);
+        h.update(target_height.to_le_bytes());
+        h.update(commit_height.to_le_bytes());
+        h.update(seed);
+        h.update(candidate_admission_root);
+        h.update(candidate_count.to_le_bytes());
+        h.update(window_id.to_le_bytes());
+        let digest: [u8; 32] = h.finalize().into();
+        Self {
+            network_id,
+            target_height,
+            commit_height,
+            seed,
+            candidate_admission_root,
+            candidate_count,
+            window_id,
+            digest,
+        }
+    }
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut o = Vec::with_capacity(ADMISSION_COMMITMENT_WIRE);
+        o.push(1u8); // version
+        o.push(self.network_id);
+        o.extend_from_slice(&self.target_height.to_le_bytes());
+        o.extend_from_slice(&self.commit_height.to_le_bytes());
+        o.extend_from_slice(&self.seed);
+        o.extend_from_slice(&self.candidate_admission_root);
+        o.extend_from_slice(&self.candidate_count.to_le_bytes());
+        o.extend_from_slice(&self.window_id.to_le_bytes());
+        o.extend_from_slice(&self.digest);
+        o
+    }
+}
+
+/// Build the committed admission for `target` (= commit_height+1) from the pool
+/// admitted cache (21E), freeze seed = `seed`. None if no admitted candidates
+/// (caller fails closed).
+pub fn build_pool_committed_admission(
+    network_id: u8,
+    target: u64,
+    seed: &[u8; 32],
+) -> Option<AdmissionCommitmentMirror> {
+    let cs = build_admitted_candidate_set(
+        &pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&target)
+            .cloned()
+            .unwrap_or_default(),
+        network_id,
+        target,
+        seed,
+    )?;
+    Some(AdmissionCommitmentMirror::from_candidate_set(
+        &cs,
+        target.saturating_sub(1),
+    ))
+}
+
 pub fn build_synthetic_phase20_ext(
     network_id: u8,
     height: u64,
@@ -2631,6 +2756,16 @@ pub fn build_synthetic_phase20_ext(
     } else {
         None
     };
+    // Phase 22A: commit the NEXT height's admitted set (from the admitted cache)
+    // when enforced; fail closed (no ext) if it cannot be built.
+    let committed_admission = if pool_committed_admission_enforced(height) {
+        match build_pool_committed_admission(network_id, height + 1, prev_hash) {
+            Some(c) => Some(c),
+            None => return None,
+        }
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim,
@@ -2644,6 +2779,7 @@ pub fn build_synthetic_phase20_ext(
         candidate_set,
         role_puzzle_proofs,
         finality_proof,
+        committed_admission,
     })
 }
 
@@ -3081,6 +3217,16 @@ pub fn build_collected_phase20_ext(
     } else {
         None
     };
+    // Phase 22A: commit the NEXT height's admitted set (from the admitted cache)
+    // when enforced; fail closed (no ext) if it cannot be built.
+    let committed_admission = if pool_committed_admission_enforced(height) {
+        match build_pool_committed_admission(network_id, height + 1, prev_hash) {
+            Some(c) => Some(c),
+            None => return None,
+        }
+    } else {
+        None
+    };
     Some(Phase20ReceiptExtMirror {
         role_reward,
         compute_claim: reveals[0].claim.clone(),
@@ -3094,6 +3240,7 @@ pub fn build_collected_phase20_ext(
         candidate_set,
         role_puzzle_proofs,
         finality_proof,
+        committed_admission,
     })
 }
 
@@ -4708,6 +4855,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
             role_reward: node_rr,
@@ -4722,6 +4870,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         assert_eq!(
             ext.serialize(),
@@ -4735,6 +4884,100 @@ mod tests {
         // RoleReward pkhs extractable from the hex without full deserialize.
         let (c, v, s) = role_reward_pkhs_from_ext_hex(&hex::encode(ext.serialize())).unwrap();
         assert_eq!((c, v, s), ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]));
+    }
+
+    #[test]
+    fn phase22a_pool_committed_admission_parity_and_failclosed() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1");
+        let net = network_id_from_env();
+        assert!(pool_committed_admission_enforced(5), "enforced on testnet");
+        assert!(
+            !pool_committed_admission_enforced(0),
+            "below activation off"
+        );
+
+        let target = 5u64;
+        let seed = [0x44u8; 32];
+        use irium_node_rs::poawx_admission::CandidateAdmissionV1 as NAV;
+        use irium_node_rs::poawx_candidate::RoleCandidate as NRC;
+        let mk = |role: u8, solver: [u8; 20], tag: u8| {
+            NRC::build(
+                net,
+                target,
+                &seed,
+                role,
+                solver,
+                [0x02u8; 33],
+                [tag; 32],
+                0,
+                1000,
+                [tag.wrapping_add(1); 32],
+            )
+        };
+        let cands = [
+            mk(1, [0xC1u8; 20], 0x11),
+            mk(2, [0xC2u8; 20], 0x12),
+            mk(3, [0xC3u8; 20], 0x13),
+        ];
+        let hexes: Vec<String> = cands
+            .iter()
+            .map(|c| hex::encode(NAV::new(net, target, seed, c.clone()).serialize()))
+            .collect();
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(target, hexes.clone());
+
+        // pool builds the committed admission; node validates it + root parity.
+        let ca = build_pool_committed_admission(net, target, &seed).expect("commitment");
+        let node_ca = irium_node_rs::poawx_committed_admission::AdmissionCommitmentV1::deserialize(
+            &ca.serialize(),
+        )
+        .unwrap();
+        assert!(
+            node_ca.validate(net, target).is_ok(),
+            "node validates pool commitment"
+        );
+        assert_eq!(node_ca.commit_height, target - 1);
+        // node admitted set (same admissions) root == committed root (parity).
+        let cache = irium_node_rs::poawx_admission::NodeCandidateAdmissionCache::new();
+        cache.set_tip(target);
+        for hx in &hexes {
+            let _ = cache.ingest_bytes(&hex::decode(hx).unwrap());
+        }
+        let node_set = cache.admitted_candidate_set(net, target, &seed);
+        assert_eq!(
+            node_ca.candidate_admission_root,
+            node_set.root(),
+            "committed root == node admitted set root"
+        );
+        assert!(
+            node_ca.matches_candidate_set(&node_set),
+            "commitment matches node set"
+        );
+
+        // fail-closed: no admitted candidates => None.
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        assert!(
+            build_pool_committed_admission(net, target, &seed).is_none(),
+            "no admitted candidates => None"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!pool_committed_admission_enforced(5), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT");
     }
 
     #[test]
@@ -5175,6 +5418,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         // node lib reads the pool DOM1 weights back identically (wire parity).
         let node_ext =
@@ -6607,6 +6851,7 @@ mod tests {
                 candidate_set: None,
                 role_puzzle_proofs: None,
                 finality_proof: None,
+                committed_admission: None,
             };
         let fpkh = [0x7Fu8; 20];
         // Pre-6A (no precommit_root): fee parses correctly.
@@ -6721,6 +6966,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         let node_ext =
             irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
