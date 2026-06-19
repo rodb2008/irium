@@ -64,3 +64,14 @@ separate audited sr25519/Ristretto VRF key, then Option C vendor + security revi
 captured in `docs/poaw-x-phase22b-true-vrf-decision-package.md`. No code/dependency/Cargo
 change in Phase 22B (docs-only). PoAW-X is **not full blueprint-complete** until this VRF
 decision is approved and implemented; no push, no mainnet, no audit/vote.
+
+
+## Phase 22C — secp256k1 true-VRF research (Option A viable)
+
+Research found a VIABLE Option A path: `vrf_fun 0.12.1` (secp256kfun) is a pure-Rust,
+no-OpenSSL **secp256k1** RFC 9381 ECVRF that scratch-built + ran outside the repo
+(prove/verify/output deterministic; wrong-message rejected). This is a real **true VRF**
+candidate for a future `AssignmentProofV2` — but `AssignmentProofV1` remains the
+**placeholder** (no homemade VRF; **no dependency added to the repo**; **mainnet hard-off**;
+not mainnet-ready). Implementation is deferred to Phase 22D pending explicit approval +
+security review. Details: `docs/poaw-x-phase22c-secp256k1-vrf-research.md`.

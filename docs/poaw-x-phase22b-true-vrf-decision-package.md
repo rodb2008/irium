@@ -127,3 +127,14 @@ implemented + gated + tested, mainnet hard-off.
   code change (docs-only).
 - Mainnet hard-off; not mainnet-ready; no push; remote branch absent; no
   merge/PR/tag/release; mainnet/prod untouched; chain difficulty/LWMA-144 untouched.
+
+
+## Phase 22C — secp256k1 true-VRF research (Option A viable)
+
+Research found a VIABLE Option A path: `vrf_fun 0.12.1` (secp256kfun) is a pure-Rust,
+no-OpenSSL **secp256k1** RFC 9381 ECVRF that scratch-built + ran outside the repo
+(prove/verify/output deterministic; wrong-message rejected). This is a real **true VRF**
+candidate for a future `AssignmentProofV2` — but `AssignmentProofV1` remains the
+**placeholder** (no homemade VRF; **no dependency added to the repo**; **mainnet hard-off**;
+not mainnet-ready). Implementation is deferred to Phase 22D pending explicit approval +
+security review. Details: `docs/poaw-x-phase22c-secp256k1-vrf-research.md`.
