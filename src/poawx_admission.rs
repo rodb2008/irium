@@ -22,7 +22,9 @@ use std::sync::{Mutex, OnceLock};
 use sha2::{Digest, Sha256};
 
 use crate::activation::network_id_byte;
-use crate::poawx_candidate::{CandidateSet, RoleCandidate};
+use crate::poawx_candidate::{
+    true_vrf_active, AssignmentProofV2, CandidateSet, RoleCandidate, ASSIGNMENT_PROOF_V2_WIRE,
+};
 use crate::poawx_gossip::GossipOutcome;
 
 /// Domain tag for the admission digest.
@@ -30,6 +32,8 @@ pub const CANDIDATE_ADMISSION_DOMAIN: &[u8] = b"IRIUM_POAWX_CANDIDATE_ADMISSION_
 pub const CANDIDATE_ADMISSION_VERSION: u8 = 1;
 /// Wire size: version(1)+net(1)+height(8)+seed(32)+candidate(175)+digest(32).
 pub const CANDIDATE_ADMISSION_WIRE: usize = 1 + 1 + 8 + 32 + 175 + 32;
+/// Phase 22E: wire size with a trailing true-VRF AssignmentProofV2 appended.
+pub const CANDIDATE_ADMISSION_V2_WIRE: usize = CANDIDATE_ADMISSION_WIRE + ASSIGNMENT_PROOF_V2_WIRE;
 /// Safety cap on a single admission payload (anti-oversize).
 pub const CANDIDATE_ADMISSION_MAX_BYTES: usize = 4096;
 const ADMISSION_SEEN_CAP: usize = 100_000;
@@ -103,6 +107,9 @@ pub struct CandidateAdmissionV1 {
     pub target_height: u64,
     pub seed: [u8; 32],
     pub candidate: RoleCandidate,
+    /// Phase 22E: optional true-VRF proof (absent when the true-VRF gate is off;
+    /// required + validated when on). Bound into the admission digest when present.
+    pub assignment_proof_v2: Option<AssignmentProofV2>,
     pub digest: [u8; 32],
 }
 
@@ -111,6 +118,7 @@ fn admission_digest(
     target_height: u64,
     seed: &[u8; 32],
     candidate: &RoleCandidate,
+    v2: Option<&AssignmentProofV2>,
 ) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(CANDIDATE_ADMISSION_DOMAIN);
@@ -119,6 +127,12 @@ fn admission_digest(
     h.update(target_height.to_le_bytes());
     h.update(seed);
     h.update(candidate.serialize());
+    // Phase 22E: bind the true-VRF proof when present. Absent => byte-identical to
+    // the pre-22E digest (backward compatible).
+    if let Some(p) = v2 {
+        h.update(b"IRIUM_POAWX_ADMISSION_V2");
+        h.update(p.digest);
+    }
     h.finalize().into()
 }
 
@@ -129,13 +143,32 @@ impl CandidateAdmissionV1 {
         seed: [u8; 32],
         candidate: RoleCandidate,
     ) -> Self {
-        let digest = admission_digest(network_id, target_height, &seed, &candidate);
+        Self::new_with_v2(network_id, target_height, seed, candidate, None)
+    }
+
+    /// Phase 22E: build an admission optionally carrying a true-VRF proof. When
+    /// present, the proof is bound into the digest and validated when the gate is on.
+    pub fn new_with_v2(
+        network_id: u8,
+        target_height: u64,
+        seed: [u8; 32],
+        candidate: RoleCandidate,
+        assignment_proof_v2: Option<AssignmentProofV2>,
+    ) -> Self {
+        let digest = admission_digest(
+            network_id,
+            target_height,
+            &seed,
+            &candidate,
+            assignment_proof_v2.as_ref(),
+        );
         Self {
             version: CANDIDATE_ADMISSION_VERSION,
             network_id,
             target_height,
             seed,
             candidate,
+            assignment_proof_v2,
             digest,
         }
     }
@@ -148,11 +181,16 @@ impl CandidateAdmissionV1 {
         out.extend_from_slice(&self.seed);
         out.extend_from_slice(&self.candidate.serialize());
         out.extend_from_slice(&self.digest);
+        // Phase 22E: trailing true-VRF proof (present-only); absent =>
+        // byte-identical to a pre-22E admission wire.
+        if let Some(p) = &self.assignment_proof_v2 {
+            out.extend_from_slice(&p.serialize());
+        }
         out
     }
 
     pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
-        if raw.len() != CANDIDATE_ADMISSION_WIRE {
+        if raw.len() != CANDIDATE_ADMISSION_WIRE && raw.len() != CANDIDATE_ADMISSION_V2_WIRE {
             return Err("candidate admission: bad length".to_string());
         }
         let version = raw[0];
@@ -168,12 +206,20 @@ impl CandidateAdmissionV1 {
         let candidate = RoleCandidate::deserialize(&raw[42..42 + 175])?;
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&raw[42 + 175..42 + 175 + 32]);
+        let assignment_proof_v2 = if raw.len() == CANDIDATE_ADMISSION_V2_WIRE {
+            Some(AssignmentProofV2::deserialize(
+                &raw[CANDIDATE_ADMISSION_WIRE..CANDIDATE_ADMISSION_V2_WIRE],
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             version,
             network_id,
             target_height,
             seed,
             candidate,
+            assignment_proof_v2,
             digest,
         })
     }
@@ -194,11 +240,39 @@ impl CandidateAdmissionV1 {
         }
         self.candidate
             .validate_self(self.network_id, self.target_height, &self.seed)?;
+        // Phase 22E: under the true-VRF gate the admission MUST carry a valid V2
+        // proof bound to the candidate (the V1 placeholder is not accepted).
+        if true_vrf_active(self.target_height) {
+            let p = self
+                .assignment_proof_v2
+                .as_ref()
+                .ok_or("candidate admission: true-VRF proof required")?;
+            p.validate(self.network_id, self.target_height)?;
+            if p.role_id != self.candidate.role_id {
+                return Err("candidate admission: v2 role mismatch".to_string());
+            }
+            if p.solver_pkh != self.candidate.solver_pkh {
+                return Err("candidate admission: v2 solver mismatch".to_string());
+            }
+            if p.ticket_digest != self.candidate.ticket_digest {
+                return Err("candidate admission: v2 ticket mismatch".to_string());
+            }
+            if p.assignment_public_key != self.candidate.assignment_public_key {
+                return Err("candidate admission: v2 assignment key mismatch".to_string());
+            }
+            if p.seed != self.seed {
+                return Err("candidate admission: v2 seed mismatch".to_string());
+            }
+            if p.vrf_output != self.candidate.assignment_proof_digest {
+                return Err("candidate admission: v2 output != candidate digest".to_string());
+            }
+        }
         let expect = admission_digest(
             self.network_id,
             self.target_height,
             &self.seed,
             &self.candidate,
+            self.assignment_proof_v2.as_ref(),
         );
         if expect != self.digest {
             return Err("candidate admission: digest mismatch".to_string());
@@ -406,7 +480,7 @@ mod tests {
         m.candidate.effective_score ^= 1;
         assert!(m.validate(1, 10).is_err(), "mutation rejects");
         assert_ne!(
-            admission_digest(1, 10, &seed, &m.candidate),
+            admission_digest(1, 10, &seed, &m.candidate, None),
             a.digest,
             "mutation changes digest"
         );
@@ -460,6 +534,164 @@ mod tests {
         assert_eq!(cache.admission_count(10), 0);
         std::env::remove_var("IRIUM_NETWORK");
         std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT");
+    }
+
+    fn v2_admission(
+        net: u8,
+        height: u64,
+        seed: [u8; 32],
+        secret: u8,
+        role: u8,
+        solver: [u8; 20],
+        ticket: [u8; 32],
+    ) -> CandidateAdmissionV1 {
+        let proof =
+            AssignmentProofV2::prove(&[secret; 32], net, height, role, solver, ticket, seed)
+                .expect("v2 prove");
+        let cand =
+            RoleCandidate::from_assignment_v2(&proof, PenaltyStatus::Clean.id(), 1000, [role; 32]);
+        CandidateAdmissionV1::new_with_v2(net, height, seed, cand, Some(proof))
+    }
+
+    fn restamp(a: &mut CandidateAdmissionV1) {
+        a.digest = admission_digest(
+            a.network_id,
+            a.target_height,
+            &a.seed,
+            &a.candidate,
+            a.assignment_proof_v2.as_ref(),
+        );
+    }
+
+    #[test]
+    fn phase22e_admission_v2_accept_and_reject() {
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1");
+        let net = network_id_byte();
+        let seed = [0x44u8; 32];
+        let a = v2_admission(net, 10, seed, 7, 1, [0xC1u8; 20], [0x11u8; 32]);
+        // (6) valid V2 admission accepts + wire round-trips.
+        assert!(a.validate(net, 10).is_ok(), "valid V2 admission");
+        let wire = a.serialize();
+        assert_eq!(wire.len(), CANDIDATE_ADMISSION_V2_WIRE);
+        assert_eq!(CandidateAdmissionV1::deserialize(&wire).unwrap(), a);
+        // (7) wrong network, (8) wrong height.
+        assert!(a.validate(net + 1, 10).is_err(), "wrong network");
+        assert!(a.validate(net, 11).is_err(), "wrong height");
+        // (9) wrong role, (10) wrong solver, (11) wrong ticket (binding mismatch).
+        let mut m = a.clone();
+        m.candidate.role_id ^= 1;
+        restamp(&mut m);
+        assert!(m.validate(net, 10).is_err(), "wrong role");
+        let mut m = a.clone();
+        m.candidate.solver_pkh[0] ^= 1;
+        restamp(&mut m);
+        assert!(m.validate(net, 10).is_err(), "wrong solver");
+        let mut m = a.clone();
+        m.candidate.ticket_digest[0] ^= 1;
+        restamp(&mut m);
+        assert!(m.validate(net, 10).is_err(), "wrong ticket");
+        // (12) wrong seed (proof seed != admission seed).
+        let p2 = AssignmentProofV2::prove(
+            &[7u8; 32],
+            net,
+            10,
+            1,
+            [0xC1u8; 20],
+            [0x11u8; 32],
+            [0x55u8; 32],
+        )
+        .unwrap();
+        let cand2 =
+            RoleCandidate::from_assignment_v2(&p2, PenaltyStatus::Clean.id(), 1000, [1u8; 32]);
+        let mut ws = CandidateAdmissionV1::new_with_v2(net, 10, seed, cand2, Some(p2));
+        restamp(&mut ws);
+        assert!(ws.validate(net, 10).is_err(), "wrong seed");
+        // (13) mutated proof + mutated output.
+        let mut m = a.clone();
+        m.assignment_proof_v2.as_mut().unwrap().vrf_proof[0] ^= 1;
+        restamp(&mut m);
+        assert!(m.validate(net, 10).is_err(), "mutated proof");
+        let mut m = a.clone();
+        m.assignment_proof_v2.as_mut().unwrap().vrf_output[0] ^= 1;
+        restamp(&mut m);
+        assert!(m.validate(net, 10).is_err(), "mutated output");
+        // (14) V2 required rejects a V1-only admission.
+        let v1cand = RoleCandidate::from_assignment_v2(
+            a.assignment_proof_v2.as_ref().unwrap(),
+            PenaltyStatus::Clean.id(),
+            1000,
+            [1u8; 32],
+        );
+        let v1only = CandidateAdmissionV1::new(net, 10, seed, v1cand);
+        assert!(
+            v1only.validate(net, 10).is_err(),
+            "V1-only rejected when V2 required"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
+    }
+
+    #[test]
+    fn phase22e_gate_off_accepts_v1_admission() {
+        // (15) with the true-VRF gate off, an old V1 admission still validates and is
+        // byte-identical on the wire.
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
+        let net = network_id_byte();
+        let seed = [0x22u8; 32];
+        let cand = cand(1, [0xC1u8; 20], 0x11, &seed);
+        let a = CandidateAdmissionV1::new(net, 10, seed, cand);
+        assert!(a.assignment_proof_v2.is_none());
+        assert_eq!(
+            a.serialize().len(),
+            CANDIDATE_ADMISSION_WIRE,
+            "byte-identical pre-22E wire"
+        );
+        assert!(
+            a.validate(net, 10).is_ok(),
+            "V1 admission accepts when gate off"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn phase22e_committed_root_binds_v2() {
+        // (16) the committed-admission root changes when the V2 proof (output) changes,
+        // because the candidate digest = the VRF output.
+        use crate::poawx_committed_admission::AdmissionCommitmentV1;
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1");
+        let net = network_id_byte();
+        let seed = [0x44u8; 32];
+        let mk_root = |secret: u8| -> [u8; 32] {
+            let a = v2_admission(net, 10, seed, secret, 1, [0xC1u8; 20], [0x11u8; 32]);
+            let mut cs = CandidateSet::new(net, 10, seed);
+            cs.push(a.candidate.clone());
+            cs.sort_canonical();
+            AdmissionCommitmentV1::from_candidate_set(&cs, 9).candidate_admission_root
+        };
+        assert_ne!(
+            mk_root(7),
+            mk_root(9),
+            "different VRF output => different committed root"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
     }
 
     #[test]

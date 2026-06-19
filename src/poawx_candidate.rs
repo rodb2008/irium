@@ -235,6 +235,36 @@ impl RoleCandidate {
         }
     }
 
+    /// Phase 22E: build a candidate from a true-VRF AssignmentProofV2. The
+    /// candidate's assignment_proof_digest IS the VRF output (so the effective
+    /// score derives from the VRF output); role/solver/assignment key/ticket are
+    /// taken from the proof. No secret material.
+    pub fn from_assignment_v2(
+        proof: &AssignmentProofV2,
+        penalty_status: u8,
+        dominance_weight: u64,
+        role_claim_digest: [u8; 32],
+    ) -> Self {
+        let assignment_proof_digest = proof.vrf_output;
+        let penalty_weight = PenaltyStatus::from_id(penalty_status)
+            .map(|p| p.weight_multiplier_permille() as u64)
+            .unwrap_or(0);
+        let assignment_score = assignment_score_from_digest(&assignment_proof_digest);
+        let effective_score = effective_score(assignment_score, dominance_weight, penalty_weight);
+        Self {
+            role_id: proof.role_id,
+            solver_pkh: proof.solver_pkh,
+            assignment_public_key: proof.assignment_public_key,
+            ticket_digest: proof.ticket_digest,
+            penalty_status,
+            assignment_proof_digest,
+            dominance_weight,
+            penalty_weight,
+            effective_score,
+            role_claim_digest,
+        }
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(ROLE_CANDIDATE_WIRE);
         out.push(self.role_id);
@@ -315,17 +345,23 @@ impl RoleCandidate {
         target_height: u64,
         seed: &[u8; 32],
     ) -> Result<(), String> {
-        let expect_digest = compute_assignment_proof_digest(
-            network_id,
-            target_height,
-            self.role_id,
-            &self.solver_pkh,
-            &self.assignment_public_key,
-            &self.ticket_digest,
-            seed,
-        );
-        if expect_digest != self.assignment_proof_digest {
-            return Err("candidate: assignment proof digest mismatch".to_string());
+        // Under the true-VRF gate, assignment_proof_digest carries the VRF output
+        // (not the V1 placeholder hash); the VRF binding is verified via the
+        // AssignmentProofV2 at admission ingest and block acceptance, so skip the
+        // placeholder recompute here. Penalty + effective-score checks still apply.
+        if !true_vrf_active(target_height) {
+            let expect_digest = compute_assignment_proof_digest(
+                network_id,
+                target_height,
+                self.role_id,
+                &self.solver_pkh,
+                &self.assignment_public_key,
+                &self.ticket_digest,
+                seed,
+            );
+            if expect_digest != self.assignment_proof_digest {
+                return Err("candidate: assignment proof digest mismatch".to_string());
+            }
         }
         let ps =
             PenaltyStatus::from_id(self.penalty_status).ok_or("candidate: bad penalty status")?;
