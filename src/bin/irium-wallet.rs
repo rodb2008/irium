@@ -2331,7 +2331,7 @@ fn usage() {
     eprintln!("  irium-wallet poawx-candidate-admission --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--role-claim-digest <64hex>] [--penalty-status <0..4>] [--dominance-weight <N>] [--assignment-pubkey <66hex>]  (emits wire_hex to POST to /poawx/candidate-admission; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-puzzle-challenge --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> [--ticket-digest <64hex>] [--assignment-proof-digest <64hex>] [--candidate-digest <64hex>] [--seed <64hex>]  (assigned-work puzzle, NOT chain PoW; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-puzzle-solve <same flags as poawx-puzzle-challenge>  (emits solution wire_hex; testnet/devnet only; no private key)");
-    eprintln!("  irium-wallet poawx-finality-vote --network-id <id> --target-height <H> --block-hash <64hex> [--parent-hash <64hex>] [--committee-epoch <N>] [--ticket-digest <64hex>] [--vote-type precommit|commit|checkpoint] --secret-hex <64hex>  (real secp256k1 vote; testnet/devnet only; signing key is input-only, never echoed)");
+    eprintln!("  irium-wallet poawx-finality-vote --network-id <id> --target-height <H> --block-hash <64hex> [--parent-hash <64hex>] [--committee-epoch <N>] [--ticket-digest <64hex>] [--vote-type precommit|commit|checkpoint] --secret-hex <64hex> [--submit --node-rpc <loopback-url>]  (real secp256k1 vote; emit-only by default; --submit POSTs to the loopback node; testnet/devnet only; signing key is input-only, never echoed)");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3843,6 +3843,14 @@ fn finality_vote_json(args: &[String]) -> Result<serde_json::Value, String> {
                 hex_into(&next_flag_value(args, &mut i)?, &mut sk)?;
                 secret = Some(sk);
             }
+            // Phase 21I: loopback-submit flags are handled by the command wrapper;
+            // accept (and skip) them here so the JSON builder does not error.
+            "--submit" => {
+                i += 1;
+            }
+            "--node-rpc" => {
+                let _ = next_flag_value(args, &mut i)?;
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -3898,6 +3906,42 @@ fn cmd_poawx_finality_vote(args: &[String]) -> Result<(), String> {
         "{}",
         serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?
     );
+    // Phase 21I: optional explicit loopback submit (default emit-only). Only POSTs
+    // when --submit is given; requires --node-rpc <loopback-url>. Testnet/devnet.
+    let mut submit = false;
+    let mut node_rpc: Option<String> = None;
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--submit" => {
+                submit = true;
+                i += 1;
+            }
+            "--node-rpc" => {
+                node_rpc = Some(next_flag_value(args, &mut i)?);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    if submit {
+        let url = node_rpc.ok_or("--submit requires --node-rpc <loopback-url>")?;
+        let wire = v["wire_hex"].as_str().ok_or("missing wire_hex")?;
+        let bytes = hex::decode(wire).map_err(|_| "bad wire_hex".to_string())?;
+        let client = reqwest::blocking::Client::builder()
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        let endpoint = format!("{}/poawx/finality-vote", url.trim_end_matches('/'));
+        match client.post(&endpoint).body(bytes).send() {
+            Ok(r) => eprintln!(
+                "[finality-vote] submitted to {} -> status {}",
+                endpoint,
+                r.status()
+            ),
+            Err(e) => eprintln!("[finality-vote] submit failed (best-effort): {e}"),
+        }
+    }
     eprintln!("[finality-vote] real secp256k1 vote; testnet/devnet only; signing key input is never echoed.");
     Ok(())
 }
@@ -16091,6 +16135,25 @@ mod tests {
             sec.as_str(),
         ]);
         assert!(finality_vote_json(&m).is_err(), "mainnet hard-off");
+        // Phase 21I: --submit / --node-rpc are accepted by the JSON builder (the
+        // command wrapper performs the optional loopback POST).
+        let withsub = fvote_args(&[
+            "--network-id",
+            "1",
+            "--target-height",
+            "10",
+            "--block-hash",
+            bh.as_str(),
+            "--secret-hex",
+            sec.as_str(),
+            "--submit",
+            "--node-rpc",
+            "http://127.0.0.1:1",
+        ]);
+        assert!(
+            finality_vote_json(&withsub).is_ok(),
+            "submit flags accepted"
+        );
     }
 
     #[test]
