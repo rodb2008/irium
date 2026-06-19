@@ -53,6 +53,12 @@
 > requires a valid finality proof. Assigned-work/consensus only — LWMA-144 and block PoW
 > untouched. Details: `poaw-x-phase21h-finality-committee.md`.
 
+> **Phase 21I (live finality-vote gossip).** Member-signed finality votes propagate over
+> P2P (PoawxFinalityVote=29) into a node cache, exposed via loopback RPC; the pool fetches
+> + bundles them into the 21H FinalityProofV1 (fail-closed). Votes are member-signed, not
+> pool/node-signed; the node re-verifies every vote + the bundled proof. Gated + mainnet
+> hard-off; LWMA-144 untouched. Details: `poaw-x-phase21i-finality-vote-gossip.md`.
+
 > **Live E2E status (Steps 6E/6F, 2026-06-18):** The role-gossip → Phase 20 production path has
 > been validated live, end-to-end, twice. **Step 6E** (single-VPS loopback) and **Step 6F**
 > (two-VPS, role gossip over real cross-VPS P2P with an observer node validating byte-identical)
