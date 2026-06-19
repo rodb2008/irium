@@ -75,3 +75,15 @@ candidate for a future `AssignmentProofV2` — but `AssignmentProofV1` remains t
 **placeholder** (no homemade VRF; **no dependency added to the repo**; **mainnet hard-off**;
 not mainnet-ready). Implementation is deferred to Phase 22D pending explicit approval +
 security review. Details: `docs/poaw-x-phase22c-secp256k1-vrf-research.md`.
+
+## Phase 22E — true-VRF E2E production wiring (update)
+
+The true-VRF path is now wired end-to-end (local-only, gated, mainnet hard-off):
+miner/wallet produces `AssignmentProofV2` → it rides in `CandidateAdmissionV1` (optional
+trailing wire, bound into the admission digest) → the node validates at ingest and exposes
+admitted V2 candidates over loopback RPC → the pool fetches and **bundles** the AVR2 section
+(holding no VRF secret, fabricating nothing; fail-closed) → `connect_block` re-validates.
+`RoleCandidate::validate_self` skips the V1 placeholder recompute under the gate so one block
+satisfies both candidate-set and true-VRF enforcement. See
+`docs/poaw-x-phase22e-true-vrf-e2e-wiring.md`. Security review still required before any
+non-test network; not mainnet-ready.

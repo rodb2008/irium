@@ -424,3 +424,13 @@ separate audited sr25519/Ristretto VRF key, then Option C vendor + security revi
 captured in `docs/poaw-x-phase22b-true-vrf-decision-package.md`. No code/dependency/Cargo
 change in Phase 22B (docs-only). PoAW-X is **not full blueprint-complete** until this VRF
 decision is approved and implemented; no push, no mainnet, no audit/vote.
+
+## Phase 22E — true-VRF E2E wiring (update)
+
+Production wiring for `AssignmentProofV2` is complete (local-only, gated, mainnet hard-off):
+wallet/miner emits the proof (`poawx-candidate-admission --secret-hex`, secret never echoed),
+it is carried in the candidate admission and committed-admission root, the node validates at
+ingest + block acceptance, and the pool fetches + bundles it into the Phase 20 ext AVR2
+section (fail-closed; no VRF secret in the pool). Both official fee-0 and third-party fee
+production paths pass with miner-supplied proofs. Not mainnet-ready (external security review
+of `vrf_fun`/`secp256kfun` pending).

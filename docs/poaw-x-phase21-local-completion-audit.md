@@ -186,3 +186,13 @@ candidate for a future `AssignmentProofV2` — but `AssignmentProofV1` remains t
 **placeholder** (no homemade VRF; **no dependency added to the repo**; **mainnet hard-off**;
 not mainnet-ready). Implementation is deferred to Phase 22D pending explicit approval +
 security review. Details: `docs/poaw-x-phase22c-secp256k1-vrf-research.md`.
+
+## Phase 22E — true-VRF E2E wiring (update)
+
+Production wiring for `AssignmentProofV2` is complete (local-only, gated, mainnet hard-off):
+wallet/miner emits the proof (`poawx-candidate-admission --secret-hex`, secret never echoed),
+it is carried in the candidate admission and committed-admission root, the node validates at
+ingest + block acceptance, and the pool fetches + bundles it into the Phase 20 ext AVR2
+section (fail-closed; no VRF secret in the pool). Both official fee-0 and third-party fee
+production paths pass with miner-supplied proofs. Not mainnet-ready (external security review
+of `vrf_fun`/`secp256kfun` pending).
