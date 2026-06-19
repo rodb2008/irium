@@ -708,6 +708,27 @@ mod tests {
     }
 
     #[test]
+    fn phase23a_admission_deserialize_rejects_bad_trailing_length() {
+        let seed = [0x22u8; 32];
+        let a = CandidateAdmissionV1::new(1, 10, seed, cand(1, [0xC1u8; 20], 0x11, &seed));
+        // base (V1) length parses; base + junk that is neither V1 nor V2 length rejects.
+        assert!(CandidateAdmissionV1::deserialize(&a.serialize()).is_ok());
+        let mut junk = a.serialize();
+        junk.extend_from_slice(&[0u8; 100]);
+        assert!(
+            CandidateAdmissionV1::deserialize(&junk).is_err(),
+            "+100 junk"
+        );
+        let mut partial = a.serialize();
+        partial.extend_from_slice(&[0u8; ASSIGNMENT_PROOF_V2_WIRE - 1]);
+        assert!(
+            CandidateAdmissionV1::deserialize(&partial).is_err(),
+            "partial v2"
+        );
+        assert!(CandidateAdmissionV1::deserialize(&[]).is_err(), "empty");
+    }
+
+    #[test]
     fn gate_logic_pure_and_mainnet_off() {
         assert!(
             !candidate_admission_gate(0, Some(1), 100),

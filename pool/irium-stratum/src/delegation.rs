@@ -5121,6 +5121,25 @@ mod tests {
     }
 
     #[test]
+    fn phase23a_assignment_v2_mirror_rejects_bad_length() {
+        // The opaque mirror enforces the exact 273-byte wire (bounded deserialization).
+        assert!(
+            AssignmentProofV2Mirror::deserialize(&[0u8; ASSIGNMENT_PROOF_V2_WIRE - 1]).is_err()
+        );
+        assert!(
+            AssignmentProofV2Mirror::deserialize(&[0u8; ASSIGNMENT_PROOF_V2_WIRE + 1]).is_err()
+        );
+        assert!(AssignmentProofV2Mirror::deserialize(&[]).is_err());
+        assert!(AssignmentProofV2Mirror::deserialize(&[0u8; ASSIGNMENT_PROOF_V2_WIRE]).is_ok());
+        // decode_admission_v2 rejects a V1-length admission (no trailing proof).
+        let v1 = "01".to_string() + &"00".repeat(CANDIDATE_ADMISSION_WIRE - 1);
+        assert!(
+            decode_admission_v2(&v1).is_none(),
+            "V1-length admission has no V2"
+        );
+    }
+
+    #[test]
     fn phase22e_pool_e2e_bundle_and_failclosed() {
         let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_NETWORK", "testnet");

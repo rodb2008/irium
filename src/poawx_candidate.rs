@@ -1192,6 +1192,33 @@ mod tests {
     }
 
     #[test]
+    fn phase23a_assignment_v2_deserialize_rejects_bad_length() {
+        let p = AssignmentProofV2::prove(
+            &[7u8; 32],
+            1,
+            10,
+            1,
+            [0xAAu8; 20],
+            [0x11u8; 32],
+            [0x22u8; 32],
+        )
+        .unwrap();
+        let w = p.serialize();
+        assert_eq!(w.len(), ASSIGNMENT_PROOF_V2_WIRE);
+        assert!(
+            AssignmentProofV2::deserialize(&w[..w.len() - 1]).is_err(),
+            "short"
+        );
+        let mut over = w.clone();
+        over.push(0);
+        assert!(AssignmentProofV2::deserialize(&over).is_err(), "long");
+        assert!(AssignmentProofV2::deserialize(&[]).is_err(), "empty");
+        // exact length parses structurally; validate() is the crypto gate (covered
+        // by assignment_v2_prove_verify_and_rejects).
+        assert!(AssignmentProofV2::deserialize(&[0u8; ASSIGNMENT_PROOF_V2_WIRE]).is_ok());
+    }
+
+    #[test]
     fn true_vrf_gates() {
         let _g = crate::poawx::poawx_test_env_lock()
             .lock()

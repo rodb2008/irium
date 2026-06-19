@@ -2117,6 +2117,83 @@ mod tests {
     }
 
     #[test]
+    fn phase23a_ext_rejects_malformed_avr2_section() {
+        use crate::poawx_candidate::AssignmentProofV2;
+        let prev = [0x44u8; 32];
+        let proofs = [
+            AssignmentProofV2::prove(
+                &[7u8; 32],
+                1,
+                61,
+                ROLE_COMPUTE_CONTRIBUTOR,
+                [0xC1u8; 20],
+                [1u8; 32],
+                [0x55u8; 32],
+            )
+            .unwrap(),
+            AssignmentProofV2::prove(
+                &[8u8; 32],
+                1,
+                61,
+                ROLE_VERIFY_CONTRIBUTOR,
+                [0xC2u8; 20],
+                [2u8; 32],
+                [0x55u8; 32],
+            )
+            .unwrap(),
+            AssignmentProofV2::prove(
+                &[9u8; 32],
+                1,
+                61,
+                ROLE_SUPPORT_CONTRIBUTOR,
+                [0xC3u8; 20],
+                [3u8; 32],
+                [0x55u8; 32],
+            )
+            .unwrap(),
+        ];
+        let ext = Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+            candidate_set: None,
+            role_puzzle_proofs: None,
+            finality_proof: None,
+            committed_admission: None,
+            role_assignment_v2: Some(proofs),
+        };
+        let good = ext.serialize();
+        assert_eq!(Phase20ReceiptExt::deserialize(&good).unwrap(), ext);
+        // Truncated AVR2 section (drop the last byte) -> bounded deserialize rejects.
+        assert!(
+            Phase20ReceiptExt::deserialize(&good[..good.len() - 1]).is_err(),
+            "truncated AVR2 rejects"
+        );
+        // Truncate one whole proof's worth (only 2 proofs present) -> rejects.
+        assert!(
+            Phase20ReceiptExt::deserialize(&good[..good.len() - ASSIGNMENT_PROOF_V2_WIRE]).is_err(),
+            "missing third proof rejects"
+        );
+        // Oversized: stray trailing byte after a complete section -> unknown magic.
+        let mut over = good.clone();
+        over.push(0xAB);
+        assert!(
+            Phase20ReceiptExt::deserialize(&over).is_err(),
+            "trailing junk rejects"
+        );
+    }
+
+    #[test]
     fn phase22d_ext_true_vrf_section_roundtrip_backward_compatible() {
         use crate::poawx_candidate::{AssignmentProofV2, ASSIGNMENT_V2_SECTION_MAGIC};
         let prev = [0x44u8; 32];
