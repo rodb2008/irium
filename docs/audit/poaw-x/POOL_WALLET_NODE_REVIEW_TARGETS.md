@@ -1,0 +1,47 @@
+# PoAW-X pool / wallet / node review targets
+
+## Wallet — `src/bin/irium-wallet.rs`
+
+- **Proof emission:** `poawx-assignment-proof-v2`, `poawx-candidate-admission` (with optional
+  `--secret-hex` to bind a V2 proof), plus `poawx-ticket-proof`, `poawx-assignment-proof` (V1),
+  `poawx-puzzle-challenge/solve`, `poawx-finality-vote`, `poawx-committed-admission`. All
+  emit-only; testnet/devnet; mainnet (network_id 0) disabled.
+- **Secret non-leakage:** secrets are inputs (`--secret-hex`); never written to JSON, logs, or
+  error strings; self-verify before emit. Review every print/format path for accidental
+  inclusion. Tests assert the secret value is absent from output.
+- **Submit path:** optional `--submit --node-rpc <loopback-url>` POSTs ONLY the public
+  `wire_hex` to the node's loopback RPC; no secret sent; no default public posting.
+
+## Node — `src/bin/iriumd.rs` + `src/p2p.rs` + caches
+
+- **Loopback-only RPC:** `/poawx/candidate-admission` (POST), `/poawx/candidate-admissions`
+  (GET), `/poawx/finality-vote` (POST), `/poawx/finality-votes` (GET) are guarded by a
+  loopback bridge guard + gossip-enabled gate. Review that they cannot be reached off-loopback
+  and are testnet/devnet only.
+- **Caches:** `NodeCandidateAdmissionCache`, `NodeFinalityVoteCache` — validate → window →
+  dedupe → store; pruned by height; bounded seen-set. Review window/dedupe/bounds.
+- **P2P gossip:** `PoawxCandidateAdmission` (=28), `PoawxFinalityVote` (=29) — receive arms
+  ingest (validate) + rebroadcast only when newly accepted; payload size-capped. Review
+  validation-before-store and rebroadcast amplification.
+
+## Pool — `pool/irium-stratum/src/delegation.rs` (+ `stratum.rs`, `block.rs`)
+
+- **No VRF secret / no proving:** the pool has no `vrf_fun`/`secp256kfun` dependency; production
+  code never proves (the only `AssignmentProofV2::prove` references are in `#[cfg(test)]` via
+  the node dev-dependency). Confirm there is no path where the pool fabricates a proof.
+- **Fetch / bundle / fail-closed:** `refresh_pool_admitted_cache` fetches admitted candidates;
+  `decode_admission_v2` + `build_admitted_v2_proofs` + `build_pool_true_vrf_section` bundle the
+  SELECTED candidates' proofs into the `AVR2` section; `build_synthetic_phase20_ext` /
+  `build_collected_phase20_ext` FAIL CLOSED (emit no ext) if a selected role lacks a proof.
+- **Byte-parity mirrors:** all consensus types are mirrored byte-for-byte; parity tests assert
+  equality vs the canonical node types (e.g. `phase22d_pool_true_vrf_parity_and_failclosed`,
+  `phase22e_pool_e2e_bundle_and_failclosed`). Review that mirrors cannot diverge silently.
+- **Fees:** official fee-0 and third-party fee (cap 2.00%, fail-closed to 0% on invalid terms)
+  both produce valid exts; review the fee split + that the node re-validates.
+- **No bypass:** the pool cannot bypass node validation — the node re-verifies every section.
+
+## Cross-cutting
+
+- **No public RPC/port exposure** introduced by this work; loopback-only bridges.
+- **Trust boundary:** node authoritative; pool/wallet untrusted producers; all producer output
+  is re-validated by the node.
