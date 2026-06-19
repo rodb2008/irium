@@ -867,6 +867,9 @@ impl ChainState {
         if crate::poawx_finality::finality_committee_enforced(expected_height) {
             self.validate_block_finality(&block, expected_height)?;
         }
+        if crate::poawx_committed_admission::committed_admission_enforced(expected_height) {
+            self.validate_block_committed_admission(&block, previous, expected_height)?;
+        }
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1155,6 +1158,99 @@ impl ChainState {
     /// HONEST LIMITATION: the node can only validate the INCLUDED candidate set;
     /// it cannot prove unseen miners did not exist (no mandatory candidate
     /// admission / gossip rule yet). Best-within-included-set, NOT global best.
+    /// Phase 22A: chain-committed candidate admission. When enforced, the
+    /// admitted candidate-set root for height H must have been committed in the
+    /// PARENT block (commit_height = H-1, freeze seed = parent's prev_hash =
+    /// grandparent hash, known when the parent was produced -> no circularity),
+    /// and block H's candidate set must reproduce that exact committed root
+    /// (root + count + seed). The producer of H therefore cannot add/omit
+    /// candidates vs the H-1 commitment. Also validates this block's OWN
+    /// commitment (for H+1) is self-consistent. Reorg-safe: the commitment is
+    /// block data (parent ext), so it is replayed/reverted with the chain. At
+    /// the activation height a one-block grace allows a pre-gate parent. Fails
+    /// closed otherwise. Does NOT prove offline/never-gossiped miners existed.
+    fn validate_block_committed_admission(
+        &self,
+        block: &Block,
+        previous: Option<&Block>,
+        height: u64,
+    ) -> Result<(), String> {
+        use crate::poawx_committed_admission::{
+            committed_admission_activation_height, AdmissionCommitmentV1,
+        };
+        let net = crate::activation::network_id_byte();
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        // (1) Outgoing: if this block carries a commitment (for H+1), it must be
+        // self-consistent: target = H+1, commit_height = H, freeze seed = this
+        // block's prev_hash.
+        for r in receipts {
+            if let Some(ext) = &r.phase20_ext {
+                if let Some(ca) = &ext.committed_admission {
+                    ca.validate(net, height + 1)?;
+                    if ca.commit_height != height {
+                        return Err("phase22a: own commitment wrong commit height".to_string());
+                    }
+                    if ca.seed != block.header.prev_hash {
+                        return Err("phase22a: own commitment wrong freeze seed".to_string());
+                    }
+                }
+            }
+        }
+        // (2) Incoming: H's candidate set must match the parent's committed root
+        // for target H.
+        let is_activation =
+            matches!(committed_admission_activation_height(), Some(a) if a == height);
+        let parent_commit: Option<AdmissionCommitmentV1> = previous.and_then(|p| {
+            p.poawx_receipts.as_ref().and_then(|rs| {
+                rs.iter().find_map(|r| {
+                    r.phase20_ext
+                        .as_ref()
+                        .and_then(|e| e.committed_admission.clone())
+                        .filter(|ca| ca.target_height == height)
+                })
+            })
+        });
+        match parent_commit {
+            Some(pc) => {
+                pc.validate(net, height)?;
+                if let Some(prev) = previous {
+                    if pc.seed != prev.header.prev_hash {
+                        return Err(
+                            "phase22a: parent commitment seed != grandparent hash".to_string()
+                        );
+                    }
+                }
+                for r in receipts {
+                    let ext = match &r.phase20_ext {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    let cs = ext.candidate_set.as_ref().ok_or_else(|| {
+                        "phase22a: committed admission requires a candidate set".to_string()
+                    })?;
+                    if !pc.matches_candidate_set(cs) {
+                        return Err(
+                            "phase22a: candidate set does not match committed admission root"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            None => {
+                if !is_activation {
+                    return Err(
+                        "phase22a: missing parent committed admission for height".to_string()
+                    );
+                }
+                // activation-height grace: the parent predates the gate.
+            }
+        }
+        Ok(())
+    }
+
     fn validate_block_candidate_sets(&self, block: &Block, height: u64) -> Result<(), String> {
         use crate::poawx::{
             ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
@@ -7799,6 +7895,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         }
     }
 
@@ -8284,6 +8381,210 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_WINDOW");
         std::env::remove_var("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK");
+    }
+
+    #[test]
+    fn phase22a_committed_admission_enforcement() {
+        use crate::poawx::{
+            ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_candidate::{CandidateSet, RoleCandidate};
+        use crate::poawx_committed_admission::{
+            committed_admission_enforced, AdmissionCommitmentV1,
+        };
+        use crate::poawx_penalty::PenaltyStatus;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "2");
+        std::env::set_var("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1");
+        assert!(
+            committed_admission_enforced(3),
+            "enforced on testnet at H>=2"
+        );
+
+        let net = crate::activation::network_id_byte();
+        let sk = test_signing_key();
+        let grandparent = [0x6Au8; 32]; // freeze seed = parent's prev_hash
+        let target = 3u64;
+        let base_ext = p20_ext(net, target, &grandparent, 0, [0u8; 20]);
+
+        // admitted candidate set for H=3, bound to the freeze seed (grandparent).
+        let mk = |role: u8, solver: [u8; 20], tag: u8| {
+            RoleCandidate::build(
+                net,
+                target,
+                &grandparent,
+                role,
+                solver,
+                [0x02u8; 33],
+                [tag; 32],
+                PenaltyStatus::Clean.id(),
+                1000,
+                [tag.wrapping_add(1); 32],
+            )
+        };
+        let mut cs = CandidateSet::new(net, target, grandparent);
+        for c in [
+            mk(ROLE_COMPUTE_CONTRIBUTOR, [0xC1u8; 20], 0x11),
+            mk(ROLE_VERIFY_CONTRIBUTOR, [0xC2u8; 20], 0x12),
+            mk(ROLE_SUPPORT_CONTRIBUTOR, [0xC3u8; 20], 0x13),
+        ] {
+            cs.push(c);
+        }
+        cs.sort_canonical();
+
+        // PARENT block H=2: prev_hash = grandparent; ext commits admission for H=3.
+        let parent = {
+            let mut ext = p20_ext(net, 2, &grandparent, 0, [0u8; 20]);
+            ext.committed_admission = Some(AdmissionCommitmentV1::from_candidate_set(&cs, 2));
+            let mut r = make_test_receipt(2, &sk, grandparent, 1);
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: grandparent,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+        let parent_hash = parent.header.hash_for_height(2);
+
+        // CHILD block H=3 carrying the matching candidate set.
+        let child = |set: Option<CandidateSet>| -> Block {
+            let mut ext = base_ext.clone();
+            ext.candidate_set = set;
+            let mut r = make_test_receipt(target, &sk, parent_hash, 1);
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+
+        let st = base_chain(None);
+        // exact committed set => accept.
+        assert!(
+            st.validate_block_committed_admission(&child(Some(cs.clone())), Some(&parent), target)
+                .is_ok(),
+            "matching committed candidate set accepts"
+        );
+        // mutated candidate set => root mismatch => reject.
+        let mut mutated = cs.clone();
+        mutated.candidates[0].dominance_weight ^= 1;
+        assert!(
+            st.validate_block_committed_admission(&child(Some(mutated)), Some(&parent), target)
+                .is_err(),
+            "mutated set rejects (root mismatch)"
+        );
+        // missing candidate set => reject.
+        assert!(
+            st.validate_block_committed_admission(&child(None), Some(&parent), target)
+                .is_err(),
+            "missing candidate set rejects"
+        );
+        // parent without a commitment (and not activation height) => reject.
+        let bare_parent = {
+            let mut r = make_test_receipt(2, &sk, grandparent, 1);
+            r.phase20_ext = Some(p20_ext(net, 2, &grandparent, 0, [0u8; 20]));
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: grandparent,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+        assert!(
+            st.validate_block_committed_admission(
+                &child(Some(cs.clone())),
+                Some(&bare_parent),
+                target
+            )
+            .is_err(),
+            "missing parent commitment rejects (H>activation)"
+        );
+        // activation-height grace: at H=2 a bare parent (H=1, pre-gate) is accepted.
+        let h2_block = {
+            let mut r = make_test_receipt(2, &sk, grandparent, 1);
+            r.phase20_ext = Some(p20_ext(net, 2, &grandparent, 0, [0u8; 20]));
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: grandparent,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+        assert!(
+            st.validate_block_committed_admission(&h2_block, Some(&bare_parent), 2)
+                .is_ok(),
+            "activation-height grace accepts pre-gate parent"
+        );
+        // outgoing self-consistency: a block committing with the WRONG freeze seed rejects.
+        let bad_commit = {
+            let mut ext = p20_ext(net, 2, &grandparent, 0, [0u8; 20]);
+            // commit for target 3 but freeze seed != this block's prev_hash.
+            let mut bogus = cs.clone();
+            bogus.seed = [0x99u8; 32];
+            ext.committed_admission = Some(AdmissionCommitmentV1::from_candidate_set(&bogus, 2));
+            let mut r = make_test_receipt(2, &sk, grandparent, 1);
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: grandparent,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+        assert!(
+            st.validate_block_committed_admission(&bad_commit, Some(&bare_parent), 2)
+                .is_err(),
+            "own commitment with wrong freeze seed rejects"
+        );
+
+        // mainnet hard-off.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!committed_admission_enforced(3), "mainnet hard-off");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED");
     }
 
     #[test]
@@ -9346,6 +9647,7 @@ mod tests {
                 candidate_set: None,
                 role_puzzle_proofs: None,
                 finality_proof: None,
+                committed_admission: None,
             }
         };
         let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {

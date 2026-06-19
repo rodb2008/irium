@@ -4,6 +4,9 @@
 
 use crate::block::Block;
 use crate::poawx_candidate::{CandidateSet, CANDIDATE_SECTION_MAGIC};
+use crate::poawx_committed_admission::{
+    AdmissionCommitmentV1, ADMISSION_COMMITMENT_WIRE, COMMITTED_ADMISSION_SECTION_MAGIC,
+};
 use crate::poawx_dominance::{DOMINANCE_SECTION_MAGIC, DOMINANCE_WEIGHTS_WIRE};
 use crate::poawx_finality::{FinalityProofV1, FINALITY_SECTION_MAGIC};
 use crate::poawx_puzzle::{PuzzleSolutionV1, PUZZLE_SECTION_MAGIC, PUZZLE_SOLUTION_WIRE};
@@ -637,6 +640,11 @@ pub struct Phase20ReceiptExt {
     /// block (trailing FIN1 section; None => byte-identical to pre-21H).
     /// Required + validated in connect_block when the finality gate is enforced.
     pub finality_proof: Option<FinalityProofV1>,
+    /// Phase 22A: optional chain-committed admission for the NEXT height
+    /// (commit_height = this block; target = this+1) — trailing CAC1 section;
+    /// None => byte-identical to pre-22A. Validated in connect_block when the
+    /// committed-admission gate is enforced.
+    pub committed_admission: Option<AdmissionCommitmentV1>,
 }
 
 impl Phase20ReceiptExt {
@@ -671,6 +679,7 @@ impl Phase20ReceiptExt {
                     || self.candidate_set.is_some()
                     || self.role_puzzle_proofs.is_some()
                     || self.finality_proof.is_some()
+                    || self.committed_admission.is_some()
                 {
                     out.push(0);
                 }
@@ -713,6 +722,12 @@ impl Phase20ReceiptExt {
             out.extend_from_slice(FINALITY_SECTION_MAGIC);
             out.extend_from_slice(&(body.len() as u32).to_le_bytes());
             out.extend_from_slice(&body);
+        }
+        // Phase 22A trailing CAC1 committed-admission section (present-only,
+        // fixed-size). Absent => byte-identical to pre-22A exts.
+        if let Some(ca) = &self.committed_admission {
+            out.extend_from_slice(COMMITTED_ADMISSION_SECTION_MAGIC);
+            out.extend_from_slice(&ca.serialize());
         }
         out
     }
@@ -780,6 +795,7 @@ impl Phase20ReceiptExt {
         let mut candidate_set: Option<CandidateSet> = None;
         let mut role_puzzle_proofs: Option<[PuzzleSolutionV1; 3]> = None;
         let mut finality_proof: Option<FinalityProofV1> = None;
+        let mut committed_admission: Option<AdmissionCommitmentV1> = None;
         while off < raw.len() {
             need(off, 4, "trailing section magic")?;
             let magic = &raw[off..off + 4];
@@ -848,6 +864,16 @@ impl Phase20ReceiptExt {
                 need(off, len, "finality section body")?;
                 finality_proof = Some(FinalityProofV1::deserialize(&raw[off..off + len])?);
                 off += len;
+            } else if magic == COMMITTED_ADMISSION_SECTION_MAGIC {
+                if committed_admission.is_some() {
+                    return Err("phase20 ext: duplicate committed-admission section".to_string());
+                }
+                off += 4;
+                need(off, ADMISSION_COMMITMENT_WIRE, "committed admission")?;
+                committed_admission = Some(AdmissionCommitmentV1::deserialize(
+                    &raw[off..off + ADMISSION_COMMITMENT_WIRE],
+                )?);
+                off += ADMISSION_COMMITMENT_WIRE;
             } else {
                 return Err("phase20 ext: unknown trailing section magic".to_string());
             }
@@ -865,6 +891,7 @@ impl Phase20ReceiptExt {
             candidate_set,
             role_puzzle_proofs,
             finality_proof,
+            committed_admission,
         })
     }
 
@@ -1832,6 +1859,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         let bytes = ext.serialize();
         let ext2 = Phase20ReceiptExt::deserialize(&bytes).expect("deserialize");
@@ -1946,6 +1974,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         let none = base();
         let mut some = base();
@@ -1987,6 +2016,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         let proofs = [
             TicketProof::new(
@@ -2052,6 +2082,89 @@ mod tests {
     }
 
     #[test]
+    fn phase22a_ext_committed_admission_roundtrip_backward_compatible() {
+        use crate::poawx_candidate::{CandidateSet, RoleCandidate};
+        use crate::poawx_committed_admission::{
+            AdmissionCommitmentV1, COMMITTED_ADMISSION_SECTION_MAGIC,
+        };
+        use crate::poawx_penalty::PenaltyStatus;
+        let prev = [0x44u8; 32];
+        let base = || Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+            candidate_set: None,
+            role_puzzle_proofs: None,
+            finality_proof: None,
+            committed_admission: None,
+        };
+        let seed = [0x55u8; 32];
+        let mut cs = CandidateSet::new(1, 61, seed);
+        cs.push(RoleCandidate::build(
+            1,
+            61,
+            &seed,
+            1,
+            [0xC1u8; 20],
+            [0x02u8; 33],
+            [0x11u8; 32],
+            PenaltyStatus::Clean.id(),
+            1000,
+            [0x21u8; 32],
+        ));
+        cs.sort_canonical();
+        let ca = AdmissionCommitmentV1::from_candidate_set(&cs, 60);
+        // (1) absent => no CAC1 magic, byte-identical, round-trips.
+        let none = base();
+        let nb = none.serialize();
+        assert!(
+            nb.windows(4)
+                .all(|w| w != &COMMITTED_ADMISSION_SECTION_MAGIC[..]),
+            "no CAC1 magic when absent"
+        );
+        assert_eq!(Phase20ReceiptExt::deserialize(&nb).unwrap(), none);
+        // (2) present => round-trips + changes the ext digest.
+        let mut c = base();
+        c.committed_admission = Some(ca.clone());
+        assert_eq!(Phase20ReceiptExt::deserialize(&c.serialize()).unwrap(), c);
+        assert_ne!(
+            none.digest(),
+            c.digest(),
+            "committed-admission section changes digest"
+        );
+        // (3) mutation changes the ext digest.
+        let mut c2 = base();
+        let mut ca2 = ca.clone();
+        ca2.candidate_admission_root[0] ^= 1;
+        ca2.digest = ca2.digest; // (digest stays; mutating root still changes serialized bytes)
+        c2.committed_admission = Some(ca2);
+        assert_ne!(
+            c.digest(),
+            c2.digest(),
+            "commitment mutation changes ext digest"
+        );
+        // (4) committed admission together with candidate set + finality round-trips.
+        let mut all = base();
+        all.candidate_set = Some(cs.clone());
+        all.committed_admission = Some(ca);
+        let ab = all.serialize();
+        assert!(ab
+            .windows(4)
+            .any(|w| w == &COMMITTED_ADMISSION_SECTION_MAGIC[..]));
+        assert_eq!(Phase20ReceiptExt::deserialize(&ab).unwrap(), all);
+    }
+
+    #[test]
     fn phase21h_ext_finality_section_roundtrip_backward_compatible() {
         use crate::poawx_finality::{FinalityProofV1, FinalityVoteType, FinalityVoteV1};
         let prev = [0x44u8; 32];
@@ -2072,6 +2185,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         let sk = k256::ecdsa::SigningKey::from_slice(&[0x21u8; 32]).unwrap();
         let mut fp = FinalityProofV1::new(1, 60, prev, [0u8; 32], 0, 1, 1);
@@ -2146,6 +2260,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         let sol = |m: u8, n: u64, t: u8| PuzzleSolutionV1 {
             mode: m,
@@ -2211,6 +2326,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         let mut cs = CandidateSet::new(1, 60, prev);
         cs.push(RoleCandidate::build(
@@ -2282,6 +2398,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         let weights = [1000u64, 800, 900, 950];
         // (1) absent => no DOM1 magic, byte-identical, round-trips.
@@ -2380,6 +2497,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
         // no-ext v3 element == v2 element + a single 0 flag byte (present-only).
         let r = make_test_receipt(9);
@@ -2420,6 +2538,7 @@ mod tests {
             candidate_set: None,
             role_puzzle_proofs: None,
             finality_proof: None,
+            committed_admission: None,
         };
 
         // Base mode-0 receipt with a production extension attached.
