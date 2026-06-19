@@ -1986,6 +1986,54 @@ pub async fn refresh_pool_admitted_cache(rpc_base: &str, rpc_token: &str, height
     cache.retain(|h, _| *h >= keep_floor);
 }
 
+/// Phase 21I: fetch node-collected finality votes for a height (hex; empty on error).
+pub async fn fetch_node_finality_votes(
+    rpc_base: &str,
+    rpc_token: &str,
+    target_height: u64,
+) -> Vec<String> {
+    let url = format!(
+        "{}/poawx/finality-votes?target_height={}",
+        rpc_base.trim_end_matches('/'),
+        target_height
+    );
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let resp = match client.get(&url).bearer_auth(rpc_token).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        votes: Vec<String>,
+    }
+    match resp.json::<Resp>().await {
+        Ok(r) => r.votes,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Refresh the pool finality-vote cache for a height from the node (best-effort;
+/// no-op unless the finality committee gate is enforced). The pool only fetches
+/// member-signed votes; it never signs them and the node re-verifies everything.
+pub async fn refresh_pool_finality_votes(rpc_base: &str, rpc_token: &str, height: u64) {
+    if !pool_finality_committee_enforced(height) {
+        return;
+    }
+    let hexes = fetch_node_finality_votes(rpc_base, rpc_token, height).await;
+    if hexes.is_empty() {
+        return;
+    }
+    let mut cache = pool_finality_vote_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.insert(height, hexes);
+    let keep_floor = height.saturating_sub(64);
+    cache.retain(|h, _| *h >= keep_floor);
+}
+
 /// ── Phase 21F: assigned puzzle work modes (pool mirror) ─────────────────────
 /// Byte-identical mirror of node `poawx_puzzle` so the pool can SOLVE the assigned
 /// puzzle for each selected candidate and attach a node-verifiable solution.

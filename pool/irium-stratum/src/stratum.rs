@@ -1948,6 +1948,15 @@ async fn template_loop(
                             job.height,
                         )
                         .await;
+                        // Phase 21I: pull node-collected finality votes into the
+                        // pool finality-vote cache before production (best-effort;
+                        // no-op unless the finality committee gate is enforced).
+                        crate::delegation::refresh_pool_finality_votes(
+                            &config.rpc_base,
+                            &config.rpc_token,
+                            job.height,
+                        )
+                        .await;
                     }
                 }
                 // Guardrail: refuse stale pre-fork templates once we've
