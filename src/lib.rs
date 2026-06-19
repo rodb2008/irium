@@ -85,6 +85,7 @@ pub mod poawx;
 pub mod poawx_adaptive;
 pub mod poawx_admission;
 pub mod poawx_candidate;
+pub mod poawx_committed_admission;
 pub mod poawx_dominance;
 pub mod poawx_finality;
 pub mod poawx_gossip;
