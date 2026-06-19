@@ -1138,6 +1138,7 @@ dependencies = [
  "axum",
  "axum-server",
  "bech32",
+ "bincode",
  "bip39",
  "bs58",
  "chrono",
@@ -2059,6 +2060,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b81d55dcb214c0cd9b5965a7c1845b8e3d82d813123a634e5494882fe527a6aa"
 dependencies = [
+ "bincode",
  "digest",
  "generic-array",
  "rand_core 0.6.4",
@@ -2515,6 +2517,7 @@ version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9eec7bfc4ebea340e4bce2b174a2c354845974ca62e22091be992bb050f555ae"
 dependencies = [
+ "bincode",
  "generic-array",
  "rand_chacha 0.3.1",
  "secp256kfun",

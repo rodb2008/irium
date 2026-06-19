@@ -20,6 +20,9 @@ use sha2::{Digest, Sha256};
 
 use crate::activation::network_id_byte;
 use crate::poawx_penalty::PenaltyStatus;
+use secp256kfun::KeyPair;
+use vrf_fun::rfc9381::tai;
+use vrf_fun::VrfProof;
 
 /// Domain tag for the assignment-proof digest.
 pub const ASSIGNMENT_PROOF_DOMAIN: &[u8] = b"IRIUM_POAWX_ASSIGNMENT_PROOF_V1";
@@ -533,6 +536,280 @@ pub fn assignment_proof_enforced(height: u64) -> bool {
     )
 }
 
+/// ── Phase 22D: true secp256k1 RFC 9381 ECVRF (AssignmentProofV2) ─────────────
+/// A real cryptographic VRF (vrf_fun/secp256kfun, pure Rust, no OpenSSL) replacing
+/// the recomputable `AssignmentProofV1` placeholder when the true-VRF gate is on.
+/// Keeps the secp256k1 key model: the VRF key IS a secp256k1 keypair; the 33-byte
+/// `assignment_public_key` is the compressed VRF public key. Gated + mainnet hard-off.
+pub const ASSIGNMENT_PROOF_V2_VERSION: u8 = 2;
+/// bincode-encoded `VrfProof<U16>` (gamma 33 + challenge 16 + response 32) = 81 bytes.
+pub const VRF_PROOF_WIRE: usize = 81;
+pub const ASSIGNMENT_PROOF_V2_WIRE: usize =
+    1 + 1 + 8 + 1 + 20 + 33 + 32 + 32 + 32 + VRF_PROOF_WIRE + 32; // 273
+const ASSIGNMENT_V2_DOMAIN: &[u8] = b"IRIUM_POAWX_ASSIGNMENT_PROOF_V2";
+const VRF_MESSAGE_DOMAIN: &[u8] = b"IRIUM_POAWX_VRF_MESSAGE_V2";
+
+fn vrf_bincode_config() -> impl bincode::config::Config {
+    bincode::config::standard()
+}
+
+/// The VRF input message (alpha): domain-separated, binds the full assignment context.
+#[allow(clippy::too_many_arguments)]
+fn vrf_message(
+    network_id: u8,
+    target_height: u64,
+    role_id: u8,
+    solver_pkh: &[u8; 20],
+    ticket_digest: &[u8; 32],
+    seed: &[u8; 32],
+    assignment_public_key: &[u8; 33],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(VRF_MESSAGE_DOMAIN.len() + 1 + 8 + 1 + 20 + 32 + 32 + 33);
+    m.extend_from_slice(VRF_MESSAGE_DOMAIN);
+    m.push(network_id);
+    m.extend_from_slice(&target_height.to_le_bytes());
+    m.push(role_id);
+    m.extend_from_slice(solver_pkh);
+    m.extend_from_slice(ticket_digest);
+    m.extend_from_slice(seed);
+    m.extend_from_slice(assignment_public_key);
+    m
+}
+
+/// Derive the deterministic assignment score from a VRF output (first 8 bytes LE).
+pub fn assignment_v2_score_from_output(vrf_output: &[u8; 32]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&vrf_output[0..8]);
+    u64::from_le_bytes(b)
+}
+
+/// True-VRF assignment proof (RFC 9381 ECVRF over secp256k1). No secret key bytes
+/// are stored; `vrf_output` + `vrf_proof` are public and verifiable against
+/// `assignment_public_key` + the bound message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentProofV2 {
+    pub version: u8,
+    pub network_id: u8,
+    pub target_height: u64,
+    pub role_id: u8,
+    pub solver_pkh: [u8; 20],
+    pub assignment_public_key: [u8; 33],
+    pub ticket_digest: [u8; 32],
+    pub seed: [u8; 32],
+    pub vrf_output: [u8; 32],
+    pub vrf_proof: [u8; VRF_PROOF_WIRE],
+    pub digest: [u8; 32],
+}
+
+impl AssignmentProofV2 {
+    fn compute_digest(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(ASSIGNMENT_V2_DOMAIN);
+        h.update([self.version]);
+        h.update([self.network_id]);
+        h.update(self.target_height.to_le_bytes());
+        h.update([self.role_id]);
+        h.update(self.solver_pkh);
+        h.update(self.assignment_public_key);
+        h.update(self.ticket_digest);
+        h.update(self.seed);
+        h.update(self.vrf_output);
+        h.update(self.vrf_proof);
+        h.finalize().into()
+    }
+
+    /// Produce a V2 proof from a secp256k1 secret key (prover/wallet side). The
+    /// secret never leaves this function; only the public key, output, and proof
+    /// are retained. `assignment_public_key` is derived from the secret.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove(
+        secret: &[u8; 32],
+        network_id: u8,
+        target_height: u64,
+        role_id: u8,
+        solver_pkh: [u8; 20],
+        ticket_digest: [u8; 32],
+        seed: [u8; 32],
+    ) -> Result<Self, String> {
+        let sk = secp256kfun::Scalar::from_bytes(*secret)
+            .and_then(|s| s.non_zero())
+            .ok_or_else(|| "assignment v2: invalid/zero secret key".to_string())?;
+        let kp = KeyPair::new(sk);
+        let pk = kp.public_key();
+        let assignment_public_key: [u8; 33] = pk.to_bytes();
+        let alpha = vrf_message(
+            network_id,
+            target_height,
+            role_id,
+            &solver_pkh,
+            &ticket_digest,
+            &seed,
+            &assignment_public_key,
+        );
+        let proof = tai::prove::<Sha256>(&kp, &alpha);
+        let verified = tai::verify::<Sha256>(pk, &alpha, &proof)
+            .ok_or_else(|| "assignment v2: self-verify failed".to_string())?;
+        let vrf_output = tai::output::<Sha256>(verified);
+        let encoded = bincode::encode_to_vec(&proof, vrf_bincode_config())
+            .map_err(|e| format!("assignment v2: proof encode: {e}"))?;
+        if encoded.len() != VRF_PROOF_WIRE {
+            return Err(format!(
+                "assignment v2: unexpected proof length {}",
+                encoded.len()
+            ));
+        }
+        let mut vrf_proof = [0u8; VRF_PROOF_WIRE];
+        vrf_proof.copy_from_slice(&encoded);
+        let mut me = Self {
+            version: ASSIGNMENT_PROOF_V2_VERSION,
+            network_id,
+            target_height,
+            role_id,
+            solver_pkh,
+            assignment_public_key,
+            ticket_digest,
+            seed,
+            vrf_output,
+            vrf_proof,
+            digest: [0u8; 32],
+        };
+        me.digest = me.compute_digest();
+        Ok(me)
+    }
+
+    pub fn score(&self) -> u64 {
+        assignment_v2_score_from_output(&self.vrf_output)
+    }
+
+    /// Verify the VRF proof against the assignment public key + bound message, and
+    /// confirm the carried output + digest. Deterministic; no secret key needed.
+    pub fn validate(&self, network_id: u8, target_height: u64) -> Result<(), String> {
+        if self.version != ASSIGNMENT_PROOF_V2_VERSION {
+            return Err("assignment v2: bad version".to_string());
+        }
+        if self.network_id != network_id {
+            return Err("assignment v2: wrong network".to_string());
+        }
+        if self.target_height != target_height {
+            return Err("assignment v2: wrong height".to_string());
+        }
+        if self.compute_digest() != self.digest {
+            return Err("assignment v2: digest mismatch".to_string());
+        }
+        let pk = secp256kfun::Point::from_bytes(self.assignment_public_key)
+            .ok_or_else(|| "assignment v2: bad vrf public key".to_string())?;
+        let (proof, used): (VrfProof, usize) =
+            bincode::decode_from_slice(&self.vrf_proof, vrf_bincode_config())
+                .map_err(|_| "assignment v2: malformed vrf proof".to_string())?;
+        if used != VRF_PROOF_WIRE {
+            return Err("assignment v2: trailing proof bytes".to_string());
+        }
+        let alpha = vrf_message(
+            self.network_id,
+            self.target_height,
+            self.role_id,
+            &self.solver_pkh,
+            &self.ticket_digest,
+            &self.seed,
+            &self.assignment_public_key,
+        );
+        let verified = tai::verify::<Sha256>(pk, &alpha, &proof)
+            .ok_or_else(|| "assignment v2: vrf verification failed".to_string())?;
+        let out = tai::output::<Sha256>(verified);
+        if out != self.vrf_output {
+            return Err("assignment v2: vrf output mismatch".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut o = Vec::with_capacity(ASSIGNMENT_PROOF_V2_WIRE);
+        o.push(self.version);
+        o.push(self.network_id);
+        o.extend_from_slice(&self.target_height.to_le_bytes());
+        o.push(self.role_id);
+        o.extend_from_slice(&self.solver_pkh);
+        o.extend_from_slice(&self.assignment_public_key);
+        o.extend_from_slice(&self.ticket_digest);
+        o.extend_from_slice(&self.seed);
+        o.extend_from_slice(&self.vrf_output);
+        o.extend_from_slice(&self.vrf_proof);
+        o.extend_from_slice(&self.digest);
+        o
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() != ASSIGNMENT_PROOF_V2_WIRE {
+            return Err("assignment v2: bad length".to_string());
+        }
+        let mut p = 0usize;
+        let take = |p: &mut usize, n: usize| -> Vec<u8> {
+            let v = raw[*p..*p + n].to_vec();
+            *p += n;
+            v
+        };
+        let version = raw[p];
+        p += 1;
+        let network_id = raw[p];
+        p += 1;
+        let mut h8 = [0u8; 8];
+        h8.copy_from_slice(&take(&mut p, 8));
+        let target_height = u64::from_le_bytes(h8);
+        let role_id = raw[p];
+        p += 1;
+        let mut solver_pkh = [0u8; 20];
+        solver_pkh.copy_from_slice(&take(&mut p, 20));
+        let mut assignment_public_key = [0u8; 33];
+        assignment_public_key.copy_from_slice(&take(&mut p, 33));
+        let mut ticket_digest = [0u8; 32];
+        ticket_digest.copy_from_slice(&take(&mut p, 32));
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&take(&mut p, 32));
+        let mut vrf_output = [0u8; 32];
+        vrf_output.copy_from_slice(&take(&mut p, 32));
+        let mut vrf_proof = [0u8; VRF_PROOF_WIRE];
+        vrf_proof.copy_from_slice(&take(&mut p, VRF_PROOF_WIRE));
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&take(&mut p, 32));
+        Ok(Self {
+            version,
+            network_id,
+            target_height,
+            role_id,
+            solver_pkh,
+            assignment_public_key,
+            ticket_digest,
+            seed,
+            vrf_output,
+            vrf_proof,
+            digest,
+        })
+    }
+}
+
+// True-VRF gates (reserved Phase 22B names; mainnet hard-off; reuse the pure gate fns).
+pub fn true_vrf_activation_height() -> Option<u64> {
+    std::env::var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+pub fn true_vrf_required() -> bool {
+    std::env::var("IRIUM_POAWX_TRUE_VRF_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+pub fn true_vrf_active(height: u64) -> bool {
+    poawx_phase21d_gate(network_id_byte(), true_vrf_activation_height(), height)
+}
+pub fn true_vrf_enforced(height: u64) -> bool {
+    poawx_phase21d_enforced_gate(
+        network_id_byte(),
+        true_vrf_activation_height(),
+        true_vrf_required(),
+        height,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,6 +1088,87 @@ mod tests {
             cs2.best_for_role(1).unwrap().assignment_proof_digest,
             a.assignment_proof_digest
         );
+    }
+
+    #[test]
+    fn assignment_v2_prove_verify_and_rejects() {
+        let secret = [7u8; 32];
+        let solver = [0xAAu8; 20];
+        let ticket = [0x11u8; 32];
+        let seed = [0x22u8; 32];
+        let p = AssignmentProofV2::prove(&secret, 1, 10, 1, solver, ticket, seed).expect("prove");
+        assert!(p.validate(1, 10).is_ok(), "valid V2 proof accepts");
+        // deterministic output + digest for same key/message.
+        let p2 = AssignmentProofV2::prove(&secret, 1, 10, 1, solver, ticket, seed).unwrap();
+        assert_eq!(p.vrf_output, p2.vrf_output, "deterministic VRF output");
+        assert_eq!(p.digest, p2.digest);
+        // score derives from VRF output.
+        assert_eq!(p.score(), assignment_v2_score_from_output(&p.vrf_output));
+        // wire round-trip.
+        let b = p.serialize();
+        assert_eq!(b.len(), ASSIGNMENT_PROOF_V2_WIRE);
+        assert_eq!(AssignmentProofV2::deserialize(&b).unwrap(), p);
+        // wrong network / height (validate args).
+        assert!(p.validate(2, 10).is_err(), "wrong network");
+        assert!(p.validate(1, 11).is_err(), "wrong height");
+        // re-stamp digest after a field mutation so the VRF/verify check is what fails.
+        let restamp = |mut m: AssignmentProofV2| {
+            m.digest = m.compute_digest();
+            m
+        };
+        let mut m = p.clone();
+        m.role_id ^= 1;
+        assert!(restamp(m).validate(1, 10).is_err(), "wrong role");
+        let mut m = p.clone();
+        m.solver_pkh[0] ^= 1;
+        assert!(restamp(m).validate(1, 10).is_err(), "wrong solver");
+        let mut m = p.clone();
+        m.ticket_digest[0] ^= 1;
+        assert!(restamp(m).validate(1, 10).is_err(), "wrong ticket");
+        let mut m = p.clone();
+        m.seed[0] ^= 1;
+        assert!(restamp(m).validate(1, 10).is_err(), "wrong seed");
+        let mut m = p.clone();
+        m.assignment_public_key[1] ^= 1;
+        assert!(restamp(m).validate(1, 10).is_err(), "wrong pubkey");
+        let mut m = p.clone();
+        m.vrf_output[0] ^= 1;
+        assert!(restamp(m).validate(1, 10).is_err(), "mutated output");
+        let mut m = p.clone();
+        m.vrf_proof[0] ^= 1;
+        assert!(restamp(m).validate(1, 10).is_err(), "mutated proof");
+        let mut m = p.clone();
+        m.vrf_proof = [0u8; VRF_PROOF_WIRE];
+        assert!(restamp(m).validate(1, 10).is_err(), "malformed proof");
+        // mutate WITHOUT re-stamp -> digest mismatch caught.
+        let mut m = p.clone();
+        m.solver_pkh[0] ^= 1;
+        assert!(m.validate(1, 10).is_err(), "digest mismatch");
+        // a different key/message yields a different output (unpredictability proxy).
+        let q = AssignmentProofV2::prove(&[9u8; 32], 1, 10, 1, solver, ticket, seed).unwrap();
+        assert_ne!(
+            p.vrf_output, q.vrf_output,
+            "different key -> different output"
+        );
+    }
+
+    #[test]
+    fn true_vrf_gates() {
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "5");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1");
+        assert!(true_vrf_active(5));
+        assert!(true_vrf_enforced(5));
+        assert!(!true_vrf_active(4), "below activation");
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!true_vrf_active(5), "mainnet hard-off");
+        assert!(!true_vrf_enforced(5), "mainnet hard-off");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
     }
 
     #[test]

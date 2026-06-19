@@ -25,7 +25,8 @@ k256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 # Phase 22D: true secp256k1 RFC 9381 ECVRF for AssignmentProofV2 (gated, mainnet
 # hard-off). Pure Rust, NO OpenSSL/secp256k1-sys/bindgen/ring. sha2 stays 0.10 to match
 # secp256kfun digest 0.10.
-vrf_fun = "0.12.1"
+vrf_fun = { version = "0.12.1", features = ["bincode"] }
+bincode = "2"
 secp256kfun = "0.12"
 tokio = { version = "1", features = ["full"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
