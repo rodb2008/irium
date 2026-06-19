@@ -138,3 +138,11 @@ candidate for a future `AssignmentProofV2` — but `AssignmentProofV1` remains t
 **placeholder** (no homemade VRF; **no dependency added to the repo**; **mainnet hard-off**;
 not mainnet-ready). Implementation is deferred to Phase 22D pending explicit approval +
 security review. Details: `docs/poaw-x-phase22c-secp256k1-vrf-research.md`.
+
+## 8. Phase 22D update
+
+**Option A is now IMPLEMENTED** (local-only, gated, mainnet hard-off): `AssignmentProofV2`
+is a true secp256k1 RFC 9381 ECVRF (`vrf_fun 0.12.1` + `secp256kfun 0.12`, no OpenSSL) —
+see `docs/poaw-x-phase22d-true-vrf-assignment-proof-v2.md`. `AssignmentProofV1` is retained
+as the gate-off fallback. Security review of `vrf_fun`/`secp256kfun` still required before
+any non-test network.
