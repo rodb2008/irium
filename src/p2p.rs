@@ -4090,6 +4090,16 @@ impl P2PNode {
         let _ = broadcast_raw(&self.peers, &serialized).await;
     }
 
+    /// Phase 21I: broadcast a PoAW-X finality vote (canonical wire bytes) to all
+    /// peers; receivers validate the signature + dedupe before re-broadcast.
+    pub async fn broadcast_finality_vote(&self, vote_bytes: &[u8]) {
+        let payload = crate::protocol::PoawxFinalityVotePayload {
+            vote_bytes: vote_bytes.to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
     /// Phase 1A+1B: drain accumulated incoming offer JSON strings. Called
     /// by iriumd offer-watcher, which writes each JSON to
     /// ~/.irium/offers/<id>.json so /offers/feed serves it locally.
@@ -6489,6 +6499,25 @@ impl P2PNode {
                             }
                         }
                     }
+                    MessageType::PoawxFinalityVote => {
+                        if crate::poawx_finality::finality_gossip_enabled() {
+                            if let Ok(p) =
+                                crate::protocol::PoawxFinalityVotePayload::from_message(&msg)
+                            {
+                                if crate::poawx_finality::global_finality_vote_cache()
+                                    .ingest_bytes(&p.vote_bytes)
+                                    .should_rebroadcast()
+                                {
+                                    let bytes = crate::protocol::PoawxFinalityVotePayload {
+                                        vote_bytes: p.vote_bytes,
+                                    }
+                                    .to_message()
+                                    .serialize();
+                                    let _ = broadcast_raw(&peers_vec, &bytes).await;
+                                }
+                            }
+                        }
+                    }
                     MessageType::DisputeRaisedNotification => {
                         if let Ok(p) =
                             crate::protocol::DisputeRaisedNotificationPayload::from_message(&msg)
@@ -8836,6 +8865,23 @@ async fn handle_incoming_with_sybil(
                         {
                             let bytes = crate::protocol::PoawxCandidateAdmissionPayload {
                                 admission_bytes: p.admission_bytes,
+                            }
+                            .to_message()
+                            .serialize();
+                            let _ = broadcast_raw(&peers, &bytes).await;
+                        }
+                    }
+                }
+            }
+            MessageType::PoawxFinalityVote => {
+                if crate::poawx_finality::finality_gossip_enabled() {
+                    if let Ok(p) = crate::protocol::PoawxFinalityVotePayload::from_message(&msg) {
+                        if crate::poawx_finality::global_finality_vote_cache()
+                            .ingest_bytes(&p.vote_bytes)
+                            .should_rebroadcast()
+                        {
+                            let bytes = crate::protocol::PoawxFinalityVotePayload {
+                                vote_bytes: p.vote_bytes,
                             }
                             .to_message()
                             .serialize();

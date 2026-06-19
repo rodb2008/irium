@@ -18,7 +18,12 @@ use sha2::{Digest, Sha256};
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
 use crate::activation::network_id_byte;
+use crate::poawx_gossip::GossipOutcome;
 
 const VOTE_DOMAIN: &[u8] = b"IRIUM_POAWX_FINALITY_VOTE_V1";
 const PROOF_DOMAIN: &[u8] = b"IRIUM_POAWX_FINALITY_PROOF_V1";
@@ -525,6 +530,208 @@ pub fn finality_committee_enforced(height: u64) -> bool {
     )
 }
 
+/// ── Phase 21I: live finality-vote gossip + node cache ───────────────────────
+pub const FINALITY_VOTE_MAX_BYTES: usize = 512;
+const FINALITY_SEEN_CAP: usize = 100_000;
+const FINALITY_PRUNE_KEEP: u64 = 64;
+pub const DEFAULT_FINALITY_GOSSIP_WINDOW: u64 = 64;
+
+pub fn finality_gossip_window() -> u64 {
+    std::env::var("IRIUM_POAWX_FINALITY_GOSSIP_WINDOW")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|w| *w >= 1)
+        .unwrap_or(DEFAULT_FINALITY_GOSSIP_WINDOW)
+}
+pub fn finality_gossip_activation_height() -> Option<u64> {
+    std::env::var("IRIUM_POAWX_FINALITY_GOSSIP_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+pub fn finality_gossip_required() -> bool {
+    std::env::var("IRIUM_POAWX_FINALITY_GOSSIP_REQUIRED")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+pub fn finality_gossip_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
+    if network_id == 0 {
+        return false;
+    }
+    matches!(activation, Some(h) if height >= h)
+}
+pub fn finality_gossip_enforced_gate(
+    network_id: u8,
+    activation: Option<u64>,
+    required: bool,
+    height: u64,
+) -> bool {
+    finality_gossip_gate(network_id, activation, height) && required
+}
+pub fn finality_gossip_active(height: u64) -> bool {
+    finality_gossip_gate(
+        network_id_byte(),
+        finality_gossip_activation_height(),
+        height,
+    )
+}
+pub fn finality_gossip_enforced(height: u64) -> bool {
+    finality_gossip_enforced_gate(
+        network_id_byte(),
+        finality_gossip_activation_height(),
+        finality_gossip_required(),
+        height,
+    )
+}
+/// Whether this node ingests/gossips finality votes (testnet/devnet + gate set).
+pub fn finality_gossip_enabled() -> bool {
+    network_id_byte() != 0 && finality_gossip_activation_height().is_some()
+}
+
+/// Process-global node finality-vote cache (mirror of the admission cache).
+/// Keyed by (target_height, block_hash, vote_type, member_pkh); deduped by the
+/// signed vote digest.
+pub struct NodeFinalityVoteCache {
+    votes: Mutex<BTreeMap<(u64, [u8; 32], u8, [u8; 20]), FinalityVoteV1>>,
+    seen: Mutex<BTreeSet<[u8; 32]>>,
+    tip: AtomicU64,
+}
+
+impl Default for NodeFinalityVoteCache {
+    fn default() -> Self {
+        Self {
+            votes: Mutex::new(BTreeMap::new()),
+            seen: Mutex::new(BTreeSet::new()),
+            tip: AtomicU64::new(0),
+        }
+    }
+}
+
+impl NodeFinalityVoteCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn set_tip(&self, tip: u64) {
+        self.tip.store(tip, Ordering::Relaxed);
+    }
+    pub fn tip(&self) -> u64 {
+        self.tip.load(Ordering::Relaxed)
+    }
+    fn in_window(&self, target: u64) -> bool {
+        let tip = self.tip();
+        target >= tip && target <= tip.saturating_add(finality_gossip_window())
+    }
+    fn already_seen(&self, d: &[u8; 32]) -> bool {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(d)
+    }
+    fn mark_seen(&self, d: [u8; 32]) {
+        let mut s = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if s.len() >= FINALITY_SEEN_CAP {
+            s.clear();
+        }
+        s.insert(d);
+    }
+
+    /// Ingest one finality vote (raw wire). validate(sig) -> window -> dedupe ->
+    /// store. AcceptedNew (rebroadcast) / Duplicate / Rejected.
+    pub fn ingest_bytes(&self, bytes: &[u8]) -> GossipOutcome {
+        if !finality_gossip_enabled() {
+            return GossipOutcome::Rejected("finality gossip disabled".to_string());
+        }
+        if bytes.len() > FINALITY_VOTE_MAX_BYTES {
+            return GossipOutcome::Rejected("finality vote oversize".to_string());
+        }
+        let v = match FinalityVoteV1::deserialize(bytes) {
+            Ok(v) => v,
+            Err(e) => return GossipOutcome::Rejected(e),
+        };
+        if v.network_id != network_id_byte() {
+            return GossipOutcome::Rejected("wrong network".to_string());
+        }
+        if let Err(e) = v.verify(v.network_id, v.target_height, &v.block_hash) {
+            return GossipOutcome::Rejected(e);
+        }
+        if !self.in_window(v.target_height) {
+            return GossipOutcome::Rejected("out of finality window".to_string());
+        }
+        let d = v.digest();
+        if self.already_seen(&d) {
+            return GossipOutcome::Duplicate;
+        }
+        let key = (v.target_height, v.block_hash, v.vote_type, v.member_pkh);
+        let mut map = self.votes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ex) = map.get(&key) {
+            if ex.digest() != d {
+                return GossipOutcome::Rejected("conflicting vote for member".to_string());
+            }
+            return GossipOutcome::Duplicate;
+        }
+        map.insert(key, v.clone());
+        drop(map);
+        self.mark_seen(d);
+        GossipOutcome::AcceptedNew
+    }
+
+    /// Votes for (height, block_hash, vote_type), sorted by member_pkh.
+    pub fn votes_for(
+        &self,
+        height: u64,
+        block_hash: &[u8; 32],
+        vote_type: u8,
+    ) -> Vec<FinalityVoteV1> {
+        let map = self.votes.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter(|((h, bh, vt, _), _)| *h == height && bh == block_hash && *vt == vote_type)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+    /// All votes for a height (any block/type), for RPC export (sorted by key).
+    pub fn votes_for_height(&self, height: u64) -> Vec<FinalityVoteV1> {
+        let map = self.votes.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter(|((h, _, _, _), _)| *h == height)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+    pub fn vote_count(&self, height: u64) -> usize {
+        self.votes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|((h, _, _, _), _)| *h == height)
+            .count()
+    }
+    /// Deterministic root over the sorted votes for (height, block_hash, type).
+    pub fn root(&self, height: u64, block_hash: &[u8; 32], vote_type: u8) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"IRIUM_POAWX_FINALITY_VOTE_CACHE_ROOT_V1");
+        for v in self.votes_for(height, block_hash, vote_type) {
+            h.update(v.digest());
+        }
+        h.finalize().into()
+    }
+    pub fn prune(&self, tip: u64) {
+        self.set_tip(tip);
+        let floor = tip.saturating_sub(FINALITY_PRUNE_KEEP);
+        if floor == 0 {
+            return;
+        }
+        let mut map = self.votes.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|(h, _, _, _), _| *h >= floor);
+    }
+    pub fn clear(&self) {
+        self.votes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+static GLOBAL_FINALITY_VOTE_CACHE: OnceLock<NodeFinalityVoteCache> = OnceLock::new();
+pub fn global_finality_vote_cache() -> &'static NodeFinalityVoteCache {
+    GLOBAL_FINALITY_VOTE_CACHE.get_or_init(NodeFinalityVoteCache::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +908,90 @@ mod tests {
         assert_eq!(p.required_votes(1), 1); // clamp >=1
         let p2 = FinalityProofV1::new(1, 10, [0u8; 32], [0u8; 32], 0, 1, 1);
         assert_eq!(p2.required_votes(4), 4); // unanimous
+    }
+
+    #[test]
+    fn finality_gossip_cache_ingest_dedupe_window_prune() {
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_FINALITY_GOSSIP_ACTIVATION_HEIGHT", "1");
+        let net = network_id_byte();
+        let bh = [0x44u8; 32];
+        let cache = NodeFinalityVoteCache::new();
+        cache.set_tip(10);
+        let v1 = FinalityVoteV1::signed(
+            &key(0xA1),
+            net,
+            10,
+            bh,
+            [0u8; 32],
+            0,
+            [0x11u8; 32],
+            FinalityVoteType::Commit,
+        );
+        let v2 = FinalityVoteV1::signed(
+            &key(0xB2),
+            net,
+            10,
+            bh,
+            [0u8; 32],
+            0,
+            [0x11u8; 32],
+            FinalityVoteType::Commit,
+        );
+        assert_eq!(
+            cache.ingest_bytes(&v1.serialize()),
+            GossipOutcome::AcceptedNew
+        );
+        assert_eq!(
+            cache.ingest_bytes(&v1.serialize()),
+            GossipOutcome::Duplicate
+        );
+        assert_eq!(
+            cache.ingest_bytes(&v2.serialize()),
+            GossipOutcome::AcceptedNew
+        );
+        assert_eq!(cache.vote_count(10), 2);
+        // malformed rejects, no panic.
+        assert!(matches!(
+            cache.ingest_bytes(&[0u8; 9]),
+            GossipOutcome::Rejected(_)
+        ));
+        // invalid signature rejects.
+        let mut bad = v1.clone();
+        bad.signature[0] ^= 1;
+        assert!(matches!(
+            cache.ingest_bytes(&bad.serialize()),
+            GossipOutcome::Rejected(_)
+        ));
+        // out of window rejects.
+        let far = FinalityVoteV1::signed(
+            &key(0xC3),
+            net,
+            9000,
+            bh,
+            [0u8; 32],
+            0,
+            [0x11u8; 32],
+            FinalityVoteType::Commit,
+        );
+        assert!(matches!(
+            cache.ingest_bytes(&far.serialize()),
+            GossipOutcome::Rejected(_)
+        ));
+        // deterministic sorted export + root.
+        let r1 = cache.root(10, &bh, FinalityVoteType::Commit.id());
+        assert_eq!(cache.root(10, &bh, FinalityVoteType::Commit.id()), r1);
+        let got = cache.votes_for(10, &bh, FinalityVoteType::Commit.id());
+        assert_eq!(got.len(), 2);
+        assert!(
+            got[0].member_pkh < got[1].member_pkh,
+            "sorted by member_pkh"
+        );
+        // prune drops old heights.
+        cache.prune(9000);
+        assert_eq!(cache.vote_count(10), 0);
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_GOSSIP_ACTIVATION_HEIGHT");
     }
 
     #[test]

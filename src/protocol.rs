@@ -102,6 +102,10 @@ pub enum MessageType {
     /// validates + stores). Same drop-safe forward-compat rules as the role
     /// gossip types; mainnet/older peers drop it via the receive-side catch-all.
     PoawxCandidateAdmission = 28,
+    /// Gossip: PoAW-X finality vote (Phase 21I). Payload: canonical
+    /// `FinalityVoteV1` wire bytes (opaque here; the node finality-vote cache
+    /// validates the member signature + stores). Drop-safe forward-compat.
+    PoawxFinalityVote = 29,
     Disconnect = 99,
 }
 
@@ -140,6 +144,7 @@ impl TryFrom<u8> for MessageType {
             26 => PoawxRolePrecommit,
             27 => PoawxRoleReveal,
             28 => PoawxCandidateAdmission,
+            29 => PoawxFinalityVote,
             99 => Disconnect,
             other => return Err(format!("Unknown message type: {}", other)),
         };
@@ -913,6 +918,31 @@ impl PoawxCandidateAdmissionPayload {
     }
 }
 
+/// Wire payload for `MessageType::PoawxFinalityVote` (Phase 21I). Opaque bytes
+/// here (same pattern as the admission/role gossip payloads); the node
+/// finality-vote cache validates the secp256k1 signature + stores.
+pub struct PoawxFinalityVotePayload {
+    pub vote_bytes: Vec<u8>,
+}
+
+impl PoawxFinalityVotePayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::PoawxFinalityVote,
+            payload: self.vote_bytes.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::PoawxFinalityVote {
+            return Err("Not a poawx finality vote".to_string());
+        }
+        Ok(PoawxFinalityVotePayload {
+            vote_bytes: msg.payload.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,6 +963,25 @@ mod tests {
                 .unwrap()
                 .admission_bytes,
             vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn message_type_try_from_finality_vote_29() {
+        assert_eq!(
+            MessageType::try_from(29u8).unwrap(),
+            MessageType::PoawxFinalityVote
+        );
+        let m = PoawxFinalityVotePayload {
+            vote_bytes: vec![9, 8, 7],
+        }
+        .to_message();
+        assert_eq!(m.msg_type, MessageType::PoawxFinalityVote);
+        assert_eq!(
+            PoawxFinalityVotePayload::from_message(&m)
+                .unwrap()
+                .vote_bytes,
+            vec![9, 8, 7]
         );
     }
 
