@@ -14244,6 +14244,18 @@ fn candidate_admission_bridge_guard(addr: &SocketAddr) -> Result<(), StatusCode>
     Ok(())
 }
 
+/// Phase 21I: loopback-only guard for the finality-vote bridge (testnet/devnet,
+/// mainnet hard-off, disabled unless the finality gossip gate is configured).
+fn finality_vote_bridge_guard(addr: &SocketAddr) -> Result<(), StatusCode> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !irium_node_rs::poawx_finality::finality_gossip_enabled() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
 async fn poawx_role_gossip_precommit_post(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -14370,6 +14382,54 @@ async fn poawx_candidate_admissions_get(
         .map(|a| hex::encode(a.serialize()))
         .collect();
     Ok(Json(json!({ "admissions": hexes })))
+}
+
+/// Phase 21I: loopback-only POST a member-signed finality vote; validate + store
+/// in the node cache and rebroadcast if newly accepted.
+async fn poawx_finality_vote_post(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, StatusCode> {
+    finality_vote_bridge_guard(&addr)?;
+    let cache = irium_node_rs::poawx_finality::global_finality_vote_cache();
+    cache.prune(state.status_height_cache.load(Ordering::Relaxed));
+    match cache.ingest_bytes(body.as_ref()) {
+        irium_node_rs::poawx_gossip::GossipOutcome::AcceptedNew => {
+            if let Some(ref p2p) = state.p2p {
+                p2p.broadcast_finality_vote(body.as_ref()).await;
+            }
+            Ok(Json(json!({"status":"accepted"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Duplicate => {
+            Ok(Json(json!({"status":"duplicate"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Rejected(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+/// Phase 21I: loopback-only GET finality votes for a height (hex-encoded canonical
+/// wire bytes, deterministic order). The pool filters by block_hash locally.
+async fn poawx_finality_votes_get(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Query(q): Query<RoleGossipHeightQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    finality_vote_bridge_guard(&addr)?;
+    let cache = irium_node_rs::poawx_finality::global_finality_vote_cache();
+    let tip = state.status_height_cache.load(Ordering::Relaxed);
+    cache.set_tip(tip);
+    let window = irium_node_rs::poawx_finality::finality_gossip_window();
+    if q.target_height < tip.saturating_sub(window) || q.target_height > tip.saturating_add(window)
+    {
+        return Ok(Json(json!({ "votes": [] })));
+    }
+    let hexes: Vec<String> = cache
+        .votes_for_height(q.target_height)
+        .iter()
+        .map(|v| hex::encode(v.serialize()))
+        .collect();
+    Ok(Json(json!({ "votes": hexes })))
 }
 
 async fn poawx_get_assignment(
@@ -18960,6 +19020,10 @@ async fn main() {
             "/poawx/candidate-admissions",
             get(poawx_candidate_admissions_get),
         )
+        // Phase 21I: loopback-only finality-vote bridge (testnet/devnet, mainnet
+        // hard-off, disabled unless the finality gossip gate is configured).
+        .route("/poawx/finality-vote", post(poawx_finality_vote_post))
+        .route("/poawx/finality-votes", get(poawx_finality_votes_get))
         .route("/rpc/submit_tx", post(submit_tx))
         // Fix D: pending-tx introspection + per-address pending-spent
         // outpoints. Both are public (rate-limited only) so the wallet's
