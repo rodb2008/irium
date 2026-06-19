@@ -2332,6 +2332,7 @@ fn usage() {
     eprintln!("  irium-wallet poawx-puzzle-challenge --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> [--ticket-digest <64hex>] [--assignment-proof-digest <64hex>] [--candidate-digest <64hex>] [--seed <64hex>]  (assigned-work puzzle, NOT chain PoW; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-puzzle-solve <same flags as poawx-puzzle-challenge>  (emits solution wire_hex; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-finality-vote --network-id <id> --target-height <H> --block-hash <64hex> [--parent-hash <64hex>] [--committee-epoch <N>] [--ticket-digest <64hex>] [--vote-type precommit|commit|checkpoint] --secret-hex <64hex> [--submit --node-rpc <loopback-url>]  (real secp256k1 vote; emit-only by default; --submit POSTs to the loopback node; testnet/devnet only; signing key is input-only, never echoed)");
+    eprintln!("  irium-wallet poawx-committed-admission --network-id <id> --target-height <H> --candidate-admission-root <64hex> --candidate-count <N> --seed <64hex> [--commit-height <N>] [--window-id <N>]  (chain-committed admission root; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3779,6 +3780,111 @@ fn cmd_poawx_role_emit(args: &[String], reveal: bool) -> Result<(), String> {
 
 /// Phase 21B: emit a PoAW-X miner work-ticket PROOF bound to a role + height
 /// (testnet/devnet only; mainnet hard-off). Prints JSON only — no private key.
+/// Phase 22A: build the committed-admission JSON (+ wire hex). Pure + testable; no
+/// private key. Mainnet hard-off (network_id 0). The committed-admission root is an
+/// input (computed from the admitted candidate set); this helper packages it.
+fn committed_admission_json(args: &[String]) -> Result<serde_json::Value, String> {
+    use irium_node_rs::poawx_committed_admission::{
+        committed_admission_window_id, AdmissionCommitmentV1,
+    };
+    let mut network_id: Option<u8> = None;
+    let mut target_height: Option<u64> = None;
+    let mut commit_height: Option<u64> = None;
+    let mut window_id: Option<u64> = None;
+    let mut candidate_count: u16 = 0;
+    let mut seed = [0u8; 32];
+    let mut root = [0u8; 32];
+    let hex_into = |s: &str, out: &mut [u8]| -> Result<(), String> {
+        let b = hex::decode(s.trim()).map_err(|_| "invalid hex".to_string())?;
+        if b.len() != out.len() {
+            return Err(format!("expected {} bytes", out.len()));
+        }
+        out.copy_from_slice(&b);
+        Ok(())
+    };
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--network-id" => {
+                network_id = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --network-id".to_string())?,
+                )
+            }
+            "--target-height" => {
+                target_height = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --target-height".to_string())?,
+                )
+            }
+            "--commit-height" => {
+                commit_height = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --commit-height".to_string())?,
+                )
+            }
+            "--window-id" => {
+                window_id = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --window-id".to_string())?,
+                )
+            }
+            "--candidate-count" => {
+                candidate_count = next_flag_value(args, &mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --candidate-count".to_string())?
+            }
+            "--seed" | "--prev-hash" => hex_into(&next_flag_value(args, &mut i)?, &mut seed)?,
+            "--candidate-admission-root" => hex_into(&next_flag_value(args, &mut i)?, &mut root)?,
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    let network_id = network_id.ok_or("--network-id required")?;
+    if network_id == 0 {
+        return Err("committed admission is mainnet-hard-off (network_id 0)".to_string());
+    }
+    let target_height = target_height.ok_or("--target-height required")?;
+    let commit_height = commit_height.unwrap_or_else(|| target_height.saturating_sub(1));
+    let window_id = window_id.unwrap_or_else(|| committed_admission_window_id(target_height));
+    let ca = AdmissionCommitmentV1::new(
+        network_id,
+        target_height,
+        commit_height,
+        seed,
+        root,
+        candidate_count,
+        window_id,
+    );
+    Ok(serde_json::json!({
+        "committed_admission": {
+            "network_id": ca.network_id,
+            "target_height": ca.target_height,
+            "commit_height": ca.commit_height,
+            "seed": hex::encode(ca.seed),
+            "candidate_admission_root": hex::encode(ca.candidate_admission_root),
+            "candidate_count": ca.candidate_count,
+            "window_id": ca.window_id,
+        },
+        "digest": hex::encode(ca.digest),
+        "wire_hex": hex::encode(ca.serialize()),
+        "note": "chain-committed admission root; testnet/devnet only; no signing key needed; producer embeds this in the commit block (target-1) ext",
+    }))
+}
+
+fn cmd_poawx_committed_admission(args: &[String]) -> Result<(), String> {
+    let v = committed_admission_json(args)?;
+    println!(
+        "{}",
+        serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?
+    );
+    eprintln!("[committed-admission] chain-committed admission root; testnet/devnet only; no private key.");
+    Ok(())
+}
+
 /// Phase 21H: build + sign a finality-committee vote (testable). The signing key
 /// is an INPUT (--secret-hex, testnet throwaway) and is NEVER echoed; the output
 /// carries only the public key, signature, digest, and wire. Mainnet hard-off.
@@ -16156,6 +16262,61 @@ mod tests {
         );
     }
 
+    fn cadmit_args(v: &[&str]) -> Vec<String> {
+        let mut o = vec!["poawx-committed-admission".to_string()];
+        o.extend(v.iter().map(|s| s.to_string()));
+        o
+    }
+
+    #[test]
+    fn phase22a_committed_admission_emit_no_secret_mainnet_off() {
+        let rt = "33".repeat(32);
+        let sd = "44".repeat(32);
+        let args = cadmit_args(&[
+            "--network-id",
+            "1",
+            "--target-height",
+            "11",
+            "--candidate-admission-root",
+            rt.as_str(),
+            "--candidate-count",
+            "3",
+            "--seed",
+            sd.as_str(),
+        ]);
+        let v = committed_admission_json(&args).expect("json");
+        let js = serde_json::to_string(&v).unwrap();
+        assert!(js.contains("candidate_admission_root"));
+        assert!(js.contains("wire_hex"));
+        assert!(!js.to_lowercase().contains("private"));
+        assert!(!js.to_lowercase().contains("mnemonic"));
+        assert!(!js.to_lowercase().contains("secret"));
+        // wire_hex deserializes + validates via the node lib (commit_height = target-1).
+        let wire = hex::decode(v["wire_hex"].as_str().unwrap()).unwrap();
+        let ca =
+            irium_node_rs::poawx_committed_admission::AdmissionCommitmentV1::deserialize(&wire)
+                .unwrap();
+        assert!(
+            ca.validate(1, 11).is_ok(),
+            "node validates wallet commitment"
+        );
+        assert_eq!(ca.commit_height, 10);
+        // mainnet hard-off.
+        let m = cadmit_args(&[
+            "--network-id",
+            "0",
+            "--target-height",
+            "11",
+            "--candidate-admission-root",
+            rt.as_str(),
+            "--candidate-count",
+            "3",
+            "--seed",
+            sd.as_str(),
+        ]);
+        assert!(committed_admission_json(&m).is_err(), "mainnet hard-off");
+    }
+
     #[test]
     fn phase21f_puzzle_challenge_and_solve_no_secret_mainnet_off() {
         std::env::set_var("IRIUM_POAWX_PUZZLE_BITS", "4");
@@ -26773,6 +26934,12 @@ fn main() {
         }
         "poawx-finality-vote" => {
             if let Err(e) = cmd_poawx_finality_vote(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        "poawx-committed-admission" => {
+            if let Err(e) = cmd_poawx_committed_admission(&args) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
