@@ -2329,7 +2329,7 @@ fn usage() {
     eprintln!("  irium-wallet poawx-ticket-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --epoch <N> --expiry-height <N> [--assignment-pubkey <66hex>] [--sybil-nonce <64hex>] [--penalty-status <0..4>]");
     eprintln!("  irium-wallet poawx-assignment-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--assignment-pubkey <66hex>]  (VRF-style placeholder; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-assignment-proof-v2 --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> --secret-hex <64hex>  (true secp256k1 RFC 9381 ECVRF; testnet/devnet only; VRF secret is input-only, never echoed)");
-    eprintln!("  irium-wallet poawx-candidate-admission --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--role-claim-digest <64hex>] [--penalty-status <0..4>] [--dominance-weight <N>] [--assignment-pubkey <66hex>]  (emits wire_hex to POST to /poawx/candidate-admission; testnet/devnet only; no private key)");
+    eprintln!("  irium-wallet poawx-candidate-admission --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--role-claim-digest <64hex>] [--penalty-status <0..4>] [--dominance-weight <N>] [--assignment-pubkey <66hex>] [--secret-hex <64hex> (binds a true-VRF proof; input-only, never echoed)] [--submit --node-rpc <loopback-url>]  (emits wire_hex to POST to /poawx/candidate-admission; testnet/devnet only)");
     eprintln!("  irium-wallet poawx-puzzle-challenge --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> [--ticket-digest <64hex>] [--assignment-proof-digest <64hex>] [--candidate-digest <64hex>] [--seed <64hex>]  (assigned-work puzzle, NOT chain PoW; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-puzzle-solve <same flags as poawx-puzzle-challenge>  (emits solution wire_hex; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-finality-vote --network-id <id> --target-height <H> --block-hash <64hex> [--parent-hash <64hex>] [--committee-epoch <N>] [--ticket-digest <64hex>] [--vote-type precommit|commit|checkpoint] --secret-hex <64hex> [--submit --node-rpc <loopback-url>]  (real secp256k1 vote; emit-only by default; --submit POSTs to the loopback node; testnet/devnet only; signing key is input-only, never echoed)");
@@ -4212,7 +4212,7 @@ fn cmd_poawx_puzzle_solve(args: &[String]) -> Result<(), String> {
 /// no private key, no seed phrase. Mainnet hard-off (network_id 0).
 fn candidate_admission_json(args: &[String]) -> Result<serde_json::Value, String> {
     use irium_node_rs::poawx_admission::CandidateAdmissionV1;
-    use irium_node_rs::poawx_candidate::RoleCandidate;
+    use irium_node_rs::poawx_candidate::{AssignmentProofV2, RoleCandidate};
     use irium_node_rs::poawx_dominance::DOMINANCE_BASE_WORK_SCORE;
     let mut network_id: Option<u8> = None;
     let mut target_height: Option<u64> = None;
@@ -4224,6 +4224,7 @@ fn candidate_admission_json(args: &[String]) -> Result<serde_json::Value, String
     let mut role_claim_digest: [u8; 32] = [0u8; 32];
     let mut penalty_status: u8 = 0;
     let mut dominance_weight: u64 = DOMINANCE_BASE_WORK_SCORE;
+    let mut secret: Option<[u8; 32]> = None;
     let hex_into = |s: &str, out: &mut [u8]| -> Result<(), String> {
         let b = hex::decode(s.trim()).map_err(|_| "invalid hex".to_string())?;
         if b.len() != out.len() {
@@ -4275,6 +4276,19 @@ fn candidate_admission_json(args: &[String]) -> Result<serde_json::Value, String
                     .parse()
                     .map_err(|_| "invalid --dominance-weight".to_string())?
             }
+            "--secret-hex" => {
+                let mut sk = [0u8; 32];
+                hex_into(&next_flag_value(args, &mut i)?, &mut sk)?;
+                secret = Some(sk);
+            }
+            // Phase 22E: loopback-submit flags handled by the command wrapper;
+            // accept + skip here so the JSON builder does not error.
+            "--submit" => {
+                i += 1;
+            }
+            "--node-rpc" => {
+                let _ = next_flag_value(args, &mut i)?;
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -4288,19 +4302,64 @@ fn candidate_admission_json(args: &[String]) -> Result<serde_json::Value, String
     if irium_node_rs::poawx_penalty::PenaltyStatus::from_id(penalty_status).is_none() {
         return Err("invalid --penalty-status (0..=4)".to_string());
     }
-    let candidate = RoleCandidate::build(
-        network_id,
-        target_height,
-        &seed,
-        role,
-        solver,
-        apk,
-        ticket_digest,
-        penalty_status,
-        dominance_weight,
-        role_claim_digest,
-    );
-    let adm = CandidateAdmissionV1::new(network_id, target_height, seed, candidate.clone());
+    // Phase 22E: when --secret-hex is given, produce a true-VRF AssignmentProofV2
+    // (secret is input-only, never echoed) and bind it into the admission; the
+    // candidate's assignment_public_key + digest come from the VRF proof. Otherwise
+    // emit the V1 placeholder admission (backward compatible).
+    let v2 = match secret {
+        Some(sk) => Some(AssignmentProofV2::prove(
+            &sk,
+            network_id,
+            target_height,
+            role,
+            solver,
+            ticket_digest,
+            seed,
+        )?),
+        None => None,
+    };
+    let (candidate, adm) = match &v2 {
+        Some(p) => {
+            let c = RoleCandidate::from_assignment_v2(
+                p,
+                penalty_status,
+                dominance_weight,
+                role_claim_digest,
+            );
+            let a = CandidateAdmissionV1::new_with_v2(
+                network_id,
+                target_height,
+                seed,
+                c.clone(),
+                Some(p.clone()),
+            );
+            (c, a)
+        }
+        None => {
+            let c = RoleCandidate::build(
+                network_id,
+                target_height,
+                &seed,
+                role,
+                solver,
+                apk,
+                ticket_digest,
+                penalty_status,
+                dominance_weight,
+                role_claim_digest,
+            );
+            let a = CandidateAdmissionV1::new(network_id, target_height, seed, c.clone());
+            (c, a)
+        }
+    };
+    let v2_json = v2.as_ref().map(|p| {
+        serde_json::json!({
+            "vrf_output": hex::encode(p.vrf_output),
+            "vrf_proof": hex::encode(p.vrf_proof),
+            "assignment_proof_digest": hex::encode(p.digest),
+            "assignment_score": p.score(),
+        })
+    });
     Ok(serde_json::json!({
         "admission": {
             "network_id": adm.network_id,
@@ -4318,10 +4377,12 @@ fn candidate_admission_json(args: &[String]) -> Result<serde_json::Value, String
                 "effective_score": candidate.effective_score,
                 "role_claim_digest": hex::encode(candidate.role_claim_digest),
             },
+            "assignment_proof_v2": v2_json,
         },
         "admission_digest": hex::encode(adm.digest),
+        "true_vrf": v2.is_some(),
         "wire_hex": hex::encode(adm.serialize()),
-        "note": "VRF-style placeholder assignment; testnet/devnet only; no signing key needed; POST wire_hex to /poawx/candidate-admission",
+        "note": "testnet/devnet only; with --secret-hex a true-VRF AssignmentProofV2 is bound (secret never echoed); POST wire_hex to /poawx/candidate-admission",
     }))
 }
 
@@ -4333,7 +4394,43 @@ fn cmd_poawx_candidate_admission_emit(args: &[String]) -> Result<(), String> {
         "{}",
         serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?
     );
-    eprintln!("[candidate-admission] VRF-style placeholder, no private key; POST wire_hex to the node's loopback /poawx/candidate-admission (testnet/devnet only).");
+    // Phase 22E: optional loopback submit (default emit-only). Only POSTs when
+    // --submit is given; requires --node-rpc <loopback-url>. Testnet/devnet.
+    let mut submit = false;
+    let mut node_rpc: Option<String> = None;
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--submit" => {
+                submit = true;
+                i += 1;
+            }
+            "--node-rpc" => {
+                node_rpc = Some(next_flag_value(args, &mut i)?);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    if submit {
+        let url = node_rpc.ok_or("--submit requires --node-rpc <loopback-url>")?;
+        let wire = v["wire_hex"].as_str().ok_or("missing wire_hex")?;
+        let bytes = hex::decode(wire).map_err(|_| "bad wire_hex".to_string())?;
+        let client = reqwest::blocking::Client::builder()
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        let endpoint = format!("{}/poawx/candidate-admission", url.trim_end_matches('/'));
+        match client.post(&endpoint).body(bytes).send() {
+            Ok(r) => eprintln!(
+                "[candidate-admission] submitted to {} -> status {}",
+                endpoint,
+                r.status()
+            ),
+            Err(e) => eprintln!("[candidate-admission] submit failed (best-effort): {e}"),
+        }
+    }
+    eprintln!("[candidate-admission] testnet/devnet only; with --secret-hex a true-VRF proof is bound; the VRF secret is input-only and never echoed; POST wire_hex to the node's loopback /poawx/candidate-admission.");
     Ok(())
 }
 
@@ -16606,6 +16703,84 @@ mod tests {
             assignment_proof_v2_json(&n).is_err(),
             "missing --secret-hex"
         );
+    }
+
+    #[test]
+    fn phase22e_candidate_admission_v2_emit_and_submit() {
+        let td = "11".repeat(32);
+        let sd = "22".repeat(32);
+        let sv = "aa".repeat(20);
+        let sk = "07".repeat(32);
+        let base = |extra: &[&str]| -> Vec<String> {
+            let mut v = vec![
+                "--network-id",
+                "1",
+                "--target-height",
+                "10",
+                "--role",
+                "compute",
+                "--solver",
+                &sv,
+                "--ticket-digest",
+                &td,
+                "--seed",
+                &sd,
+            ];
+            v.extend_from_slice(extra);
+            cadm_args(&v)
+        };
+        // (1)+(2) with --secret-hex a true-VRF proof is bound and emitted in a
+        // candidate-admission-compatible JSON.
+        let v = candidate_admission_json(&base(&["--secret-hex", &sk])).expect("json");
+        let s = serde_json::to_string(&v).unwrap();
+        assert_eq!(v["true_vrf"], serde_json::json!(true), "true_vrf flagged");
+        assert!(s.contains("vrf_output"), "has vrf output");
+        assert!(s.contains("assignment_proof_v2"), "has v2 section");
+        // the wire decodes to a node admission carrying the V2 proof, and the proof
+        // verifies + binds to the candidate (output == candidate digest).
+        let wire = hex::decode(v["wire_hex"].as_str().unwrap()).unwrap();
+        let adm = irium_node_rs::poawx_admission::CandidateAdmissionV1::deserialize(&wire).unwrap();
+        let proof = adm.assignment_proof_v2.as_ref().expect("v2 bound");
+        proof.validate(1, 10).expect("v2 verifies");
+        assert_eq!(
+            proof.vrf_output, adm.candidate.assignment_proof_digest,
+            "output == candidate digest"
+        );
+        // (4) the VRF secret never leaks.
+        assert!(!s.contains(&sk), "secret hex not echoed");
+        assert!(!s.to_lowercase().contains("mnemonic"));
+        assert!(!s.to_lowercase().contains("private"));
+        // (3) loopback-submit flags are accepted by the JSON builder (skipped).
+        let vs = candidate_admission_json(&base(&[
+            "--secret-hex",
+            &sk,
+            "--submit",
+            "--node-rpc",
+            "http://127.0.0.1:1/",
+        ]))
+        .expect("submit-flags json");
+        assert!(
+            vs["wire_hex"].as_str().is_some(),
+            "wire_hex present with submit flags"
+        );
+        // (5) mainnet disabled.
+        let m = cadm_args(&[
+            "--network-id",
+            "0",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            &sv,
+            "--ticket-digest",
+            &td,
+            "--seed",
+            &sd,
+            "--secret-hex",
+            &sk,
+        ]);
+        assert!(candidate_admission_json(&m).is_err(), "mainnet hard-off");
     }
 
     #[test]
