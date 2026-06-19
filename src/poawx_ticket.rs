@@ -570,6 +570,27 @@ mod tests {
     }
 
     #[test]
+    fn phase24a_ticket_wire_malformed_rejected() {
+        // MinerWorkTicket requires a minimum length; short input rejects, no panic.
+        assert!(
+            MinerWorkTicket::deserialize(&[0u8; 50]).is_err(),
+            "too short"
+        );
+        assert!(MinerWorkTicket::deserialize(&[]).is_err());
+        // TicketProof is exact-length.
+        assert!(TicketProof::deserialize(&[0u8; TICKET_PROOF_WIRE - 1]).is_err());
+        assert!(TicketProof::deserialize(&[0u8; TICKET_PROOF_WIRE + 1]).is_err());
+        // a valid ticket round-trips; truncating the tail rejects (no panic).
+        let t = mk(2, 100, 200);
+        let w = t.serialize();
+        assert!(MinerWorkTicket::deserialize(&w).is_ok());
+        assert!(
+            MinerWorkTicket::deserialize(&w[..w.len() - 1]).is_err(),
+            "truncated tail"
+        );
+    }
+
+    #[test]
     fn ticket_serialize_roundtrip_and_digest_mutation() {
         let t = mk(1, 10, 100);
         let b = t.serialize();

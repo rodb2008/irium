@@ -508,6 +508,14 @@ mod tests {
     }
 
     #[test]
+    fn phase24a_puzzle_solution_wire_malformed_rejected() {
+        assert!(PuzzleSolutionV1::deserialize(&[0u8; PUZZLE_SOLUTION_WIRE - 1]).is_err());
+        assert!(PuzzleSolutionV1::deserialize(&[0u8; PUZZLE_SOLUTION_WIRE + 1]).is_err());
+        assert!(PuzzleSolutionV1::deserialize(&[]).is_err());
+        assert!(PuzzleSolutionV1::deserialize(&[0u8; PUZZLE_SOLUTION_WIRE]).is_ok());
+    }
+
+    #[test]
     fn mode_assignment_deterministic_and_bound() {
         let (pkh, td, apd, _cd, seed) = ctx();
         let m1 = assign_puzzle_mode(1, 10, 1, &pkh, &td, &apd, &seed);

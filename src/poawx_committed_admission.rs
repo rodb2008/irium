@@ -311,6 +311,15 @@ mod tests {
     }
 
     #[test]
+    fn phase24a_committed_admission_wire_malformed_rejected() {
+        assert!(AdmissionCommitmentV1::deserialize(&[0u8; ADMISSION_COMMITMENT_WIRE - 1]).is_err());
+        assert!(AdmissionCommitmentV1::deserialize(&[0u8; ADMISSION_COMMITMENT_WIRE + 1]).is_err());
+        assert!(AdmissionCommitmentV1::deserialize(&[]).is_err());
+        // all-zeros at exact length still rejects (version byte guard).
+        assert!(AdmissionCommitmentV1::deserialize(&[0u8; ADMISSION_COMMITMENT_WIRE]).is_err());
+    }
+
+    #[test]
     fn commitment_wire_roundtrip_and_validate() {
         let seed = [0x44u8; 32];
         let cs = sample_set(1, 11, seed);

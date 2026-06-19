@@ -736,6 +736,52 @@ pub fn global_finality_vote_cache() -> &'static NodeFinalityVoteCache {
 mod tests {
     use super::*;
 
+    #[test]
+    fn phase24a_finality_wire_malformed_rejected() {
+        let bh = [0x11u8; 32];
+        let ph = [0x22u8; 32];
+        // vote: exact wire.
+        assert!(FinalityVoteV1::deserialize(&[0u8; FINALITY_VOTE_WIRE - 1]).is_err());
+        assert!(FinalityVoteV1::deserialize(&[0u8; FINALITY_VOTE_WIRE + 1]).is_err());
+        assert!(FinalityVoteV1::deserialize(&[]).is_err());
+        // proof: build a valid 1-vote proof, then corrupt the wire.
+        let mut p = FinalityProofV1::new(1, 10, bh, ph, 0, 1, 1);
+        p.push(FinalityVoteV1::signed(
+            &key(7),
+            1,
+            10,
+            bh,
+            ph,
+            0,
+            [0u8; 32],
+            FinalityVoteType::Commit,
+        ));
+        let w = p.serialize();
+        assert!(FinalityProofV1::deserialize(&w).is_ok());
+        assert!(
+            FinalityProofV1::deserialize(&w[..3]).is_err(),
+            "truncated header"
+        );
+        assert!(
+            FinalityProofV1::deserialize(&w[..w.len() - 1]).is_err(),
+            "truncated body"
+        );
+        let mut over = w.clone();
+        over.push(0);
+        assert!(
+            FinalityProofV1::deserialize(&over).is_err(),
+            "trailing junk"
+        );
+        // count field (u16 LE) at offset 86 -> set huge -> too many votes (cap 256).
+        let mut huge = w.clone();
+        huge[86] = 0xFF;
+        huge[87] = 0x01;
+        assert!(
+            FinalityProofV1::deserialize(&huge).is_err(),
+            "count overflow"
+        );
+    }
+
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_slice(&[seed; 32]).expect("sk")
     }
