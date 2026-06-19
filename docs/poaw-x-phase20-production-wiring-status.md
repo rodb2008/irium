@@ -413,3 +413,14 @@ The live integration is a multi-thousand-line change across `iriumd` (~25k lines
 trusted-miner flow depends on. Landing the consensus validator + extension first (this pass,
 zero-regression) makes the live integration a smaller, reviewable, bisectable next step rather
 than one risky mega-change. **Production wiring is therefore PARTIAL, not COMPLETE — not faked.**
+
+
+## Phase 22B — true VRF decision package (PENDING)
+
+True VRF remains **pending** (true VRF pending): `AssignmentProofV1` is a **placeholder**,
+**mainnet hard-off**, **not mainnet-ready**, and **no homemade VRF** will be added. The
+key-model + dependency decision (Option A secp256k1 ECVRF without OpenSSL, vs Option B a
+separate audited sr25519/Ristretto VRF key, then Option C vendor + security review) is
+captured in `docs/poaw-x-phase22b-true-vrf-decision-package.md`. No code/dependency/Cargo
+change in Phase 22B (docs-only). PoAW-X is **not full blueprint-complete** until this VRF
+decision is approved and implemented; no push, no mainnet, no audit/vote.

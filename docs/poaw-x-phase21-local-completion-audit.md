@@ -164,3 +164,14 @@ Phase 22A (chain-committed candidate admission) has since been added on top of t
 in the parent block and re-validated at the target block (gated, mainnet hard-off). It
 strengthens 21E without claiming offline-miner discovery; true VRF remains pending. See
 `poaw-x-phase22a-committed-admission.md` and `poaw-x-blueprint-completion-gap-audit.md`.
+
+
+## Phase 22B — true VRF decision package (PENDING)
+
+True VRF remains **pending** (true VRF pending): `AssignmentProofV1` is a **placeholder**,
+**mainnet hard-off**, **not mainnet-ready**, and **no homemade VRF** will be added. The
+key-model + dependency decision (Option A secp256k1 ECVRF without OpenSSL, vs Option B a
+separate audited sr25519/Ristretto VRF key, then Option C vendor + security review) is
+captured in `docs/poaw-x-phase22b-true-vrf-decision-package.md`. No code/dependency/Cargo
+change in Phase 22B (docs-only). PoAW-X is **not full blueprint-complete** until this VRF
+decision is approved and implemented; no push, no mainnet, no audit/vote.
