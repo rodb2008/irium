@@ -2328,6 +2328,7 @@ fn usage() {
     eprintln!("  irium-wallet poawx-role-reveal --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --secret <64hex> --nonce <64hex> --prev-hash <64hex>");
     eprintln!("  irium-wallet poawx-ticket-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --epoch <N> --expiry-height <N> [--assignment-pubkey <66hex>] [--sybil-nonce <64hex>] [--penalty-status <0..4>]");
     eprintln!("  irium-wallet poawx-assignment-proof --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--assignment-pubkey <66hex>]  (VRF-style placeholder; testnet/devnet only; no private key)");
+    eprintln!("  irium-wallet poawx-assignment-proof-v2 --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> --secret-hex <64hex>  (true secp256k1 RFC 9381 ECVRF; testnet/devnet only; VRF secret is input-only, never echoed)");
     eprintln!("  irium-wallet poawx-candidate-admission --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> --ticket-digest <64hex> --seed <64hex> [--role-claim-digest <64hex>] [--penalty-status <0..4>] [--dominance-weight <N>] [--assignment-pubkey <66hex>]  (emits wire_hex to POST to /poawx/candidate-admission; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-puzzle-challenge --network-id <id> --target-height <H> --role <compute|verify|support> --solver <addr|40hex> [--ticket-digest <64hex>] [--assignment-proof-digest <64hex>] [--candidate-digest <64hex>] [--seed <64hex>]  (assigned-work puzzle, NOT chain PoW; testnet/devnet only; no private key)");
     eprintln!("  irium-wallet poawx-puzzle-solve <same flags as poawx-puzzle-challenge>  (emits solution wire_hex; testnet/devnet only; no private key)");
@@ -4422,6 +4423,112 @@ fn assignment_proof_json(args: &[String]) -> Result<serde_json::Value, String> {
 
 /// Phase 21D: emit a PoAW-X assignment proof (VRF-style placeholder). No private
 /// key, testnet/devnet only, mainnet hard-off.
+/// Phase 22D: emit a true secp256k1 RFC 9381 ECVRF AssignmentProofV2. The VRF
+/// secret is an INPUT (--secret-hex, testnet throwaway) and is NEVER echoed; the
+/// output carries only the public key, VRF output, proof, digest, score, and wire.
+/// Mainnet hard-off (network_id 0). Emit-only (operator/pool attaches to the gated
+/// Phase 20 ext; the node re-verifies).
+fn assignment_proof_v2_json(args: &[String]) -> Result<serde_json::Value, String> {
+    use irium_node_rs::poawx_candidate::AssignmentProofV2;
+    let mut network_id: Option<u8> = None;
+    let mut target_height: Option<u64> = None;
+    let mut role: Option<u8> = None;
+    let mut solver: Option<[u8; 20]> = None;
+    let mut ticket_digest = [0u8; 32];
+    let mut seed = [0u8; 32];
+    let mut secret: Option<[u8; 32]> = None;
+    let hex_into = |s: &str, out: &mut [u8]| -> Result<(), String> {
+        let b = hex::decode(s.trim()).map_err(|_| "invalid hex".to_string())?;
+        if b.len() != out.len() {
+            return Err(format!("expected {} bytes", out.len()));
+        }
+        out.copy_from_slice(&b);
+        Ok(())
+    };
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--network-id" => {
+                network_id = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --network-id".to_string())?,
+                )
+            }
+            "--target-height" => {
+                target_height = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --target-height".to_string())?,
+                )
+            }
+            "--role" => {
+                let r = next_flag_value(args, &mut i)?;
+                role = Some(match r.to_ascii_lowercase().as_str() {
+                    "compute" | "1" => irium_node_rs::poawx::ROLE_COMPUTE_CONTRIBUTOR,
+                    "verify" | "2" => irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR,
+                    "support" | "3" => irium_node_rs::poawx::ROLE_SUPPORT_CONTRIBUTOR,
+                    other => return Err(format!("invalid --role {other}")),
+                });
+            }
+            "--solver" => solver = Some(resolve_fee_pkh_arg(&next_flag_value(args, &mut i)?)?),
+            "--ticket-digest" => hex_into(&next_flag_value(args, &mut i)?, &mut ticket_digest)?,
+            "--seed" | "--prev-hash" => hex_into(&next_flag_value(args, &mut i)?, &mut seed)?,
+            "--secret-hex" => {
+                let mut sk = [0u8; 32];
+                hex_into(&next_flag_value(args, &mut i)?, &mut sk)?;
+                secret = Some(sk);
+            }
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    let network_id = network_id.ok_or("--network-id required")?;
+    if network_id == 0 {
+        return Err("assignment proof v2 is mainnet-hard-off (network_id 0)".to_string());
+    }
+    let target_height = target_height.ok_or("--target-height required")?;
+    let role = role.ok_or("--role required")?;
+    let solver = solver.ok_or("--solver <addr|40hex> required")?;
+    let secret = secret.ok_or("--secret-hex <64hex> required (testnet throwaway)")?;
+    let proof = AssignmentProofV2::prove(
+        &secret,
+        network_id,
+        target_height,
+        role,
+        solver,
+        ticket_digest,
+        seed,
+    )?;
+    // Self-verify before emitting (never emit an invalid proof).
+    proof.validate(network_id, target_height)?;
+    Ok(serde_json::json!({
+        "version": proof.version,
+        "network_id": proof.network_id,
+        "target_height": proof.target_height,
+        "role_id": proof.role_id,
+        "solver_pkh": hex::encode(proof.solver_pkh),
+        "assignment_public_key": hex::encode(proof.assignment_public_key),
+        "ticket_digest": hex::encode(proof.ticket_digest),
+        "seed": hex::encode(proof.seed),
+        "vrf_output": hex::encode(proof.vrf_output),
+        "vrf_proof": hex::encode(proof.vrf_proof),
+        "assignment_proof_digest": hex::encode(proof.digest),
+        "assignment_score": proof.score(),
+        "wire_hex": hex::encode(proof.serialize()),
+        "note": "true secp256k1 RFC 9381 ECVRF assignment proof; testnet/devnet only; the VRF secret is an input and is never echoed; operator/pool attaches the AVR2 wire to the gated Phase 20 ext and the node re-verifies",
+    }))
+}
+
+fn cmd_poawx_assignment_v2_emit(args: &[String]) -> Result<(), String> {
+    let v = assignment_proof_v2_json(args)?;
+    println!(
+        "{}",
+        serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?
+    );
+    eprintln!("[assignment-proof-v2] real secp256k1 ECVRF; testnet/devnet only; the VRF secret is input-only and never echoed.");
+    Ok(())
+}
+
 fn cmd_poawx_assignment_emit(args: &[String]) -> Result<(), String> {
     let v = assignment_proof_json(args)?;
     println!(
@@ -16177,6 +16284,12 @@ mod tests {
         o
     }
 
+    fn aproof_v2_args(v: &[&str]) -> Vec<String> {
+        let mut o = vec!["poawx-assignment-proof-v2".to_string()];
+        o.extend(v.iter().map(|s| s.to_string()));
+        o
+    }
+
     fn cadm_args(v: &[&str]) -> Vec<String> {
         let mut o = vec!["poawx-candidate-admission".to_string()];
         o.extend(v.iter().map(|s| s.to_string()));
@@ -16418,6 +16531,81 @@ mod tests {
             &sd,
         ]);
         assert!(candidate_admission_json(&m).is_err(), "mainnet hard-off");
+    }
+
+    #[test]
+    fn phase22d_assignment_proof_v2_emit_no_secret_mainnet_off() {
+        let td = "11".repeat(32);
+        let sd = "22".repeat(32);
+        let sv = "aa".repeat(20);
+        let sk = "07".repeat(32);
+        let args = aproof_v2_args(&[
+            "--network-id",
+            "1",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            &sv,
+            "--ticket-digest",
+            &td,
+            "--seed",
+            &sd,
+            "--secret-hex",
+            &sk,
+        ]);
+        let v = assignment_proof_v2_json(&args).expect("json");
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.contains("vrf_output"), "has vrf output");
+        assert!(s.contains("vrf_proof"), "has vrf proof");
+        assert!(s.contains("assignment_score"), "has score");
+        // the emitted wire re-validates via the node lib.
+        let wire = hex::decode(v["wire_hex"].as_str().unwrap()).unwrap();
+        let proof = irium_node_rs::poawx_candidate::AssignmentProofV2::deserialize(&wire).unwrap();
+        proof
+            .validate(1, 10)
+            .expect("node re-validates emitted proof");
+        // the VRF secret must NOT leak (only the public key/output/proof are emitted).
+        assert!(!s.contains(&sk), "secret hex not echoed");
+        assert!(!s.to_lowercase().contains("private"));
+        assert!(!s.to_lowercase().contains("mnemonic"));
+        // mainnet hard-off (network_id 0) and missing-secret both error.
+        let m = aproof_v2_args(&[
+            "--network-id",
+            "0",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            &sv,
+            "--ticket-digest",
+            &td,
+            "--seed",
+            &sd,
+            "--secret-hex",
+            &sk,
+        ]);
+        assert!(assignment_proof_v2_json(&m).is_err(), "mainnet hard-off");
+        let n = aproof_v2_args(&[
+            "--network-id",
+            "1",
+            "--target-height",
+            "10",
+            "--role",
+            "compute",
+            "--solver",
+            &sv,
+            "--ticket-digest",
+            &td,
+            "--seed",
+            &sd,
+        ]);
+        assert!(
+            assignment_proof_v2_json(&n).is_err(),
+            "missing --secret-hex"
+        );
     }
 
     #[test]
@@ -26910,6 +27098,12 @@ fn main() {
         }
         "poawx-assignment-proof" => {
             if let Err(e) = cmd_poawx_assignment_emit(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        "poawx-assignment-proof-v2" => {
+            if let Err(e) = cmd_poawx_assignment_v2_emit(&args) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
