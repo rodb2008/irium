@@ -149,3 +149,15 @@ mainnet hard-off, with node-authoritative validation and pool byte-parity. It is
 mainnet-ready**, and it **requires external security review and a public testnet (then
 independent audit + a governance/activation decision) before any push, merge, or mainnet
 activation.**
+
+## Phase 24E update (two-VPS production-candidate validation — PARTIAL)
+
+Phase 24E attempted the full two-VPS all-gates validation. Cross-host P2P was BLOCKED at the
+firewall/provider layer (port 40610 dropped despite an OS ufw allow; SSH:22 from the same source
+worked). A single-host loopback demo validated, under all gates on a live node, the admission +
+finality ingest/validation/cache path (true-VRF V2 admission + member-signed finality vote both
+accepted [200 OK] and cached); Phase 24C storage isolation stayed safe; the VRF secret never
+leaked. NOT validated: cross-host P2P/gossip, node-to-node P2P gossip (same-host peers are
+filtered), all-gates block production, fee blocks, observer/restart block validation. NOT
+production-ready; NOT mainnet-ready. See docs/poaw-x-phase24e-two-vps-production-candidate-
+validation.md.
