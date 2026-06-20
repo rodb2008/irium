@@ -14448,9 +14448,10 @@ async fn poawx_get_assignment(
     let (height, tip_hash_bytes, bits) = {
         let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip_h = guard.tip_height();
-        if tip_h == 0 {
-            return Err(StatusCode::NOT_FOUND);
-        }
+        // Phase 24F: serve the assignment at the genesis tip (tip_h == 0) on test
+        // networks too, so a fresh devnet/testnet can produce its first PoAW-X block.
+        // Mainnet + inactive are already rejected above; the seed derives from the
+        // genesis tip hash via the same path used for tip_h >= 1.
         let tip_hash = guard
             .chain
             .last()
@@ -27231,6 +27232,51 @@ mod tests {
     fn poawx_env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn phase24f_assignment_served_at_genesis_devnet_only() {
+        let _env_guard = poawx_env_lock().lock().unwrap();
+        let (state, _, _, _) = create_test_state(None);
+        let addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
+        let headers = HeaderMap::new();
+        // devnet + active: served at the genesis tip (tip_h == 0) — Phase 24F fix.
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let ok =
+            poawx_get_assignment(ConnectInfo(addr), State(state.clone()), headers.clone()).await;
+        assert!(ok.is_ok(), "devnet genesis must serve assignment");
+        let v = ok.unwrap().0;
+        assert_eq!(v["height"].as_u64(), Some(0), "genesis height 0");
+        assert_eq!(
+            v["seed"].as_str().map(|s| s.len()),
+            Some(64),
+            "32-byte seed hex"
+        );
+        assert!(v["pow_bits"].as_str().is_some(), "pow_bits present");
+        assert!(
+            v["puzzle_difficulty"].as_u64().is_some(),
+            "puzzle_difficulty present"
+        );
+        // mainnet: rejected (hard-off preserved).
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(
+            poawx_get_assignment(ConnectInfo(addr), State(state.clone()), headers.clone())
+                .await
+                .is_err(),
+            "mainnet must reject assignment"
+        );
+        // inactive: rejected.
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "off");
+        assert!(
+            poawx_get_assignment(ConnectInfo(addr), State(state), headers)
+                .await
+                .is_err(),
+            "inactive poawx must reject assignment"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
     }
 
     fn minimal_header() -> SubmitBlockHeader {
