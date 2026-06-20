@@ -47,3 +47,15 @@ Live all-gates block production is now unblocked at the assignment layer (assemb
 connect_block validate path is complete in code); a real cpuminer-mined all-gates block is
 still not demonstrated, and cross-host P2P remains firewall-blocked. NOT production-ready, NOT
 mainnet-ready. See docs/poaw-x-phase24f-pool-cpuminer-all-gates-harness.md.
+
+## Phase 24G update (single-VPS real mined block rehearsal — PARTIAL)
+
+Phase 24G validated LIVE: the 24F genesis /poawx/assignment fix (200 at tip 0) and the full
+wallet->node all-gates block-material path (3-role true-VRF V2 candidate admissions seeded with
+the genesis hash + finality vote, all validated under all gates and cached). A real
+cpuminer-mined accepted all-gates block was NOT demonstrated: it requires a miner<->pool
+onboarding/coordination layer (admitted role solvers == pool primary_pkh for all 3 roles;
+finality vote from a committee member; admitted candidates for H+1; dominance matching genesis
+state) + live PoW mining, and the synthetic producer path is disallowed for the claim. No fake,
+no weakened gates. NOT production-ready/mainnet-ready. See
+docs/poaw-x-phase24g-single-vps-real-mined-all-gates-block.md.

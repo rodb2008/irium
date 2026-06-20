@@ -75,3 +75,15 @@ Preserved unchanged:
 2. Run pool/stratum + cpuminer live on an isolated devnet (genesis assignment now served) to
    produce a real all-gates block; verify observer sync + restart/reload.
 3. Then (only after external audit + public testnet + governance) consider mainnet.
+
+## Phase 24G update (single-VPS real mined block rehearsal — PARTIAL)
+
+Phase 24G validated LIVE: the 24F genesis /poawx/assignment fix (200 at tip 0) and the full
+wallet->node all-gates block-material path (3-role true-VRF V2 candidate admissions seeded with
+the genesis hash + finality vote, all validated under all gates and cached). A real
+cpuminer-mined accepted all-gates block was NOT demonstrated: it requires a miner<->pool
+onboarding/coordination layer (admitted role solvers == pool primary_pkh for all 3 roles;
+finality vote from a committee member; admitted candidates for H+1; dominance matching genesis
+state) + live PoW mining, and the synthetic producer path is disallowed for the claim. No fake,
+no weakened gates. NOT production-ready/mainnet-ready. See
+docs/poaw-x-phase24g-single-vps-real-mined-all-gates-block.md.
