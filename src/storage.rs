@@ -468,16 +468,58 @@ fn normalize_under(base: &Path, input: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-fn configured_dir(var: &str) -> Option<PathBuf> {
+/// Phase 24C: resolve an explicit storage-dir env var, distinguishing UNSET from
+/// SET-BUT-INVALID so callers can FAIL CLOSED instead of silently falling back to
+/// the default `~/.irium` (which, on a host that also runs mainnet, is the mainnet
+/// live block store -- see the Phase 24B incident).
+/// - `Ok(None)`       => the var is UNSET (caller may use its default).
+/// - `Ok(Some(path))` => set to a path that resolves UNDER $HOME.
+/// - `Err(msg)`       => set to a path that does NOT resolve under $HOME (e.g. /tmp);
+///                       callers MUST fail closed and never fall back to ~/.irium.
+pub fn resolve_configured_dir(var: &str) -> Result<Option<PathBuf>, String> {
     let home = os_home_dir();
+    let raw = match env::var_os(var) {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let candidate = PathBuf::from(&raw);
+    match normalize_under(&home, &candidate) {
+        Some(normalized) if normalized.starts_with(&home) => Ok(Some(normalized)),
+        _ => Err(format!(
+            "{var} is set to {:?} which does not resolve under HOME ({:?}); refusing \
+             to fall back to the default ~/.irium. Set {var} to an explicit path under \
+             {:?}, or unset it to use the default.",
+            candidate, home, home
+        )),
+    }
+}
 
-    let raw = env::var_os(var)?;
-    let candidate = PathBuf::from(raw);
-    let normalized = normalize_under(&home, &candidate)?;
-    if normalized.starts_with(&home) {
-        Some(normalized)
-    } else {
-        None
+/// Validate every explicit storage-dir env var up front. Call at startup BEFORE any
+/// storage access so the node exits with a clear error rather than silently falling
+/// back to `~/.irium` when an explicit path is invalid. `Ok(())` when all set vars
+/// resolve under $HOME (or are unset); `Err` names the first offending var + path.
+pub fn validate_storage_env() -> Result<(), String> {
+    for var in [
+        "IRIUM_DATA_DIR",
+        "IRIUM_BLOCKS_DIR",
+        "IRIUM_STATE_DIR",
+        "IRIUM_BOOTSTRAP_DIR",
+    ] {
+        resolve_configured_dir(var)?;
+    }
+    Ok(())
+}
+
+/// Internal resolver used by the dir accessors. Preserves the `Option` contract
+/// (None => use default) for UNSET vars, but FAILS CLOSED (process exit) when an
+/// explicit var is invalid -- it must never silently fall back to ~/.irium.
+fn configured_dir(var: &str) -> Option<PathBuf> {
+    match resolve_configured_dir(var) {
+        Ok(opt) => opt,
+        Err(msg) => {
+            eprintln!("[fatal][storage] {msg}");
+            std::process::exit(78); // EX_CONFIG: fail closed, never fall back
+        }
     }
 }
 
@@ -972,5 +1014,70 @@ mod storage_security_tests {
 
         std::env::remove_var("IRIUM_BLOCKS_DIR");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // ── Phase 24C: storage isolation fail-closed (no fs touched; path logic only) ──
+    #[test]
+    fn phase24c_resolve_configured_dir_unset_invalid_valid() {
+        let _g = env_lock().lock().unwrap();
+        let home = os_home_dir();
+        for var in ["IRIUM_DATA_DIR", "IRIUM_BLOCKS_DIR", "IRIUM_STATE_DIR"] {
+            std::env::remove_var(var);
+            // (1/2/3) unset => Ok(None) (default permitted).
+            assert_eq!(resolve_configured_dir(var), Ok(None), "unset {var}");
+            // explicit /tmp (not under HOME) => Err, NO fallback.
+            std::env::set_var(var, "/tmp/irium-p24c-invalid");
+            let r = resolve_configured_dir(var);
+            assert!(r.is_err(), "/tmp must be rejected for {var}");
+            assert!(r.unwrap_err().contains(var), "error names {var}");
+            // (5) explicit HOME-rooted => Ok(Some(exact)).
+            let good = home.join(format!(".irium-p24c-{var}"));
+            std::env::set_var(var, &good);
+            assert_eq!(
+                resolve_configured_dir(var),
+                Ok(Some(good.clone())),
+                "home-rooted {var}"
+            );
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn phase24c_validate_storage_env_fail_closed() {
+        let _g = env_lock().lock().unwrap();
+        for var in [
+            "IRIUM_DATA_DIR",
+            "IRIUM_BLOCKS_DIR",
+            "IRIUM_STATE_DIR",
+            "IRIUM_BOOTSTRAP_DIR",
+        ] {
+            std::env::remove_var(var);
+        }
+        // (4) all unset => Ok (default behavior preserved).
+        assert!(validate_storage_env().is_ok(), "all unset ok");
+        // explicit invalid /tmp on any var => Err naming it.
+        std::env::set_var("IRIUM_BLOCKS_DIR", "/tmp/irium-p24c-bad");
+        let e = validate_storage_env();
+        assert!(
+            e.is_err() && e.unwrap_err().contains("IRIUM_BLOCKS_DIR"),
+            "invalid blocks dir rejected"
+        );
+        // HOME-rooted explicit => Ok.
+        std::env::set_var("IRIUM_BLOCKS_DIR", os_home_dir().join(".irium-p24c-ok"));
+        assert!(validate_storage_env().is_ok(), "home-rooted ok");
+        std::env::remove_var("IRIUM_BLOCKS_DIR");
+    }
+
+    #[test]
+    fn phase24c_default_preserved_when_unset() {
+        // (9) regression: with env unset, dirs resolve to the ~/.irium default
+        // (path computation only; does not create or touch ~/.irium).
+        let _g = env_lock().lock().unwrap();
+        for var in ["IRIUM_DATA_DIR", "IRIUM_BLOCKS_DIR", "IRIUM_STATE_DIR"] {
+            std::env::remove_var(var);
+        }
+        let irium = os_home_dir().join(".irium");
+        assert_eq!(blocks_dir(), irium.join("blocks"));
+        assert_eq!(state_dir(), irium.join("state"));
     }
 }

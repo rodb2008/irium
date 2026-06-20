@@ -16595,12 +16595,36 @@ async fn run_ltc_header_sync_cycle(
     ))
 }
 
+/// Phase 24C: true when the user requested help. Help must print usage and exit
+/// WITHOUT initializing storage or starting a node.
+fn args_request_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--help" || a == "-h")
+}
+
+fn print_iriumd_usage() {
+    println!("iriumd {} — Irium node", env!("CARGO_PKG_VERSION"));
+    println!("USAGE: iriumd [FLAGS]");
+    println!("  -V, --version   print version and exit");
+    println!("  -h, --help      print this help and exit");
+    println!();
+    println!("Configuration is via IRIUM_* environment variables (network, ports, PoAW-X");
+    println!("gates, storage dirs). Storage dirs IRIUM_DATA_DIR / IRIUM_BLOCKS_DIR /");
+    println!("IRIUM_STATE_DIR MUST resolve under $HOME; an explicit path that does not");
+    println!("(e.g. /tmp) causes iriumd to exit rather than fall back to ~/.irium.");
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     // Added to allow --version to be displayed
     let args: Vec<String> = std::env::args().collect();
     if args.contains(&"--version".to_string()) || args.contains(&"-V".to_string()) {
         println!("iriumd version {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+    // Phase 24C: help must print usage and exit WITHOUT initializing storage or
+    // starting a node (so `iriumd --help` cannot touch ~/.irium).
+    if args_request_help(&args) {
+        print_iriumd_usage();
         std::process::exit(0);
     }
     // -----------------------
@@ -16622,6 +16646,13 @@ async fn main() {
         }
     }
 
+    // Phase 24C: fail closed if an explicit storage-dir env var is invalid, instead
+    // of silently falling back to ~/.irium (the Phase 24B incident). Runs AFTER any
+    // config data_dir was applied to the env, BEFORE any storage access.
+    if let Err(e) = storage::validate_storage_env() {
+        eprintln!("[fatal][storage] {e}");
+        std::process::exit(78);
+    }
     let (blocks_dir, state_dir) = storage::ensure_runtime_dirs().unwrap_or_else(|e| {
         eprintln!("Failed to init runtime dirs: {e}");
         std::process::exit(1);
@@ -19277,6 +19308,20 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn phase24c_args_request_help() {
+        assert!(args_request_help(&[
+            "iriumd".to_string(),
+            "--help".to_string()
+        ]));
+        assert!(args_request_help(&["iriumd".to_string(), "-h".to_string()]));
+        assert!(!args_request_help(&[
+            "iriumd".to_string(),
+            "--version".to_string()
+        ]));
+        assert!(!args_request_help(&["iriumd".to_string()]));
+    }
 
     fn test_socket() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 38000)
