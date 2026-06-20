@@ -86,3 +86,13 @@ pass/validation result.**
 suite — e.g. `chain::phase22e_true_vrf_e2e_block` validates a full all-gates block in-process —
 and the Phase 23A/24A internal hardening + malformed-wire corpus remain green. Those are
 separate from this paused live rehearsal.)
+
+## Update — Phase 24C fixed the root cause
+
+The silent-fallback root cause is now fixed in code (Phase 24C): `storage::configured_dir`
+fails closed (exit 78) on an explicit invalid storage path instead of falling back to
+`~/.irium`, `storage::validate_storage_env()` guards startup, and `iriumd --help`/`-h` exits
+before any storage init. See `docs/poaw-x-phase24c-storage-isolation-hardening.md`. **Phase 24B
+itself remains PAUSED with no validation claim;** a future live rehearsal must set explicit
+`$HOME`-rooted `IRIUM_BLOCKS_DIR`/`STATE_DIR`/`DATA_DIR` and verify the printed storage paths
+before continuing, ideally on a host without mainnet.
