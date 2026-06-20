@@ -96,3 +96,12 @@ before any storage init. See `docs/poaw-x-phase24c-storage-isolation-hardening.m
 itself remains PAUSED with no validation claim;** a future live rehearsal must set explicit
 `$HOME`-rooted `IRIUM_BLOCKS_DIR`/`STATE_DIR`/`DATA_DIR` and verify the printed storage paths
 before continuing, ideally on a host without mainnet.
+
+## Update — Phase 24D retry (partial, paused at firewall)
+
+Phase 24D retried the two-VPS rehearsal with the Phase 24C fail-closed storage fix. The
+isolated `$HOME`-rooted launch path was validated live on BOTH hosts (node A on VPS-1, node B
+on VPS-2 from a git-bundle build, no push) with all gates enabled; neither node touched
+`~/.irium`. It **paused at the operator firewall gate** (no UFW rule opened, no cross-host
+P2P, no block production) and was cleaned up. No all-gates block / fee / observer / restart
+validation claim. See `docs/poaw-x-phase24d-two-vps-all-gates-retry.md`.
