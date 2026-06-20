@@ -36,3 +36,14 @@ State plainly, up front:
 - Non-PoAW-X mainnet services.
 - Public testnet operations and external miner operations (unless requested later).
 - A claim that the internal review substitutes for an external audit (it does not).
+
+## Phase 24F update (genesis assignment harness fix)
+
+Phase 24F found + fixed the exact live-block-production blocker: poawx_get_assignment returned
+404 at tip_height==0, so a fresh devnet could not get an assignment for block 1 (the 14-F
+genesis /poawx/assignment wall). Fix: serve the assignment at the genesis tip on
+devnet/testnet only (mainnet + inactive still 503; connect_block/LWMA/difficulty untouched).
+Live all-gates block production is now unblocked at the assignment layer (assembly + submit +
+connect_block validate path is complete in code); a real cpuminer-mined all-gates block is
+still not demonstrated, and cross-host P2P remains firewall-blocked. NOT production-ready, NOT
+mainnet-ready. See docs/poaw-x-phase24f-pool-cpuminer-all-gates-harness.md.
