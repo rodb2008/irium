@@ -1,4 +1,4 @@
-//! Phase 24K: Irium-native PoAW-X all-gates mining submit harness (helpers).
+//! Phase 24K/24L: Irium-native PoAW-X all-gates mining submit harness (helpers).
 //!
 //! Phase 24J proved the remaining blocker for a real all-gates block was mining
 //! TOOLING, not PoAW-X consensus: stock cpuminer/minerd hashes a standard
@@ -8,26 +8,46 @@
 //! Irium's ACTUAL PoW hash.
 //!
 //! This module provides the small, reusable, **mainnet-hard-off** primitives a
-//! devnet/testnet harness (in-process test today, an explicit dev binary for a
-//! future live Phase 24L) needs to produce a real all-gates block:
+//! devnet/testnet harness (in-process tests and the explicit
+//! `poawx-live-proof-harness` binary for the Phase 24L Windows live proof) needs
+//! to produce a real all-gates block:
 //!   * [`guard_network`] — refuse mainnet (`network_id == 0`); require an
 //!     explicit devnet/testnet id.
 //!   * [`guard_isolated_storage`] — refuse missing/default/`/tmp` runtime
 //!     storage; require an explicit isolated dir that is NOT the production
-//!     `$HOME/.irium`.
-//!   * [`mine_pow`] — grind the header nonce using Irium's REAL PoW path
-//!     ([`hash_for_height`](crate::block::BlockHeader::hash_for_height) +
-//!     [`meets_target`](crate::pow::meets_target)) until it satisfies the
-//!     supplied target. This NEVER touches LWMA / difficulty / target logic —
-//!     it only searches a nonce against an externally-decided target.
+//!     default (`$HOME/.irium` on Unix, `%USERPROFILE%\.irium` on Windows).
+//!   * [`mine_pow`] — grind the header nonce using Irium's REAL PoW path. This
+//!     NEVER touches LWMA / difficulty / target logic.
+//!   * [`build_devnet_all_gates_block`] — assemble a complete all-gates block
+//!     (admissions + candidate set + puzzle + finality + committed admission +
+//!     true-VRF + canonical 0%-fee coinbase + mined PoW) from public APIs. Used
+//!     by the live-proof binary AND validated end-to-end by a `connect_block`
+//!     test (so the binary's exact construction is proven node-acceptable).
 //!
-//! Nothing here holds or prints private keys, seeds, or VRF secrets: the PoW
-//! grind takes only a header + a target, and the guards take only a network id
-//! and a path. The heavy all-gates block assembly + authoritative-validator
-//! checks live in the Phase 24K chain tests, which reuse these primitives.
+//! Nothing here prints private keys, seeds, or VRF secrets. Harness keys are
+//! deterministic test/dev keys; this is devnet/testnet-only (mainnet hard-off).
 
-use crate::block::BlockHeader;
-use crate::pow::{meets_target, Target};
+use crate::block::{Block, BlockHeader};
+use crate::constants::block_reward;
+use crate::poawx::{
+    count_leading_zero_bits, irx1_root_from_block_receipts_gated, multi_role_amounts,
+    Phase20ReceiptExt, PoawxBlockReceipt, PoawxRoleClaim, RoleReward, ROLE_COMPUTE_CONTRIBUTOR,
+    ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+};
+use crate::poawx_admission::CandidateAdmissionV1;
+use crate::poawx_candidate::{AssignmentProofV2, CandidateSet, RoleCandidate};
+use crate::poawx_committed_admission::AdmissionCommitmentV1;
+use crate::poawx_dominance::{PersistentDominance, DOMINANCE_BASE_WORK_SCORE};
+use crate::poawx_finality::{
+    finality_threshold, FinalityProofV1, FinalityVoteType, FinalityVoteV1,
+};
+use crate::poawx_penalty::PenaltyStatus;
+use crate::poawx_puzzle::{default_profile, solve_dev, PuzzleChallengeV1};
+use crate::pow::{meets_target, sha256d, Target};
+use crate::tx::{p2pkh_script, Transaction, TxInput, TxOutput};
+use k256::ecdsa::SigningKey;
+use ripemd::Ripemd160;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// Refuse to run the harness on mainnet. Mainnet is `network_id == 0`
@@ -50,15 +70,10 @@ pub fn guard_network(network_id: u8) -> Result<(), String> {
 
 /// Refuse to use runtime storage unless it is an EXPLICIT isolated directory.
 ///
-/// `None` (no dir chosen) is rejected: a runtime harness must be pointed at an
-/// explicit isolated dir, never a default. A `/tmp` path is rejected (the
-/// project rule forbids `/tmp` for Irium storage). The production default
-/// `$HOME/.irium` (and any path whose final component is `.irium` directly under
-/// `$HOME`) is rejected so the harness can never clobber real node/wallet data.
-///
-/// Pure in-process tests do not use runtime storage and need not call this; it
-/// exists so a future live (Phase 24L) harness fails closed before touching
-/// disk.
+/// `None` (no dir chosen) is rejected. A `/tmp` path is rejected. The production
+/// default dir is rejected on BOTH platforms: `$HOME/.irium` (Unix) and
+/// `%USERPROFILE%\.irium` (Windows), plus any path whose final component is
+/// `.irium` directly under the home dir. Fails closed before touching disk.
 pub fn guard_isolated_storage(dir: Option<&Path>) -> Result<(), String> {
     let dir = dir.ok_or_else(|| {
         "poawx mining harness: runtime storage requires an explicit isolated dir \
@@ -71,23 +86,29 @@ pub fn guard_isolated_storage(dir: Option<&Path>) -> Result<(), String> {
             dir.display()
         ));
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = Path::new(&home);
-        let default_dir = home.join(".irium");
-        if dir == default_dir {
-            return Err(format!(
-                "poawx mining harness: refusing the production default dir {} \
-                 (use an explicit isolated dir)",
-                dir.display()
-            ));
-        }
-        // Also refuse a bare `$HOME/.irium`-style default expressed differently.
-        if dir.parent() == Some(home) && dir.file_name().and_then(|s| s.to_str()) == Some(".irium")
-        {
-            return Err(format!(
-                "poawx mining harness: refusing a $HOME/.irium default dir {}",
-                dir.display()
-            ));
+    // Reject the production default `.irium` dir under the user's home on either
+    // platform (HOME on Unix, USERPROFILE on Windows).
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(var) {
+            if home.is_empty() {
+                continue;
+            }
+            let home = Path::new(&home);
+            if dir == home.join(".irium") {
+                return Err(format!(
+                    "poawx mining harness: refusing the production default dir {} \
+                     (use an explicit isolated dir)",
+                    dir.display()
+                ));
+            }
+            if dir.parent() == Some(home)
+                && dir.file_name().and_then(|s| s.to_str()) == Some(".irium")
+            {
+                return Err(format!(
+                    "poawx mining harness: refusing a home/.irium default dir {}",
+                    dir.display()
+                ));
+            }
         }
     }
     Ok(())
@@ -97,13 +118,7 @@ pub fn guard_isolated_storage(dir: Option<&Path>) -> Result<(), String> {
 /// space `[0, max_iters)` until `hash_for_height(height)` satisfies `target`
 /// (the EXACT check `validate_block_header` performs). On success the header's
 /// `nonce` is set and the winning nonce is returned. Returns `Err` if the range
-/// is exhausted.
-///
-/// This is the Irium-native counterpart to stock cpuminer's wrong-algorithm
-/// grind: it calls the same hashing path the node validator uses, so a mined
-/// header is accepted by the authoritative PoW check. It does NOT read or modify
-/// any LWMA/difficulty/target state — `target` is supplied by the caller (who
-/// derived it from the chain via `target_for_height`).
+/// is exhausted. Does NOT read or modify any LWMA/difficulty/target state.
 pub fn mine_pow(
     header: &mut BlockHeader,
     height: u64,
@@ -122,6 +137,327 @@ pub fn mine_pow(
     ))
 }
 
+fn hash160(data: &[u8]) -> [u8; 20] {
+    let mut o = [0u8; 20];
+    o.copy_from_slice(&Ripemd160::digest(Sha256::digest(data)));
+    o
+}
+
+/// A complete, mined all-gates block plus the candidate admissions a node must
+/// have ingested for `connect_block` to accept it. Returned by
+/// [`build_devnet_all_gates_block`]. `admissions` are the canonical wire bytes a
+/// live harness POSTs to `/poawx/candidate-admission` before submitting `block`.
+pub struct AllGatesProof {
+    pub height: u64,
+    pub block: Block,
+    pub admissions: Vec<Vec<u8>>,
+    pub block_hash: [u8; 32],
+    pub irx1_root: [u8; 32],
+}
+
+/// Build a complete mined all-gates PoAW-X block for `height` over `prev_hash`,
+/// using ONLY public consensus APIs (the same construction proven node-acceptable
+/// by the Phase 24K `connect_block` test). Mainnet-hard-off: returns `Err` for
+/// `network_id == 0`. Deterministic devnet/dev keys (never printed). The PoW is
+/// mined with the real Irium hash against `Target { bits }` (caller supplies the
+/// chain's `bits` — this does not touch difficulty/LWMA logic).
+///
+/// Gate env (network, activation heights, `IRIUM_POAWX_PUZZLE_BITS`, finality
+/// threshold) must be set identically in this process and the target node so the
+/// built sections match the node validators.
+pub fn build_devnet_all_gates_block(
+    network_id: u8,
+    height: u64,
+    prev_hash: [u8; 32],
+    bits: u32,
+    time: u32,
+    receipt_difficulty_bits: u32,
+) -> Result<AllGatesProof, String> {
+    guard_network(network_id)?;
+    let net = network_id;
+    let seed = prev_hash; // every gate section binds the seed to the block's prev_hash.
+
+    // Identities (deterministic dev keys; the SUPPORT solver MUST be
+    // hash160(finality member pubkey) so the committee vote validates).
+    let worker_sk = SigningKey::from_bytes((&[0x55u8; 32]).into())
+        .map_err(|_| "harness: bad worker key".to_string())?;
+    let worker_pubkey_pt = worker_sk.verifying_key().to_encoded_point(true);
+    let worker_pubkey_bytes = worker_pubkey_pt.as_bytes();
+    let worker_pkh = hash160(worker_pubkey_bytes);
+    let member_sk = SigningKey::from_bytes((&[0xC3u8; 32]).into())
+        .map_err(|_| "harness: bad member key".to_string())?;
+    let member_pub = member_sk.verifying_key().to_encoded_point(true);
+    let support_solver = hash160(member_pub.as_bytes());
+    let compute_solver = [0xC1u8; 20];
+    let verify_solver = [0xC2u8; 20];
+
+    let dom = PersistentDominance::from_env();
+    let dw = |pkh: &[u8; 20]| dom.weight(DOMINANCE_BASE_WORK_SCORE, pkh, height);
+
+    // V2 (true-VRF) proofs + candidates.
+    let mk = |secret: u8, role: u8, solver: [u8; 20], ticket: [u8; 32]| {
+        let p = AssignmentProofV2::prove(&[secret; 32], net, height, role, solver, ticket, seed)?;
+        let c = RoleCandidate::from_assignment_v2(
+            &p,
+            PenaltyStatus::Clean.id(),
+            dw(&solver),
+            [role; 32],
+        );
+        Ok::<_, String>((p, c))
+    };
+    let (pc, cc) = mk(7, ROLE_COMPUTE_CONTRIBUTOR, compute_solver, [0x11u8; 32])?;
+    let (pv, cv) = mk(8, ROLE_VERIFY_CONTRIBUTOR, verify_solver, [0x12u8; 32])?;
+    let (ps, csup) = mk(9, ROLE_SUPPORT_CONTRIBUTOR, support_solver, [0x13u8; 32])?;
+
+    let mut cs = CandidateSet::new(net, height, seed);
+    for c in [cc.clone(), cv.clone(), csup.clone()] {
+        cs.push(c);
+    }
+    cs.sort_canonical();
+
+    // Candidate admissions (canonical wire bytes the node must ingest).
+    let admissions: Vec<Vec<u8>> = [(&pc, &cc), (&pv, &cv), (&ps, &csup)]
+        .iter()
+        .map(|(p, c)| {
+            CandidateAdmissionV1::new_with_v2(net, height, seed, (*c).clone(), Some((*p).clone()))
+                .serialize()
+        })
+        .collect();
+
+    // Per-role assigned puzzle solutions.
+    let profile = default_profile();
+    let mut sols = Vec::with_capacity(3);
+    for role in [
+        ROLE_COMPUTE_CONTRIBUTOR,
+        ROLE_VERIFY_CONTRIBUTOR,
+        ROLE_SUPPORT_CONTRIBUTOR,
+    ] {
+        let cand = cs
+            .best_for_role(role)
+            .ok_or_else(|| format!("harness: no candidate for role {role}"))?;
+        let cdg: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(cand.serialize());
+            h.finalize().into()
+        };
+        let challenge = PuzzleChallengeV1::build(
+            net,
+            height,
+            role,
+            cand.solver_pkh,
+            cand.ticket_digest,
+            cand.assignment_proof_digest,
+            cdg,
+            seed,
+            profile,
+        );
+        sols.push(solve_dev(&challenge).ok_or_else(|| "harness: puzzle solve failed".to_string())?);
+    }
+
+    // SUPPORT-committee finality proof finalizing the parent (block_hash = prev_hash).
+    let (num, den) = finality_threshold();
+    let mut fproof = FinalityProofV1::new(net, height, prev_hash, [0u8; 32], 0, num, den);
+    fproof.push(FinalityVoteV1::signed(
+        &member_sk,
+        net,
+        height,
+        prev_hash,
+        [0u8; 32],
+        0,
+        [0x11u8; 32],
+        FinalityVoteType::Commit,
+    ));
+    fproof.sort_canonical();
+
+    // OUTGOING committed-admission commitment for H+1 (incoming graced at the
+    // activation height). Self-consistent: commit_height = H, seed = prev_hash.
+    let mut cs2 = CandidateSet::new(net, height + 1, seed);
+    for c in [cc, cv, csup] {
+        cs2.push(c);
+    }
+    cs2.sort_canonical();
+    let commitment = AdmissionCommitmentV1::from_candidate_set(&cs2, height);
+
+    let claim = |role: u8, solver: [u8; 20]| -> PoawxRoleClaim {
+        let lane = crate::poawx::assign_lane(net, height, &seed, role, 0);
+        let nonce = [0x01u8; 32];
+        let secret = [0x02u8; 32];
+        let cd = crate::poawx::role_claim_digest(
+            net,
+            height,
+            &seed,
+            role,
+            lane.id(),
+            &solver,
+            &nonce,
+            &secret,
+        );
+        PoawxRoleClaim {
+            role_id: role,
+            lane_id: lane.id(),
+            solver_pkh: solver,
+            nonce,
+            secret,
+            claim_digest: cd,
+            commitment_hash: None,
+        }
+    };
+
+    let ext = Phase20ReceiptExt {
+        role_reward: RoleReward {
+            compute_contributor_pkh: compute_solver,
+            verify_contributor_pkh: verify_solver,
+            support_contributor_pkh: support_solver,
+        },
+        compute_claim: claim(ROLE_COMPUTE_CONTRIBUTOR, compute_solver),
+        verify_claim: claim(ROLE_VERIFY_CONTRIBUTOR, verify_solver),
+        support_claim: claim(ROLE_SUPPORT_CONTRIBUTOR, support_solver),
+        fee_bps: 0,
+        fee_pkh: [0u8; 20],
+        precommit_root: None,
+        role_ticket_proofs: None,
+        role_dominance_weights: Some([
+            dw(&worker_pkh),
+            dw(&compute_solver),
+            dw(&verify_solver),
+            dw(&support_solver),
+        ]),
+        candidate_set: Some(cs),
+        role_puzzle_proofs: Some([sols[0], sols[1], sols[2]]),
+        finality_proof: Some(fproof),
+        committed_admission: Some(commitment),
+        role_assignment_v2: Some([pc, pv, ps]),
+    };
+
+    // Worker receipt: real receipt PoW solution + signed challenge (mode-0).
+    let parent_height = height.saturating_sub(1);
+    let r_seed: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(prev_hash);
+        h.update(parent_height.to_le_bytes());
+        h.update(b"poawx_assignment_seed_v1");
+        h.finalize().into()
+    };
+    let r_nonce: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(r_seed);
+        h.update(b"commitment_nonce");
+        h.finalize().into()
+    };
+    let mut solution = [0u8; 8];
+    let mut found = false;
+    for n in 0u64..200_000_000 {
+        let cand = n.to_le_bytes();
+        let mut pow_input = [0u8; 72];
+        pow_input[..32].copy_from_slice(&r_seed);
+        pow_input[32..64].copy_from_slice(&r_nonce);
+        pow_input[64..].copy_from_slice(&cand);
+        if count_leading_zero_bits(&sha256d(&pow_input)) >= receipt_difficulty_bits {
+            solution = cand;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Err("harness: receipt PoW not found".to_string());
+    }
+    let challenge: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(solution);
+        h.update(r_nonce);
+        h.update(height.to_le_bytes());
+        h.finalize().into()
+    };
+    let sig: k256::ecdsa::Signature = {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        worker_sk
+            .sign_prehash(&challenge)
+            .map_err(|_| "harness: sign failed".to_string())?
+    };
+    let mut worker_sig = [0u8; 64];
+    worker_sig.copy_from_slice(&sig.to_bytes());
+    let mut worker_pubkey = [0u8; 33];
+    worker_pubkey.copy_from_slice(worker_pubkey_bytes);
+
+    let receipt = PoawxBlockReceipt {
+        height,
+        lane: b'A',
+        worker_pkh,
+        worker_pubkey,
+        worker_sig,
+        solution,
+        commitment_nonce: r_nonce,
+        delegation: None,
+        phase20_ext: Some(ext.clone()),
+    };
+
+    // Canonical 0%-fee multi-role coinbase + the gated (ext-bound) irx1 root.
+    let total = block_reward(height);
+    let a = multi_role_amounts(total);
+    let irx1_root = irx1_root_from_block_receipts_gated(std::slice::from_ref(&receipt), true);
+    let mut irx1_script = vec![0x6a, 0x24u8];
+    irx1_script.extend_from_slice(b"irx1");
+    irx1_script.extend_from_slice(&irx1_root);
+    let outputs = vec![
+        TxOutput {
+            value: 0,
+            script_pubkey: irx1_script,
+        },
+        TxOutput {
+            value: a[0],
+            script_pubkey: p2pkh_script(&worker_pkh),
+        },
+        TxOutput {
+            value: a[1],
+            script_pubkey: p2pkh_script(&compute_solver),
+        },
+        TxOutput {
+            value: a[2],
+            script_pubkey: p2pkh_script(&verify_solver),
+        },
+        TxOutput {
+            value: a[3],
+            script_pubkey: p2pkh_script(&support_solver),
+        },
+    ];
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: [0u8; 32],
+            prev_index: 0xffff_ffff,
+            script_sig: vec![0x01, 0x00],
+            sequence: 0xffff_ffff,
+        }],
+        outputs,
+        locktime: 0,
+    };
+
+    let mut block = Block {
+        header: BlockHeader {
+            version: 1,
+            prev_hash,
+            merkle_root: [0u8; 32],
+            time,
+            bits,
+            nonce: 0,
+        },
+        transactions: vec![coinbase],
+        auxpow: None,
+        poawx_receipts: Some(vec![receipt]),
+    };
+    block.header.merkle_root = block.merkle_root();
+    mine_pow(&mut block.header, height, Target { bits }, 50_000_000)?;
+    let block_hash = block.header.hash_for_height(height);
+
+    Ok(AllGatesProof {
+        height,
+        block,
+        admissions,
+        block_hash,
+        irx1_root,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,7 +469,6 @@ mod tests {
         assert!(guard_network(1).is_ok(), "testnet (1) allowed");
         assert!(guard_network(2).is_ok(), "devnet (2) allowed");
         assert!(guard_network(7).is_err(), "unknown id refused");
-        // E18: the rejection message names no secret/key material.
         let msg = guard_network(0).unwrap_err().to_lowercase();
         assert!(!msg.contains("secret") && !msg.contains("private") && !msg.contains("mnemonic"));
     }
@@ -142,22 +477,38 @@ mod tests {
     fn guard_isolated_storage_refuses_default_and_missing() {
         // E2: missing dir refused.
         assert!(guard_isolated_storage(None).is_err(), "no dir refused");
-        // /tmp refused.
         assert!(
             guard_isolated_storage(Some(Path::new("/tmp/irium-x"))).is_err(),
             "/tmp refused"
         );
-        // $HOME/.irium (production default) refused.
+        // Unix default refused.
         std::env::set_var("HOME", "/home/tester");
         assert!(
             guard_isolated_storage(Some(Path::new("/home/tester/.irium"))).is_err(),
-            "production default $HOME/.irium refused"
+            "Unix default $HOME/.irium refused"
         );
-        // an explicit isolated dir is accepted.
         assert!(
-            guard_isolated_storage(Some(Path::new("/home/tester/irium-p24k-node"))).is_ok(),
+            guard_isolated_storage(Some(Path::new("/home/tester/irium-p24l"))).is_ok(),
             "explicit isolated dir accepted"
         );
+        // USERPROFILE (Windows home) default `.irium` refused. Use Path::join so
+        // the separator is correct on whatever platform runs this test.
+        let up = if cfg!(windows) {
+            "C:\\Users\\tester"
+        } else {
+            "/home/winuser"
+        };
+        std::env::set_var("USERPROFILE", up);
+        let up_path = Path::new(up);
+        assert!(
+            guard_isolated_storage(Some(&up_path.join(".irium"))).is_err(),
+            "USERPROFILE/.irium default refused"
+        );
+        assert!(
+            guard_isolated_storage(Some(&up_path.join("irium-poawx-live-proof"))).is_ok(),
+            "explicit USERPROFILE-rooted isolated dir accepted"
+        );
+        std::env::remove_var("USERPROFILE");
     }
 
     #[test]
@@ -170,7 +521,6 @@ mod tests {
             prev_hash: [0u8; 32],
             merkle_root: [0x11u8; 32],
             time: 1,
-            // Easy target: high exponent, so a winning nonce is found quickly.
             bits: 0x1f00ffff,
             nonce: 0,
         };
@@ -178,13 +528,17 @@ mod tests {
         let target = header.target();
         let nonce = mine_pow(&mut header, height, target, 5_000_000).expect("mine a nonce");
         assert_eq!(header.nonce, nonce);
-        assert!(
-            meets_target(&header.hash_for_height(height), target),
-            "mined header satisfies the real Irium PoW check"
-        );
-        // A trivially-impossible target is exhausted (fails closed, no panic).
+        assert!(meets_target(&header.hash_for_height(height), target));
         let mut h2 = header.clone();
         let impossible = Target { bits: 0x0300_0001 };
         assert!(mine_pow(&mut h2, height, impossible, 2_000).is_err());
+    }
+
+    #[test]
+    fn build_devnet_all_gates_block_rejects_mainnet() {
+        assert!(
+            build_devnet_all_gates_block(0, 1, [0x44u8; 32], 0x207fffff, 1, 1).is_err(),
+            "builder refuses mainnet"
+        );
     }
 }
