@@ -174,6 +174,17 @@ pub fn build_devnet_all_gates_block(
     receipt_difficulty_bits: u32,
 ) -> Result<AllGatesProof, String> {
     guard_network(network_id)?;
+    // Resolve the standard-header activation height into the process global the
+    // SAME way the node does at startup, so `hash_for_height` here serializes the
+    // header identically to the node's validator. A standalone harness has no
+    // ChainState to set this, so without it the global falls back to the mainnet
+    // constant (22_888) and mined-block height-1 headers hash differently than
+    // the node (which, on devnet/testnet, resolves it to 1). Idempotent OnceLock.
+    crate::block::set_standard_header_activation_height(
+        crate::activation::resolved_standard_header_activation_height(
+            crate::activation::network_kind_from_env(),
+        ),
+    );
     let net = network_id;
     let seed = prev_hash; // every gate section binds the seed to the block's prev_hash.
 
