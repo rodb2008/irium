@@ -453,7 +453,13 @@ fn normalize_under(base: &Path, input: &Path) -> Option<PathBuf> {
     let base_depth = base.components().count();
     for comp in input.components() {
         match comp {
-            Component::Prefix(_) => return None,
+            // On Windows an absolute path's first component is the disk/UNC
+            // Prefix (e.g. `C:`); it is part of a legitimate absolute path, not a
+            // traversal element, so keep it. (On Unix this arm never matches, so
+            // behaviour there is unchanged.) The `starts_with(&home)` check in the
+            // caller still enforces that the resolved path is under HOME, so a
+            // different drive/UNC root cannot escape.
+            Component::Prefix(p) => out.push(p.as_os_str()),
             Component::RootDir => out.push(Path::new("/")),
             Component::CurDir => {}
             Component::ParentDir => {
