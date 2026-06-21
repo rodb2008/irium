@@ -184,3 +184,16 @@ finality vote from a committee member; admitted candidates for H+1; dominance ma
 state) + live PoW mining, and the synthetic producer path is disallowed for the claim. No fake,
 no weakened gates. NOT production-ready/mainnet-ready. See
 docs/poaw-x-phase24g-single-vps-real-mined-all-gates-block.md.
+
+## Phase 24H update (miner-pool coordination fix)
+
+Phase 24H fixed the exact 24G blocker: build_synthetic_phase20_ext now derives per-role solvers
+(and role_reward + the AVR2 lookup) from the node-validated admitted candidate set instead of
+the pool primary_pkh, so role rewards + per-role V2 proofs key to the actual admitted miners;
+fail-closed if any role lacks an admitted candidate. New helper pool_role_reward_from_admitted.
+build_collected already derives role_reward from reveals (real path, unchanged). No pool-local
+onboarding endpoint needed (node RPC suffices); pool holds no miner secret. Test
+delegation::phase24h_role_reward_derived_from_admitted_candidates. Remaining for 24I: one
+coordinated live run (matching admission/V2/ticket/finality-member/reveal/H+1 + dominance) +
+live PoW mining. NOT production-candidate; NOT mainnet-ready. See
+docs/poaw-x-phase24h-miner-pool-onboarding-coordination.md.
