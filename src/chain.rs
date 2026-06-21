@@ -9077,6 +9077,279 @@ mod tests {
     }
 
     #[test]
+    fn phase24k_native_pow_all_gates_connect_block() {
+        // Phase 24K Stage 2: the FULL node entry point. Build a mined all-gates
+        // block at height 1 over the real locked genesis and drive the entire
+        // `connect_block` pipeline (header PoW -> irx1 coinbase -> receipts +
+        // production payout -> dominance -> candidate set + admission -> puzzle
+        // -> finality -> committed admission -> true-VRF -> apply txns) to
+        // acceptance, then confirm the chain advanced to height 2.
+        //
+        // Covers the connect_block-INTEGRATED gates with material built here.
+        // The independent hidden-precommit, ticket-proof, and mode-1 delegation
+        // gates are left OFF (each has its own dedicated tests); leaving an
+        // optional gate disabled does not weaken the gates under test.
+        use crate::poawx::{
+            irx1_root_from_block_receipts_gated, multi_role_amounts, ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        use crate::poawx_admission::{global_admission_cache, CandidateAdmissionV1};
+        use crate::poawx_candidate::{AssignmentProofV2, CandidateSet, RoleCandidate};
+        use crate::poawx_committed_admission::AdmissionCommitmentV1;
+        use crate::poawx_dominance::DOMINANCE_BASE_WORK_SCORE;
+        use crate::poawx_finality::{FinalityProofV1, FinalityVoteType, FinalityVoteV1};
+        use crate::poawx_penalty::PenaltyStatus;
+        use crate::poawx_puzzle::{
+            default_profile, solve_dev, PuzzleChallengeV1, PuzzleSolutionV1,
+        };
+        use sha2::{Digest, Sha256};
+
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        for (k, v) in [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4"), // receipt PoW difficulty
+            ("IRIUM_POAWX_PUZZLE_BITS", "4"),            // assigned-puzzle gate difficulty
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+        ] {
+            std::env::set_var(k, v);
+        }
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let seed = genesis_hash;
+
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let height = 1u64;
+        let target = st.target_for_height(height);
+
+        let worker_sk = signing_key(0x55);
+        let worker_pkh = key_hash(&worker_sk);
+        let member_sk = signing_key(0xC3);
+        let support_solver = key_hash(&member_sk);
+        let compute_solver = [0xC1u8; 20];
+        let verify_solver = [0xC2u8; 20];
+
+        let dw = |pkh: &[u8; 20]| st.dominance.weight(DOMINANCE_BASE_WORK_SCORE, pkh, height);
+
+        let mk = |secret: u8,
+                  role: u8,
+                  solver: [u8; 20],
+                  ticket: [u8; 32]|
+         -> (AssignmentProofV2, RoleCandidate) {
+            let p =
+                AssignmentProofV2::prove(&[secret; 32], net, height, role, solver, ticket, seed)
+                    .expect("v2 prove");
+            let c = RoleCandidate::from_assignment_v2(
+                &p,
+                PenaltyStatus::Clean.id(),
+                dw(&solver),
+                [role; 32],
+            );
+            (p, c)
+        };
+        let (pc, cc) = mk(7, ROLE_COMPUTE_CONTRIBUTOR, compute_solver, [0x11u8; 32]);
+        let (pv, cv) = mk(8, ROLE_VERIFY_CONTRIBUTOR, verify_solver, [0x12u8; 32]);
+        let (ps, csup) = mk(9, ROLE_SUPPORT_CONTRIBUTOR, support_solver, [0x13u8; 32]);
+
+        let mut cs = CandidateSet::new(net, height, seed);
+        for c in [cc.clone(), cv.clone(), csup.clone()] {
+            cs.push(c);
+        }
+        cs.sort_canonical();
+
+        let cache = global_admission_cache();
+        cache.clear();
+        cache.set_tip(height);
+        for (p, c) in [(&pc, &cc), (&pv, &cv), (&ps, &csup)] {
+            let adm =
+                CandidateAdmissionV1::new_with_v2(net, height, seed, c.clone(), Some(p.clone()));
+            assert_eq!(
+                cache.ingest_bytes(&adm.serialize()),
+                crate::poawx_gossip::GossipOutcome::AcceptedNew
+            );
+        }
+
+        let profile = default_profile();
+        let mut sols: Vec<PuzzleSolutionV1> = Vec::new();
+        for role in [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ] {
+            let cand = cs.best_for_role(role).expect("best candidate");
+            let cdg: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(cand.serialize());
+                h.finalize().into()
+            };
+            let challenge = PuzzleChallengeV1::build(
+                net,
+                height,
+                role,
+                cand.solver_pkh,
+                cand.ticket_digest,
+                cand.assignment_proof_digest,
+                cdg,
+                seed,
+                profile,
+            );
+            sols.push(solve_dev(&challenge).expect("solve puzzle"));
+        }
+        let puzzle_proofs = [sols[0], sols[1], sols[2]];
+
+        let committee: Vec<[u8; 20]> = cs
+            .candidates
+            .iter()
+            .filter(|c| c.role_id == ROLE_SUPPORT_CONTRIBUTOR)
+            .map(|c| c.solver_pkh)
+            .collect();
+        let mut fproof = FinalityProofV1::new(net, height, genesis_hash, [0u8; 32], 0, 1, 1);
+        fproof.push(FinalityVoteV1::signed(
+            &member_sk,
+            net,
+            height,
+            genesis_hash,
+            [0u8; 32],
+            0,
+            [0x11u8; 32],
+            FinalityVoteType::Commit,
+        ));
+        fproof.sort_canonical();
+
+        let mut cs2 = CandidateSet::new(net, height + 1, seed);
+        for c in [cc.clone(), cv.clone(), csup.clone()] {
+            cs2.push(c);
+        }
+        cs2.sort_canonical();
+        let commitment = AdmissionCommitmentV1::from_candidate_set(&cs2, height);
+
+        let total = block_reward(height);
+        let mut ext = p20_ext(net, height, &seed, 0, [0u8; 20]);
+        ext.role_reward.compute_contributor_pkh = compute_solver;
+        ext.role_reward.verify_contributor_pkh = verify_solver;
+        ext.role_reward.support_contributor_pkh = support_solver;
+        ext.support_claim = p20_claim(net, height, &seed, ROLE_SUPPORT_CONTRIBUTOR, support_solver);
+        ext.role_dominance_weights = Some([
+            dw(&worker_pkh),
+            dw(&compute_solver),
+            dw(&verify_solver),
+            dw(&support_solver),
+        ]);
+        ext.candidate_set = Some(cs.clone());
+        ext.role_puzzle_proofs = Some(puzzle_proofs);
+        ext.finality_proof = Some(fproof);
+        ext.committed_admission = Some(commitment);
+        ext.role_assignment_v2 = Some([pc, pv, ps]);
+
+        let mut receipt = make_test_receipt(height, &worker_sk, genesis_hash, 4);
+        receipt.phase20_ext = Some(ext.clone());
+
+        // Coinbase: canonical 0%-fee role payout + the gated irx1 root (ext bound).
+        let receipts = vec![receipt];
+        let irx1_root = irx1_root_from_block_receipts_gated(&receipts, true);
+        assert_ne!(irx1_root, [0u8; 32], "gated irx1 root is non-zero");
+        let mut outputs = p20_coinbase(&worker_pkh, &ext, total);
+        let mut irx1_script = vec![0x6a, 0x24u8];
+        irx1_script.extend_from_slice(b"irx1");
+        irx1_script.extend_from_slice(&irx1_root);
+        outputs[0].script_pubkey = irx1_script; // replace the placeholder OP_RETURN
+        let coinbase = crate::tx::Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0xffff_ffff,
+                script_sig: vec![0x01, 0x00],
+                sequence: 0xffff_ffff,
+            }],
+            outputs,
+            locktime: 0,
+        };
+        // sanity: canonical 0% payout self-checks.
+        let _ = multi_role_amounts(total);
+
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: genesis_hash,
+                merkle_root: [0u8; 32],
+                time: genesis.header.time + 1,
+                bits: target.bits,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+            auxpow: None,
+            poawx_receipts: Some(receipts),
+        };
+        block.header.merkle_root = block.merkle_root();
+
+        // MINE Irium's real PoW.
+        crate::poawx_mining_harness::mine_pow(&mut block.header, height, target, 50_000_000)
+            .expect("mine real Irium PoW");
+
+        // FULL node entry point: connect_block validates every section + applies.
+        let before = st.height;
+        st.connect_block(block)
+            .expect("connect_block accepts mined all-gates block");
+        assert_eq!(st.height, before + 1, "chain advanced to height 2");
+
+        cache.clear();
+        for k in [
+            "IRIUM_NETWORK",
+            "IRIUM_POAWX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_MODE",
+            "IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS",
+            "IRIUM_POAWX_PUZZLE_BITS",
+            "IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_SET_REQUIRED",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PUZZLE_WORK_REQUIRED",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_NUM",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_DEN",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TRUE_VRF_REQUIRED",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
     fn phase22d_true_vrf_enforcement() {
         use crate::poawx::{
             ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
