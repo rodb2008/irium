@@ -197,3 +197,16 @@ delegation::phase24h_role_reward_derived_from_admitted_candidates. Remaining for
 coordinated live run (matching admission/V2/ticket/finality-member/reveal/H+1 + dominance) +
 live PoW mining. NOT production-candidate; NOT mainnet-ready. See
 docs/poaw-x-phase24h-miner-pool-onboarding-coordination.md.
+
+## Phase 24I update (coordinated live mined block attempt — PARTIAL)
+
+Phase 24I validated LIVE: 24F genesis assignment (200); the full coordinated node material under
+all gates (single identity P: H=1+H=2 candidate admissions [3 roles, solver=P, true-VRF V2] +
+SUPPORT finality vote member=P, all 200 OK + cached); the pool running in COLLECTED mode
+(loopback, isolated, all gates, role protocol) accepting 9/9 role precommit/reveal + building
+jobs. A real mined accepted all-gates block was NOT produced: the pool builds the PoAW-X ext
+per-miner-SESSION (needs a connected stratum miner), and the cpuminer step was stopped after a
+minor ~/.irium incident (new-address created a stray ~/.irium/wallet.json because the wallet CLI
+defaults its store to ~/.irium; removed; operator wallets + mainnet untouched; lesson: isolate
+the wallet path too). NOT production-candidate; NOT mainnet-ready. See
+docs/poaw-x-phase24i-single-vps-live-mined-all-gates-block.md.
