@@ -2840,6 +2840,24 @@ pub fn build_pool_committed_admission(
     ))
 }
 
+/// Phase 24H: derive role_reward solvers from the node-validated admitted candidate
+/// set (best candidate per role), so the pool keys role rewards + the per-role V2
+/// proofs (looked up by role_reward.solver) to the actual admitted miners instead of
+/// the pool primary_pkh. None (fail closed) if any role has no admitted candidate.
+/// The pool holds no miner secret.
+pub fn pool_role_reward_from_admitted(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+) -> Option<RoleRewardMirror> {
+    let cs = build_pool_candidate_set_for_height(network_id, height, prev_hash)?;
+    Some(RoleRewardMirror {
+        compute_contributor_pkh: cs.best_for_role(ROLE_COMPUTE_CONTRIBUTOR)?.solver_pkh,
+        verify_contributor_pkh: cs.best_for_role(ROLE_VERIFY_CONTRIBUTOR)?.solver_pkh,
+        support_contributor_pkh: cs.best_for_role(ROLE_SUPPORT_CONTRIBUTOR)?.solver_pkh,
+    })
+}
+
 pub fn build_synthetic_phase20_ext(
     network_id: u8,
     height: u64,
@@ -2861,10 +2879,42 @@ pub fn build_synthetic_phase20_ext(
     // (so block H-1 can compute block H's commitments) and set commitment_hash; the
     // claim still binds prev_hash via claim_digest. When inactive, keep the prior
     // prev-hash-derived secret/nonce + no commitment (Steps 5A/5B unchanged).
+    // Phase 24H: under all-gates candidate admission, the per-role solvers (and thus
+    // role_reward + the per-role V2 lookup) are derived from the node-validated
+    // admitted candidate set, NOT the pool primary_pkh. Fail closed if any role lacks
+    // an admitted candidate.
+    let admitted_cs = if pool_candidate_admission_enforced(height) {
+        Some(build_pool_candidate_set_for_height(
+            network_id, height, prev_hash,
+        )?)
+    } else {
+        None
+    };
+    let solvers: [[u8; 20]; 3] = match &admitted_cs {
+        Some(cs) => [
+            match cs.best_for_role(ROLE_COMPUTE_CONTRIBUTOR) {
+                Some(c) => c.solver_pkh,
+                None => return None,
+            },
+            match cs.best_for_role(ROLE_VERIFY_CONTRIBUTOR) {
+                Some(c) => c.solver_pkh,
+                None => return None,
+            },
+            match cs.best_for_role(ROLE_SUPPORT_CONTRIBUTOR) {
+                Some(c) => c.solver_pkh,
+                None => return None,
+            },
+        ],
+        None => [
+            synth_role_solver(primary_pkh, workers, 0),
+            synth_role_solver(primary_pkh, workers, 1),
+            synth_role_solver(primary_pkh, workers, 2),
+        ],
+    };
     let hp = hidden_precommit_active(height);
     let mk = |role_id: u8, idx: usize| -> PoawxRoleClaimMirror {
         let lane_id = assign_lane_id(network_id, height, prev_hash, role_id, 0);
-        let solver = synth_role_solver(primary_pkh, workers, idx);
+        let solver = solvers[idx];
         let (secret, nonce) = if hp {
             synth_role_secret_nonce(network_id, height, role_id)
         } else {
@@ -5281,6 +5331,142 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED");
         std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
+    }
+
+    #[test]
+    fn phase24h_role_reward_derived_from_admitted_candidates() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1");
+        let net = network_id_from_env();
+        let height = 7u64;
+        let seed = [0x44u8; 32];
+        let primary = [0xA0u8; 20];
+        // admitted candidates with DISTINCT solvers per role (none == primary).
+        let roles = [
+            (ROLE_COMPUTE_CONTRIBUTOR, [0xC1u8; 20], 7u8),
+            (ROLE_VERIFY_CONTRIBUTOR, [0xC2u8; 20], 8u8),
+            (ROLE_SUPPORT_CONTRIBUTOR, [0xC3u8; 20], 9u8),
+        ];
+        let hexes: Vec<String> = roles
+            .iter()
+            .map(|&(role, solver, secret)| {
+                let proof = irium_node_rs::poawx_candidate::AssignmentProofV2::prove(
+                    &[secret; 32],
+                    net,
+                    height,
+                    role,
+                    solver,
+                    [role; 32],
+                    seed,
+                )
+                .unwrap();
+                let cand = irium_node_rs::poawx_candidate::RoleCandidate::from_assignment_v2(
+                    &proof,
+                    irium_node_rs::poawx_penalty::PenaltyStatus::Clean.id(),
+                    1000,
+                    [role; 32],
+                );
+                let adm = irium_node_rs::poawx_admission::CandidateAdmissionV1::new_with_v2(
+                    net,
+                    height,
+                    seed,
+                    cand,
+                    Some(proof),
+                );
+                hex::encode(adm.serialize())
+            })
+            .collect();
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(height, hexes);
+
+        // (1)(2) role_reward solvers come from the admitted candidates, NOT primary_pkh.
+        let off = build_synthetic_phase20_ext(net, height, &seed, &primary, &[], None)
+            .expect("official ext");
+        assert_eq!(off.role_reward.compute_contributor_pkh, [0xC1u8; 20]);
+        assert_eq!(off.role_reward.verify_contributor_pkh, [0xC2u8; 20]);
+        assert_eq!(off.role_reward.support_contributor_pkh, [0xC3u8; 20]);
+        assert_ne!(
+            off.role_reward.compute_contributor_pkh, primary,
+            "not forced to primary"
+        );
+        // (6) AVR2 bundled (looked up by the admitted role_reward solvers).
+        assert!(
+            off.role_assignment_v2.is_some(),
+            "AVR2 bundled for admitted solvers"
+        );
+        // the candidate set + role claims agree with role_reward.
+        let cs = off.candidate_set.as_ref().expect("candidate set");
+        assert_eq!(
+            cs.best_for_role(ROLE_COMPUTE_CONTRIBUTOR)
+                .unwrap()
+                .solver_pkh,
+            [0xC1u8; 20]
+        );
+        assert_eq!(
+            off.compute_claim.solver_pkh, [0xC1u8; 20],
+            "claim solver matches role_reward"
+        );
+        // (3) official fee-0.
+        assert_eq!(off.fee_bps, 0);
+        assert_eq!(off.fee_pkh, [0u8; 20]);
+        // (4) third-party fee: PRIMARY-only fee terms set; role solvers (rewards) unchanged.
+        let tp = build_synthetic_phase20_ext(
+            net,
+            height,
+            &seed,
+            &primary,
+            &[],
+            Some((100, [0xFEu8; 20])),
+        )
+        .expect("third-party ext");
+        assert_eq!(tp.fee_bps, 100);
+        assert_eq!(tp.fee_pkh, [0xFEu8; 20]);
+        assert_eq!(
+            tp.role_reward.compute_contributor_pkh, [0xC1u8; 20],
+            "role rewards untaxed"
+        );
+        // (5) fail-closed: drop the SUPPORT admission -> no ext.
+        let two: Vec<String> = pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&height)
+            .unwrap()[..2]
+            .to_vec();
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(height, two);
+        assert!(
+            build_synthetic_phase20_ext(net, height, &seed, &primary, &[], None).is_none(),
+            "fail-closed when a role's admitted candidate is missing"
+        );
+        // helper fail-closed on empty cache.
+        pool_admitted_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        assert!(
+            pool_role_reward_from_admitted(net, height, &seed).is_none(),
+            "helper fail-closed"
+        );
+
+        for v in [
+            "IRIUM_NETWORK",
+            "IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TRUE_VRF_REQUIRED",
+        ] {
+            std::env::remove_var(v);
+        }
     }
 
     #[test]
