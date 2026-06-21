@@ -210,3 +210,16 @@ minor ~/.irium incident (new-address created a stray ~/.irium/wallet.json becaus
 defaults its store to ~/.irium; removed; operator wallets + mainnet untouched; lesson: isolate
 the wallet path too). NOT production-candidate; NOT mainnet-ready. See
 docs/poaw-x-phase24i-single-vps-live-mined-all-gates-block.md.
+
+## Phase 24J update (stratum cpuminer attempt — PoW-tooling blocker)
+
+Phase 24J fixed + proved wallet-path isolation (isolated HOME; real ~/.irium/wallet.json never
+created) and ran the full coordinated path with a single identity P: H1+H2 admissions + finality
+(member=P) cached by node; 9/9 role precommit/reveal accepted by the pool (collected mode); and
+a live cpuminer SESSION (subscribe+authorize, worker A -> pkh P). But NO block: stock cpuminer
+hashed ~900M sha256d vs an easy target and found 0 valid shares -> stock cpuminer PoW != Irium's
+custom block hashing (Irium ships an RPC-based irium-miner; stratum adapter is
+native_rewardable_reserved). Definitive remaining blocker = mining tooling: need an
+Irium-PoW-compatible stratum miner (or node-template ext-build for the RPC miner, or a custom
+submit harness). Not a PoAW-X consensus gap. NOT production-candidate; NOT mainnet-ready. See
+docs/poaw-x-phase24j-stratum-cpuminer-all-gates-block.md.
