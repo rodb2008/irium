@@ -82,3 +82,18 @@ per-section tests).
   miner, or a custom submit harness).
 - Cross-host P2P provider/firewall; independent audit; public testnet; governance/mainnet
   activation.
+
+## Phase 24K update (Irium-native all-gates mining harness — block mined + connect_block-accepted)
+
+Phase 24K closed the Phase 24J mining-tooling blocker IN-PROCESS. New mainnet-hard-off harness
+`src/poawx_mining_harness.rs` (`guard_network`, `guard_isolated_storage`, `mine_pow` — grinds the
+nonce via Irium's REAL `hash_for_height` + `meets_target`, never touches LWMA/difficulty). Two
+deterministic tests in `src/chain.rs`: Stage 1 mines an all-gates block and every authoritative
+validator accepts it (+ E13–E17 negatives); Stage 2 drives the FULL `connect_block` to acceptance,
+advancing the chain to height 2 (real PoW, gated `irx1` root, production payout, dominance,
+candidate set + admission, puzzle, finality, committed admission, true-VRF, 0%-fee coinbase).
+Mainnet hard-off (devnet `network_id=2`); no validator weakened; no PoW bypass; hidden-precommit /
+ticket-proof / mode-1 delegation gates left off as independent (separately tested). Still NOT
+production-candidate / mainnet-ready: a live cross-host run (Phase 24L), independent audit, public
+testnet, and governance activation remain. See
+docs/poaw-x-phase24k-irium-native-mining-submit-harness.md.
