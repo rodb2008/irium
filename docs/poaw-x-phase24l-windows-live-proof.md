@@ -144,3 +144,18 @@ If it passes, the only allowed claim is:
 NOT allowed: "mainnet-ready", "production-ready", "audited". This is a local
 devnet proof — it does not establish cross-host networking, public-testnet
 behavior, independent audit, or governance/mainnet activation.
+
+## Phase 24L Windows live proof — RESULT: PASSED
+
+The Windows local devnet live proof ran end-to-end and PASSED: a real Irium-native-PoW all-gates
+block was submitted to a real local devnet node over RPC and accepted, advancing the chain
+height 0 -> 1 (block 31df881052b05dc6319c5915ca938b282df60ab7e823aba44ee5edd20dfd23bf, irx1 root
+772e1cd700af122e5bc2a586a1eb94d4dc33bdd2ab819dba435df9875c7ed9bd, official 0% fee, all-gates
+sections present). Post-fix HEAD 1ca7d89. Two genuine bugs were fixed to make it work on Windows:
+cef587d (preserve Windows drive prefix in the storage guard) and 1ca7d89 (initialize the
+standard-header activation global in the standalone harness). Mainnet node (PID 33752) and the real
+%USERPROFILE%\.irium wallet/config were untouched; no proof listeners remained. Allowed claim:
+"Local Windows devnet live proof succeeded: a real Irium-native-PoW all-gates block was submitted
+to a real node and accepted, advancing the chain." NOT production-ready / mainnet-ready / audited.
+Remaining: cross-host P2P provider/firewall, independent audit, public testnet, governance/mainnet
+activation. See docs/poaw-x-phase24l-windows-live-proof-result.md.
