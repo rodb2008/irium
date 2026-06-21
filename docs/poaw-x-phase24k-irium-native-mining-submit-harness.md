@@ -98,3 +98,21 @@ cover.
   node) — not done in this code/test-first phase.
 - Cross-host P2P provider/firewall; independent audit; public testnet; governance/mainnet
   activation.
+
+## Phase 24L update (Windows local live-proof package)
+
+Phase 24L packages a Windows-safe, devnet-only LIVE proof: a loopback `iriumd` +
+the new `poawx-live-proof-harness` binary that builds an all-gates block with
+Irium-native PoW (via `poawx_mining_harness::build_devnet_all_gates_block`),
+ingests candidate admissions, submits through the real `/rpc/submit_block_extended`
+path, and verifies the node advanced height. A `connect_block` test
+(`chain::phase24l_lib_builder_connect_block`) proves the binary's exact builder
+output is node-acceptable, so only the local RPC round-trip is Windows-verified by
+the user. Safety: rejects mainnet, requires loopback RPC + an explicit isolated
+work dir (not `%USERPROFILE%\.irium` / `$HOME/.irium`), no public bind, no secrets
+in logs. Isolated root is under `%USERPROFILE%` (Phase 24C storage hardening fails
+closed on dirs outside the user home). Runner: `scripts/windows/poawx-live-proof.ps1`;
+guide: `docs/poaw-x-phase24l-windows-live-proof.md`. The actual Windows live proof
+is run by the user; allowed claim if it passes: "Local Windows devnet live proof
+succeeded: a real Irium-native-PoW all-gates block submitted to a real node and
+accepted." NOT mainnet-ready / production-ready / audited.
