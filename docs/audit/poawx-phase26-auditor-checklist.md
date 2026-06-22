@@ -4,6 +4,9 @@ Companion to `poawx-phase26-independent-audit-package.md` and `...-technical-app
 **NOT production-ready / mainnet-ready / audited.** Audited HEAD `0208368`; full source range
 `30bce64..0208368`. No secrets/keys/wallet data included; logs summarized.
 
+> Kickoff package: `docs/audit/phase26h-kickoff/` collects the scope, review guide, findings tracker,
+> deliverables, reproduction commands, and a reviewer-intro email draft for engaging an auditor.
+
 ## How to start
 
 ```

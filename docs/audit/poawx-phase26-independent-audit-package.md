@@ -12,6 +12,9 @@ It contains no secrets, private keys, wallet data, or machine credentials; logs 
 See the companion docs:
 - `docs/audit/poawx-phase26-technical-appendix.md` — detailed per-change analysis (A–E).
 - `docs/audit/poawx-phase26-auditor-checklist.md` — questions for the auditor to answer.
+- `docs/audit/phase26h-kickoff/` — **audit kickoff package** (start here to engage a reviewer):
+  `README.md`, `AUDIT_SCOPE.md`, `AUDITOR_REVIEW_GUIDE.md`, `FINDINGS_TRACKER.md`,
+  `AUDIT_KICKOFF_EMAIL_DRAFT.md`, `AUDIT_DELIVERABLES.md`, `REPRO_COMMANDS.md`.
 
 ## Executive summary
 

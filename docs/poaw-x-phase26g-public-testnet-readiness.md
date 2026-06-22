@@ -14,6 +14,9 @@ Companion docs: `poaw-x-phase26g-public-testnet-rollout-checklist.md`,
 - Branch: `testnet/poawx-phase20-blueprint-completion-local`
 - Commit baseline: **`c15c436`** (`origin/main` unchanged at `19c496dc5f2fa08981a109b10eeb257105c28c43`).
 - Audit package: `docs/audit/poawx-phase26-*` (Phase 26F).
+- Audit kickoff package: `docs/audit/phase26h-kickoff/` (Phase 26H) — scope, review guide, findings
+  tracker, deliverables, reproduction commands, and reviewer-intro email draft. An independent audit
+  with a scoped sign-off is a prerequisite gate before any public-testnet launch.
 
 ## Executive summary
 
