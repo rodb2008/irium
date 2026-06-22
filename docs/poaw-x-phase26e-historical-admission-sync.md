@@ -63,14 +63,38 @@ admission persistence is reused unchanged.)
 - **Full lib suite: 748 passed / 0 failed** (serialized).
 - Release build `--release --bin iriumd --bin poawx-live-proof-harness` — success.
 
-## Live validation (fresh-wipe sync)
+## Live validation (fresh-wipe sync) — PASSED
 
-Performed after this code commit (controlled Windows + VPS-1 + VPS-2 devnet run); results recorded
-in a follow-up docs update.
+Controlled Windows + VPS-1 + VPS-2 devnet run on this build (HEAD `9de939f`):
+
+- Windows egress IP `122.162.151.91` (unchanged); existing source-restricted VPS-1 UFW rule for
+  `41210` reused; **no firewall change**. RPC loopback-only; isolated `p26e` dirs.
+- **6 all-gates blocks mined + propagated to all three**; final height 6, tip
+  `607b6069ccd05ceabc8b89f6d45b3ac83a1322d4cc1305a1fdca11c5251df572`,
+  irx1 `4d8611dbec979495512b9894e0889f1df12e75b7960be14b2899a1fee0466b4a`.
+- **Fresh-wipe (the Phase 26D remaining blocker):** stopped VPS-2 by exact PID, then **fully wiped
+  its Phase 26E storage** (`rm -rf irium-p26e-vps2-node` — blocks + state + data, incl. the
+  `candidate_admissions.dat` snapshot; `0 files` left), and restarted it as a **brand-new node**
+  (`contiguous_from_zero=0`, `local height=0`). It connected to VPS-1, **received the historical
+  candidate admissions** served alongside the blocks (the hub logged VPS-2 re-broadcasting them),
+  ingested + re-validated them via the normal path, **connected the blocks, and reached height 6**
+  in ~45 s — tip + irx1 **exactly matching** VPS-1 and Windows. (In Phase 26C/26D this fresh-wipe
+  case could not sync.)
+- **New block after fresh sync:** mined H7 (Windows); the fresh-synced VPS-2 received it live — all
+  three at height 7, tip `2ad6f9cb1b5aec217177c46132edb23b12c2bd6307434c6fe945a767d10014da`,
+  irx1 `030563892c6cbd00fc01de199f07db81d140c50343452e029aaa89311f95f25a`.
 
 ## Cleanup proof
 
-Recorded in the follow-up docs update alongside the live validation.
+- All three Phase 26E nodes stopped by **exact pidfile PIDs** (no pkill/killall): Windows `24756`,
+  VPS-1 `48363`, VPS-2 `2109223` — all STOPPED. All p26e ports closed
+  (`41210/41411/41408`, `41420/41421/41418`, `41430/41431/41428`).
+- Mainnet/prod alive and untouched: Windows `33752`, VPS-1 `219530`, VPS-2 `1851441`; VPS-1 prod
+  pool alive.
+- Default storage untouched (all predate this run): Windows `%USERPROFILE%\.irium` (2026-06-07),
+  VPS-1 `~/.irium` (2026-06-21), VPS-2 `~/.irium` (2026-06-06). UFW unchanged. No real wallets
+  touched. Artifacts preserved under `phase26e-artifacts-vps1/vps2` and the Windows
+  `irium-poawx-phase26e\artifacts`.
 
 ## Remaining blockers
 
