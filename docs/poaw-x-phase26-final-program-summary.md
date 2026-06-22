@@ -47,7 +47,9 @@ workflow, and engagement tracker so that engagement can start immediately once a
 | 26M | This final program summary + index + commit map + decision tracker | docs | _this commit_ |
 
 See `docs/poaw-x-phase26-commit-map.md` for the full table and source ranges, and
-`docs/poaw-x-phase26-index.md` for all document links.
+`docs/poaw-x-phase26-index.md` for all document links. Draft release notes (draft only — no tag/
+release): `docs/release-notes/poaw-x-phase26-draft-release-notes.md` and
+`docs/release-notes/poaw-x-phase26-draft-changelog.md`.
 
 ## Major technical achievements
 

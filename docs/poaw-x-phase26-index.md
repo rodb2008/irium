@@ -57,6 +57,9 @@ Baseline: branch `testnet/poawx-phase20-blueprint-completion-local`, HEAD `208d5
 - `docs/poaw-x-phase26-index.md` — this index.
 - `docs/poaw-x-phase26-commit-map.md` — commit table + audit source ranges.
 - `docs/poaw-x-phase26-next-decision-tracker.md` — the five open decisions.
+- `docs/release-notes/poaw-x-phase26-draft-release-notes.md` — 26N draft release notes (draft only; no
+  tag/release).
+- `docs/release-notes/poaw-x-phase26-draft-changelog.md` — 26N draft changelog (grouped by area).
 
 ## Findings trackers (where audit findings will be recorded)
 
