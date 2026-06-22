@@ -82,14 +82,39 @@ NOT changed: phase21d / phase21e / phase22a logic; `connect_block` validation; t
 - No default-storage usage in tests (snapshot path is a per-process file under `target/`).
 - Mainnet PoAW-X remains hard-disabled (unchanged gate functions).
 
-## Live validation (restart / keep-storage)
+## Live validation (restart / keep-storage) — PASSED
 
-Performed after this code commit (controlled Windows + VPS-1 + VPS-2 devnet run); results recorded
-in a follow-up docs update.
+Controlled Windows + VPS-1 + VPS-2 devnet run on this build (HEAD `de13a83`):
+
+- Windows egress IP `122.162.151.91` (unchanged); existing source-restricted VPS-1 UFW rule for
+  `41210` applied; **no firewall change**. RPC loopback-only on all three. Isolated Phase 26D dirs
+  (`irium-p26d-vps1-node`, `irium-p26d-vps2-node`, `irium-poawx-phase26d\node`).
+- **6 all-gates blocks mined + propagated to all three** (H1 Windows, H2 VPS-1, H3 Windows,
+  H4 **VPS-2-originated**, H5 VPS-1, H6 Windows); all three matched height/tip/irx1 after each.
+  Final: height 6, tip `1f7b10d9106047dabe909077855fa6cbcf71579e5b772a4b7f3ec0ac18991290`,
+  irx1 `745c8a9d40043cc1b1d7d0d33ab05156be66de4b9ef7758ec7bb9612d5380526`.
+- VPS-2's data root held `candidate_admissions.dat` (the durable snapshot, ~9.5 KB).
+- **Restart with same isolated storage (the Phase 26C failure case):** stopped VPS-2 by exact PID,
+  restarted (storage preserved). Startup logged **`reloaded 18 persisted candidate admissions for
+  cold replay`** and **`Startup source-of-truth: … tip=6 hash=1f7b10d9…`** — the active chain rebuilt
+  to **height 6 from disk** (the persisted-block replay now passes phase21e via the reloaded
+  admitted set). In Phase 26C this exact restart left `local height=0` stuck. VPS-2's tip + irx1
+  matched the hub and Windows exactly.
+- **New block after resync:** mined H7 (Windows); VPS-2 received it incrementally — all three at
+  height 7, tip `0d9076037e0fa6a84d896dda730a32af879a3d3a7bcad3a21c4962216f85bf14`,
+  irx1 `20025b5b0dd6972c503eab81dc29b0d43372c1fe0830295f7872054668b22a05`.
 
 ## Cleanup proof
 
-Recorded in the follow-up docs update alongside the live validation.
+- All three Phase 26D nodes stopped by **exact pidfile PIDs** (no pkill/killall): Windows `40972`,
+  VPS-1 `33729`, VPS-2 `2106268` — all STOPPED. All p26d ports closed
+  (`41210/41411/41408`, `41420/41421/41418`, `41430/41431/41428`).
+- Mainnet/prod alive and untouched: Windows `33752`, VPS-1 `219530`, VPS-2 `1851441`; VPS-1 prod
+  pool alive.
+- Default storage untouched (all predate this run): Windows `%USERPROFILE%\.irium` (2026-06-07),
+  VPS-1 `~/.irium` (2026-06-21), VPS-2 `~/.irium` (2026-06-06). UFW unchanged. No real wallets
+  touched. Artifacts preserved under `phase26d-artifacts-vps1/vps2` and the Windows
+  `irium-poawx-phase26d\artifacts`.
 
 ## What remains unsolved
 
