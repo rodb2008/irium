@@ -38,6 +38,10 @@ on the *gating logic*, *admission availability*, and *DoS/abuse surface*.
 6. `AUDIT_DELIVERABLES.md` — what the audit should produce.
 7. `AUDIT_KICKOFF_EMAIL_DRAFT.md` — a ready-to-send intro for the reviewer.
 
+Delivery wrapper (how this package is handed to an external reviewer):
+- `docs/audit/phase26j-external-handoff/` — `PACKAGE_MANIFEST.md`, `SEND_READY_SUMMARY.md`,
+  `AUDITOR_OUTREACH_MESSAGE.md`, `AUDITOR_HANDOFF_CHECKLIST.md`, `EXTERNAL_FINDINGS_TRACKER_COPY.md`.
+
 Background (already written; the auditor should read these too):
 - `docs/audit/poawx-phase26-independent-audit-package.md` — full package (invariants, threat model,
   test/live matrices).

@@ -49,6 +49,9 @@ serving/reload/gate code paths.
 
 ## Where the evidence lives
 
+- External delivery wrapper: `docs/audit/phase26j-external-handoff/` — `PACKAGE_MANIFEST.md` (full
+  file list + read order), `SEND_READY_SUMMARY.md`, `AUDITOR_OUTREACH_MESSAGE.md`,
+  `AUDITOR_HANDOFF_CHECKLIST.md`, `EXTERNAL_FINDINGS_TRACKER_COPY.md`.
 - This folder (`docs/audit/phase26i-self-review/`): `SELF_REVIEW_REPORT.md`, `REPRO_EVIDENCE.md`,
   `INTERNAL_FINDINGS.md`, and these notes.
 - Kickoff package: `docs/audit/phase26h-kickoff/` (`README.md`, `AUDIT_SCOPE.md`,
