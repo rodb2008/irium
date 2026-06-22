@@ -5,6 +5,10 @@ tracked." **No auditor has been contacted, no audit has happened, and no email h
 **NOT audited. NOT production-ready. NOT mainnet-ready.** Mainnet PoAW-X is hard-off
 (`network_id == 0`); public testnet remains gated.
 
+> Program overview: `docs/poaw-x-phase26-final-program-summary.md`, index
+> `docs/poaw-x-phase26-index.md`, commit map `docs/poaw-x-phase26-commit-map.md`, decisions
+> `docs/poaw-x-phase26-next-decision-tracker.md`.
+
 ## Coordinates
 
 - Repo: `https://github.com/iriumlabs/irium.git` (public)

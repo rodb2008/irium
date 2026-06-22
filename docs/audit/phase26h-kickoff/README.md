@@ -27,6 +27,11 @@ basic applied cryptography (signatures, digests, VRF outputs as opaque values). 
 expertise is not required — the audit treats VRF outputs as validated opaque digests; the focus is
 on the *gating logic*, *admission availability*, and *DoS/abuse surface*.
 
+## Program overview
+
+For the whole Phase 26 picture (executive summary, timeline, commit map, and open decisions), see
+`docs/poaw-x-phase26-final-program-summary.md` and the index `docs/poaw-x-phase26-index.md`.
+
 ## How to navigate the docs
 
 1. Start here (`README.md`).

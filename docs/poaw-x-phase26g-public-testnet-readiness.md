@@ -17,6 +17,8 @@ Companion docs: `poaw-x-phase26g-public-testnet-rollout-checklist.md`,
 - Audit kickoff package: `docs/audit/phase26h-kickoff/` (Phase 26H) — scope, review guide, findings
   tracker, deliverables, reproduction commands, and reviewer-intro email draft. An independent audit
   with a scoped sign-off is a prerequisite gate before any public-testnet launch.
+- Program overview: `docs/poaw-x-phase26-final-program-summary.md` and `docs/poaw-x-phase26-index.md`
+  (full Phase 26 summary, index, commit map, and the next-decision tracker).
 
 ## Executive summary
 
