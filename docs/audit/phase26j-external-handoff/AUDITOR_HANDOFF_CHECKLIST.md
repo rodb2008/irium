@@ -36,7 +36,11 @@ item here requires sharing secrets, keys, wallet data, machine credentials, or m
       `EXTERNAL_FINDINGS_TRACKER_COPY.md`); internal pre-read is
       `docs/audit/phase26i-self-review/INTERNAL_FINDINGS.md`.
 - [ ] **Severity scale aligned** — Critical / High / Medium / Low / Informational (definitions in the
-      tracker).
+      tracker and `docs/audit/phase26k-remediation-workflow/FINDING_TRIAGE_POLICY.md`).
+- [ ] **Remediation workflow shared** — point the auditor to
+      `docs/audit/phase26k-remediation-workflow/` (response lifecycle, branch policy, retest protocol,
+      response templates, status dashboard, per-finding record template) so finding handling is
+      understood up front.
 
 ## Safety confirmations
 

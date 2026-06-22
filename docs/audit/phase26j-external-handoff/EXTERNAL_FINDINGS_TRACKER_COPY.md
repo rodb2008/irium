@@ -7,6 +7,10 @@ response", "Fix commit", and "Retest evidence". **No findings confirmed yet — 
 
 Baseline: branch `testnet/poawx-phase20-blueprint-completion-local`, HEAD `22dfde8`, source `0208368`.
 
+> Remediation process for any finding logged here is defined in
+> `docs/audit/phase26k-remediation-workflow/` (triage, response lifecycle, branch policy, retest
+> protocol, response templates, status dashboard, per-finding record template).
+
 ## Legend
 
 - **Severity:** Critical · High · Medium · Low · Informational

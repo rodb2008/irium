@@ -5,6 +5,10 @@ rows; the project fills "Project response", "Fix commit", and "Retest evidence".
 been confirmed yet — this is an empty tracker for the review.** NOT audited / production-ready /
 mainnet-ready.
 
+> Remediation process: how findings are triaged, fixed, retested, and closed is defined in
+> `docs/audit/phase26k-remediation-workflow/` (triage policy, response workflow, branch policy, retest
+> protocol, response templates, status dashboard, and a per-finding record template).
+
 ## Legend
 
 - **Severity:** Critical · High · Medium · Low · Informational
