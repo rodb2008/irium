@@ -3111,6 +3111,20 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
     storage::set_expected_hash_window_span(0);
     storage::set_persisted_window_tip(0);
 
+    // Phase 26D: wire the durable candidate-admission snapshot to the node's
+    // isolated data root and reload it BEFORE replaying persisted blocks, so
+    // `connect_block`'s UNCHANGED phase21e gate can match the admitted set for
+    // historical heights and reconnect the chain on a cold restart. Setting the
+    // path here (startup, before serving) also makes every later ingest durable.
+    {
+        let cache = irium_node_rs::poawx_admission::global_admission_cache();
+        cache.set_persist_path(storage::candidate_admissions_file());
+        let reloaded = cache.load_persisted();
+        if reloaded > 0 {
+            eprintln!("[i] reloaded {reloaded} persisted candidate admissions for cold replay");
+        }
+    }
+
     let node_dir = storage::blocks_dir();
     let miner_dir = miner_blocks_dir();
 

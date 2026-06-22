@@ -9770,6 +9770,106 @@ mod tests {
     }
 
     #[test]
+    fn phase26d_cold_replay_with_persisted_admissions() {
+        // Phase 26D: prove a restarted node can re-validate persisted blocks
+        // through the UNCHANGED phase21e gate by reloading the durable
+        // candidate-admission snapshot. Build a 6-block all-gates chain (ingesting
+        // + persisting admissions), then simulate a restart (clear the in-memory
+        // admission cache) and show:
+        //   (a) WITHOUT the reload, connect_block is REJECTED by phase21e (gate
+        //       intact — persistence is not a bypass);
+        //   (b) WITH the reload from disk, a fresh chain re-connects every block.
+        use crate::poawx_admission::global_admission_cache;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        phase26b_set_gate_env();
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let net = crate::activation::network_id_byte();
+        let cache = global_admission_cache();
+        let path = std::path::PathBuf::from("target")
+            .join(format!("p26d_chain_adm_{}.dat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        cache.set_persist_path(path.clone());
+        cache.clear();
+
+        // ---- Build + connect 6 blocks; admissions auto-persist on ingest. ----
+        let n_blocks = 6u64;
+        let mut st1 = base_chain(None);
+        let mut prev = genesis_hash;
+        let mut parent_prev: Option<[u8; 32]> = None;
+        let mut blocks: Vec<Block> = Vec::new();
+        for h in 1..=n_blocks {
+            let bits = st1.target_for_height(h).bits;
+            let proof = crate::poawx_mining_harness::build_devnet_all_gates_block(
+                net,
+                h,
+                prev,
+                parent_prev,
+                bits,
+                genesis.header.time + h as u32,
+                4,
+            )
+            .unwrap_or_else(|e| panic!("build H{h}: {e}"));
+            cache.set_tip(h);
+            for adm in &proof.admissions {
+                assert_eq!(
+                    cache.ingest_bytes(adm),
+                    crate::poawx_gossip::GossipOutcome::AcceptedNew
+                );
+            }
+            let blk_prev = prev;
+            let blk_hash = proof.block_hash;
+            blocks.push(proof.block.clone());
+            st1.connect_block(proof.block)
+                .unwrap_or_else(|e| panic!("connect H{h}: {e}"));
+            parent_prev = Some(blk_prev);
+            prev = blk_hash;
+        }
+        assert!(path.exists(), "admissions persisted to disk on ingest");
+
+        // ---- (a) Simulated restart with EMPTY cache: phase21e must reject. ----
+        cache.clear();
+        {
+            let mut st_neg = base_chain(None);
+            let err = st_neg
+                .connect_block(blocks[0].clone())
+                .expect_err("phase21e must reject without admitted candidates");
+            assert!(
+                err.contains("phase21e"),
+                "expected phase21e admitted-set rejection, got: {err}"
+            );
+        }
+
+        // ---- (b) Reload persisted admissions, then a FRESH chain reconnects. ----
+        cache.clear();
+        let reloaded = cache.load_persisted();
+        assert_eq!(
+            reloaded,
+            (n_blocks as usize) * 3,
+            "all per-height role admissions reloaded from disk"
+        );
+        let mut st2 = base_chain(None);
+        let before = st2.height;
+        for (i, blk) in blocks.iter().enumerate() {
+            st2.connect_block(blk.clone())
+                .unwrap_or_else(|e| panic!("cold replay H{} failed: {e}", i + 1));
+        }
+        assert_eq!(
+            st2.height,
+            before + n_blocks,
+            "cold replay reached the 6-block tip via the reloaded admitted set"
+        );
+
+        cache.clear();
+        let _ = std::fs::remove_file(&path);
+        phase26b_clear_gate_env();
+    }
+
+    #[test]
     fn phase22d_true_vrf_enforcement() {
         use crate::poawx::{
             ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,

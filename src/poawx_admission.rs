@@ -16,6 +16,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -293,6 +294,11 @@ pub struct NodeCandidateAdmissionCache {
     admissions: Mutex<BTreeMap<(u64, u8, [u8; 20]), CandidateAdmissionV1>>,
     seen: Mutex<BTreeSet<[u8; 32]>>,
     tip: AtomicU64,
+    /// Phase 26D: optional on-disk snapshot path (the node's isolated data
+    /// root). When set, accepted admissions are persisted so a restarted node
+    /// can reload its admitted set and replay persisted blocks through the
+    /// UNCHANGED phase21e gate. `None` => purely in-memory (e.g. unit tests).
+    persist_path: Mutex<Option<PathBuf>>,
 }
 
 impl Default for NodeCandidateAdmissionCache {
@@ -301,6 +307,7 @@ impl Default for NodeCandidateAdmissionCache {
             admissions: Mutex::new(BTreeMap::new()),
             seen: Mutex::new(BTreeSet::new()),
             tip: AtomicU64::new(0),
+            persist_path: Mutex::new(None),
         }
     }
 }
@@ -375,6 +382,9 @@ impl NodeCandidateAdmissionCache {
         map.insert(key, adm.clone());
         drop(map);
         self.mark_seen(adm.digest);
+        // Phase 26D: durably snapshot the admitted set (best-effort; the
+        // admission was already fully validated above). No validation change.
+        self.persist_snapshot();
         GossipOutcome::AcceptedNew
     }
 
@@ -442,6 +452,131 @@ impl NodeCandidateAdmissionCache {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    // ── Phase 26D: durable snapshot of the validated admitted set ────────────
+    //
+    // This persists ONLY admissions that already passed `ingest_bytes`
+    // validation, and reloads them through the SAME `CandidateAdmissionV1`
+    // re-validation. It does not change, skip, or weaken phase21e: the
+    // `admitted_candidate_set` equality check is untouched; this merely makes the
+    // already-admitted set durable across a restart so persisted blocks can be
+    // replayed. Mainnet PoAW-X stays hard-off independently of this path.
+
+    /// Configure the on-disk snapshot path (the node's isolated data root).
+    /// Idempotent; call once at startup.
+    pub fn set_persist_path(&self, path: PathBuf) {
+        *self
+            .persist_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(path);
+    }
+
+    /// Atomically rewrite the snapshot of all cached admissions (length-prefixed
+    /// raw wire records) to the configured path. Bounded by the (pruned) cache
+    /// size. Best-effort: any I/O error is ignored and never panics.
+    fn persist_snapshot(&self) {
+        let path = match self
+            .persist_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(p) => p,
+            None => return,
+        };
+        // Snapshot raw wire bytes under the lock, then release before any I/O.
+        let records: Vec<Vec<u8>> = {
+            let map = self.admissions.lock().unwrap_or_else(|e| e.into_inner());
+            map.values().map(|a| a.serialize()).collect()
+        };
+        let mut buf = Vec::new();
+        for r in &records {
+            if r.is_empty() || r.len() > CANDIDATE_ADMISSION_MAX_BYTES {
+                continue;
+            }
+            buf.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            buf.extend_from_slice(r);
+        }
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &buf).is_ok() {
+            // Atomic replace: remove the destination first so the rename
+            // succeeds cross-platform (Windows rename-over-existing).
+            let _ = std::fs::remove_file(&path);
+            if std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+
+    /// Reload one persisted admission (raw wire bytes) at startup. Re-validates
+    /// EXACTLY like `ingest_bytes` (network match + full `CandidateAdmissionV1`
+    /// validation, incl. signature/digest/seed/true-VRF), but does NOT apply the
+    /// live gossip window (we are reconstructing historical admitted state, not
+    /// accepting new gossip). Rejects malformed / wrong-network / invalid /
+    /// conflicting records. Returns true if stored. Never panics.
+    pub fn reload_persisted_bytes(&self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() || bytes.len() > CANDIDATE_ADMISSION_MAX_BYTES {
+            return false;
+        }
+        let adm = match CandidateAdmissionV1::deserialize(bytes) {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        if adm.network_id != network_id_byte() {
+            return false;
+        }
+        if adm.validate(adm.network_id, adm.target_height).is_err() {
+            return false;
+        }
+        let key = (
+            adm.target_height,
+            adm.candidate.role_id,
+            adm.candidate.solver_pkh,
+        );
+        let mut map = self.admissions.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&key) {
+            Some(existing) if existing.digest != adm.digest => return false,
+            Some(_) => return true,
+            None => {}
+        }
+        map.insert(key, adm.clone());
+        drop(map);
+        self.mark_seen(adm.digest);
+        true
+    }
+
+    /// Load all persisted admissions from the configured path into the cache at
+    /// startup. Returns the number reloaded. A missing file, or any truncated /
+    /// corrupt / invalid record, is skipped without crashing the node.
+    pub fn load_persisted(&self) -> usize {
+        let path = match self
+            .persist_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(p) => p,
+            None => return 0,
+        };
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => return 0,
+        };
+        let mut loaded = 0usize;
+        let mut i = 0usize;
+        while i + 4 <= data.len() {
+            let len = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+            i += 4;
+            if len == 0 || len > CANDIDATE_ADMISSION_MAX_BYTES || i + len > data.len() {
+                break; // truncated / corrupt tail: stop scanning.
+            }
+            if self.reload_persisted_bytes(&data[i..i + len]) {
+                loaded += 1;
+            }
+            i += len;
+        }
+        loaded
     }
 }
 
@@ -742,5 +877,98 @@ mod tests {
             !candidate_admission_enforced_gate(0, Some(1), true, 100),
             "mainnet hard-off"
         );
+    }
+
+    // Phase 26D: a per-process unique scratch path UNDER `target/` (never /tmp,
+    // never a default storage dir). Cargo runs tests with the crate root as cwd.
+    fn p26d_test_file(name: &str) -> PathBuf {
+        PathBuf::from("target").join(format!("p26d_adm_{}_{}.dat", std::process::id(), name))
+    }
+
+    #[test]
+    fn phase26d_persist_reload_roundtrip() {
+        // Accepted admissions are snapshotted to disk on ingest; a fresh cache
+        // (simulating a restart with an empty in-memory map) reloads them and
+        // exposes the SAME admitted set. phase21e logic is untouched.
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
+        let net = network_id_byte();
+        let seed = [0x33u8; 32];
+        let path = p26d_test_file("roundtrip");
+        let _ = std::fs::remove_file(&path);
+
+        let a = NodeCandidateAdmissionCache::new();
+        a.set_persist_path(path.clone());
+        a.set_tip(10);
+        let m1 = CandidateAdmissionV1::new(net, 10, seed, cand(1, [0xC1u8; 20], 0x11, &seed));
+        let m2 = CandidateAdmissionV1::new(net, 10, seed, cand(2, [0xC2u8; 20], 0x12, &seed));
+        assert_eq!(a.ingest_bytes(&m1.serialize()), GossipOutcome::AcceptedNew);
+        assert_eq!(a.ingest_bytes(&m2.serialize()), GossipOutcome::AcceptedNew);
+        assert!(path.exists(), "snapshot written on ingest");
+
+        // Fresh cache => empty in-memory; reload from disk.
+        let b = NodeCandidateAdmissionCache::new();
+        b.set_persist_path(path.clone());
+        assert_eq!(b.load_persisted(), 2, "both admissions reloaded");
+        assert_eq!(
+            b.admitted_candidate_set(net, 10, &seed).candidates.len(),
+            2,
+            "reloaded admitted set matches"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn phase26d_reload_rejects_invalid_records() {
+        // Reload re-validates EXACTLY like ingest: wrong-network, corrupt,
+        // truncated, and tampered records are rejected (never accepted, never
+        // panics) — so persistence cannot smuggle an unvalidated admission past
+        // phase21e.
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_TRUE_VRF_REQUIRED");
+        let net = network_id_byte(); // testnet == 1
+        let seed = [0x44u8; 32];
+        let cache = NodeCandidateAdmissionCache::new();
+
+        let good = CandidateAdmissionV1::new(net, 10, seed, cand(1, [0xC1u8; 20], 0x11, &seed));
+        assert!(cache.reload_persisted_bytes(&good.serialize()), "valid reloads");
+
+        // Wrong network id => rejected before any state change.
+        let wrong_net = CandidateAdmissionV1::new(2, 10, seed, cand(1, [0xC3u8; 20], 0x13, &seed));
+        assert!(
+            !cache.reload_persisted_bytes(&wrong_net.serialize()),
+            "wrong network rejected"
+        );
+
+        // Corrupt / truncated / empty => rejected, no panic.
+        assert!(!cache.reload_persisted_bytes(&[0u8; 5]), "garbage rejected");
+        assert!(!cache.reload_persisted_bytes(&[]), "empty rejected");
+        let full = good.serialize();
+        assert!(
+            !cache.reload_persisted_bytes(&full[..full.len() / 2]),
+            "truncated rejected"
+        );
+
+        // Tampered bytes (digest no longer recomputes) => rejected.
+        let mut tampered = good.serialize();
+        tampered[20] ^= 0xFF;
+        assert!(
+            !cache.reload_persisted_bytes(&tampered),
+            "tampered admission rejected"
+        );
+
+        std::env::remove_var("IRIUM_NETWORK");
     }
 }

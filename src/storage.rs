@@ -541,6 +541,15 @@ pub fn state_dir() -> PathBuf {
     configured_dir("IRIUM_STATE_DIR").unwrap_or_else(|| runtime_root_dir().join("state"))
 }
 
+/// Phase 26D: on-disk snapshot of the validated candidate-admission cache.
+/// Lives in the node's data root (NOT the state dir) so it survives a
+/// "delete only state, keep blocks" resync as well as a same-storage restart.
+/// Never the production default / `/tmp` (it follows the configured isolated
+/// `IRIUM_DATA_DIR`, same as every other runtime path).
+pub fn candidate_admissions_file() -> PathBuf {
+    runtime_root_dir().join("candidate_admissions.dat")
+}
+
 pub fn bootstrap_dir() -> PathBuf {
     configured_dir("IRIUM_BOOTSTRAP_DIR").unwrap_or_else(|| runtime_root_dir().join("bootstrap"))
 }
