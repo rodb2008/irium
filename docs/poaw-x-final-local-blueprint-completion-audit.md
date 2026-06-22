@@ -271,3 +271,13 @@ standard-header activation global in the standalone harness). Mainnet node (PID 
 to a real node and accepted, advancing the chain." NOT production-ready / mainnet-ready / audited.
 Remaining: cross-host P2P provider/firewall, independent audit, public testnet, governance/mainnet
 activation. See docs/poaw-x-phase24l-windows-live-proof-result.md.
+
+## Phase 26 update (multiblock + cold-resync) and public-testnet readiness
+
+Subsequent work (Phase 26B–26F) made multi-block all-gates PoAW-X chains satisfiable (epoch-seed
+alignment), fixed restart/keep-storage cold replay and fresh-wipe sync, and produced an
+independent-audit package — all with phase21d/21e/22a equality logic preserved and mainnet hard-off.
+Still NOT production-ready / mainnet-ready / audited. The next gate is an independent audit
+(`docs/audit/poawx-phase26-*`) followed by a public testnet. See the Phase 26G public-testnet
+readiness package: `docs/poaw-x-phase26g-public-testnet-readiness.md` (with rollout-checklist,
+risk-register, and operator-runbook).
