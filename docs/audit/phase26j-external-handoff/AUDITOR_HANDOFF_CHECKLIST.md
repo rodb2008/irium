@@ -3,6 +3,10 @@
 Work through this before and during handoff. **NOT audited / production-ready / mainnet-ready.** No
 item here requires sharing secrets, keys, wallet data, machine credentials, or mainnet access.
 
+> Engagement tracking + owner inputs + the pre-send checklist live in
+> `docs/audit/phase26l-engagement-tracker/` (`OWNER_ACTIONS_REQUIRED.md`, `SEND_CHECKLIST.md`,
+> `NEXT_STEPS_TRACKER.md`). No outreach has been sent.
+
 ## Before outreach
 
 - [ ] **Auditor contact confirmed** — name, company, and a verified email/contact channel

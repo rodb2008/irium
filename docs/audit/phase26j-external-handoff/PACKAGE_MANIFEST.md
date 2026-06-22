@@ -78,6 +78,13 @@ NOT mainnet-ready.** Mainnet PoAW-X is hard-off (`network_id == 0`). No public t
 - Internal pre-read (already populated, Informational only):
   `docs/audit/phase26i-self-review/INTERNAL_FINDINGS.md`.
 
+## Engagement tracking
+
+To go from "package prepared" to "auditor contacted / scheduled / findings tracked," see
+`docs/audit/phase26l-engagement-tracker/` — `ENGAGEMENT_SUMMARY.md`, `NEXT_STEPS_TRACKER.md`,
+`AUDITOR_SELECTION_CRITERIA.md`, `OWNER_ACTIONS_REQUIRED.md`, `AUDIT_ENGAGEMENT_STATUS.md`,
+`SEND_CHECKLIST.md`. No auditor has been contacted and no message has been sent.
+
 ## Disclaimer
 
 This package is an outreach/handoff bundle only. It is **not** an audit and asserts no sign-off.

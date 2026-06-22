@@ -50,6 +50,9 @@ any validation gate.
 
 ## Related
 
+- Engagement tracking (move from prepared → contacted → scheduled → findings):
+  `docs/audit/phase26l-engagement-tracker/` (`ENGAGEMENT_SUMMARY.md`, `NEXT_STEPS_TRACKER.md`,
+  `AUDIT_ENGAGEMENT_STATUS.md`, `OWNER_ACTIONS_REQUIRED.md`, `SEND_CHECKLIST.md`).
 - Findings trackers (where findings are listed): `docs/audit/phase26h-kickoff/FINDINGS_TRACKER.md` and
   the send-copy `docs/audit/phase26j-external-handoff/EXTERNAL_FINDINGS_TRACKER_COPY.md`.
 - Internal self-review pre-read (Informational only, not an audit):
