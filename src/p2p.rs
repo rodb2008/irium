@@ -5106,6 +5106,17 @@ impl P2PNode {
                                                     end_h
                                                 ),
                                             );
+                                        // Phase 26E: send historical admissions for the pushed
+                                        // heights before the block bodies (fresh-sync support;
+                                        // no-op on mainnet; bounded).
+                                        let p26e_fw = Arc::downgrade(&fallback_writer);
+                                        send_historical_admissions(
+                                            &p26e_fw,
+                                            fallback_addr,
+                                            start_height,
+                                            blocks.len(),
+                                        )
+                                        .await;
                                         for block_data in blocks {
                                             let msg = BlockPayload { block_data }.to_message();
                                             let _ =
@@ -5914,6 +5925,18 @@ impl P2PNode {
                                     }
                                 }
 
+                                // Phase 26E: send the historical candidate admissions for the
+                                // served heights BEFORE the block bodies, so a fresh/wiped peer
+                                // can populate its admission cache and pass the UNCHANGED
+                                // phase21e gate (no-op on mainnet; bounded).
+                                send_historical_admissions(
+                                    &writer_weak,
+                                    addr2,
+                                    start_height,
+                                    blocks.len(),
+                                )
+                                .await;
+
                                 for block_data in blocks {
                                     let Some(writer) = writer_weak.upgrade() else {
                                         break;
@@ -6656,6 +6679,45 @@ async fn send_message(
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("failed to send to {}: {}", peer, e)),
         Err(_) => Err(format!("failed to send to {}: write timeout", peer)),
+    }
+}
+
+/// Phase 26E: send the historical candidate admissions for the served block
+/// range `[start_height, start_height + block_count)` to a syncing peer, so a
+/// fresh / wiped node can populate its admission cache and pass the UNCHANGED
+/// phase21e gate. Admissions are public, already-validated data; the receiver
+/// re-validates each via the normal ingest path (`ingest_bytes`). Bounded
+/// (anti-spam) and a no-op when there are no admissions (e.g. mainnet hard-off).
+/// Sent BEFORE the matching block bodies so the receiver's cache is populated
+/// before it connects those blocks.
+async fn send_historical_admissions(
+    writer_weak: &std::sync::Weak<Mutex<OwnedWriteHalf>>,
+    peer: SocketAddr,
+    start_height: u64,
+    block_count: usize,
+) {
+    if block_count == 0 {
+        return;
+    }
+    let cache = crate::poawx_admission::global_admission_cache();
+    let end = start_height + block_count as u64;
+    let cap = block_count.saturating_mul(16);
+    let mut sent = 0usize;
+    for h in start_height..end {
+        for adm in cache.admissions_for_height(h) {
+            if sent >= cap {
+                return;
+            }
+            let Some(writer) = writer_weak.upgrade() else {
+                return;
+            };
+            let msg = crate::protocol::PoawxCandidateAdmissionPayload {
+                admission_bytes: adm.serialize(),
+            }
+            .to_message();
+            let _ = send_message(&writer, msg, peer).await;
+            sent += 1;
+        }
     }
 }
 
@@ -7558,6 +7620,16 @@ async fn handle_incoming_with_sybil(
                                     end_h
                                 ),
                                 );
+                                // Phase 26E: send historical admissions for the pushed heights
+                                // before the block bodies (fresh-sync support; no-op on mainnet).
+                                let p26e_fw = Arc::downgrade(&fallback_writer);
+                                send_historical_admissions(
+                                    &p26e_fw,
+                                    fallback_addr,
+                                    start_height,
+                                    blocks.len(),
+                                )
+                                .await;
                                 for block_data in blocks {
                                     let msg = BlockPayload { block_data }.to_message();
                                     let _ =
@@ -8403,6 +8475,11 @@ async fn handle_incoming_with_sybil(
                                 ));
                             }
                         }
+
+                        // Phase 26E: send historical admissions for the served heights
+                        // before the block bodies (fresh-sync; no-op on mainnet; bounded).
+                        send_historical_admissions(&writer_weak, addr2, start_height, blocks.len())
+                            .await;
 
                         for block_data in blocks {
                             let Some(writer) = writer_weak.upgrade() else {

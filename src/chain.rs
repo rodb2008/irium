@@ -9870,6 +9870,134 @@ mod tests {
     }
 
     #[test]
+    fn phase26e_fresh_sync_via_served_admissions() {
+        // Phase 26E: a brand-new / fresh-wipe node (empty admission cache, no
+        // persisted snapshot) can sync a 6-block chain when a peer SERVES the
+        // historical candidate admissions for the synced heights. The receiver
+        // ingests them via the NORMAL gossip path (`ingest_bytes`, window 64,
+        // cache tip 0) — phase21e is UNCHANGED. This mirrors the P2P serving
+        // wired into the block-serve handlers (admissions sent before blocks).
+        use crate::poawx_admission::global_admission_cache;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        phase26b_set_gate_env();
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let net = crate::activation::network_id_byte();
+        let cache = global_admission_cache();
+        cache.clear();
+
+        // ---- "Server" builds a 6-block chain and admits each height. ----
+        let n_blocks = 6u64;
+        let mut st_srv = base_chain(None);
+        let mut prev = genesis_hash;
+        let mut parent_prev: Option<[u8; 32]> = None;
+        let mut blocks: Vec<Block> = Vec::new();
+        for h in 1..=n_blocks {
+            let bits = st_srv.target_for_height(h).bits;
+            let proof = crate::poawx_mining_harness::build_devnet_all_gates_block(
+                net,
+                h,
+                prev,
+                parent_prev,
+                bits,
+                genesis.header.time + h as u32,
+                4,
+            )
+            .unwrap_or_else(|e| panic!("build H{h}: {e}"));
+            cache.set_tip(h);
+            for adm in &proof.admissions {
+                assert_eq!(
+                    cache.ingest_bytes(adm),
+                    crate::poawx_gossip::GossipOutcome::AcceptedNew
+                );
+            }
+            let blk_prev = prev;
+            let blk_hash = proof.block_hash;
+            blocks.push(proof.block.clone());
+            st_srv
+                .connect_block(proof.block)
+                .unwrap_or_else(|e| panic!("connect H{h}: {e}"));
+            parent_prev = Some(blk_prev);
+            prev = blk_hash;
+        }
+
+        // What a peer SERVES to a syncing node: admissions_for_height(h) (exactly
+        // what the P2P block-serve handlers now send before the block bodies).
+        let mut served: Vec<Vec<u8>> = Vec::new();
+        for h in 1..=n_blocks {
+            for adm in cache.admissions_for_height(h) {
+                served.push(adm.serialize());
+            }
+        }
+        assert_eq!(
+            served.len(),
+            (n_blocks as usize) * 3,
+            "server can serve the historical admissions for the synced heights"
+        );
+
+        // ---- Fresh node: empty cache, tip 0 (as a fresh syncing node has). ----
+        cache.clear();
+        cache.set_tip(0);
+
+        // (a) Negative: phase21e rejects without the admissions.
+        {
+            let mut st_neg = base_chain(None);
+            let err = st_neg
+                .connect_block(blocks[0].clone())
+                .expect_err("phase21e must reject a fresh node lacking admissions");
+            assert!(
+                err.contains("phase21e"),
+                "expected phase21e rejection, got: {err}"
+            );
+        }
+
+        // (b) Receiver ingests the SERVED admissions via the normal gossip path
+        // (window 64, tip 0 covers heights 1..=6). Tampered/wrong-network served
+        // records are rejected by that same path.
+        cache.clear();
+        cache.set_tip(0);
+        let mut tampered = served[0].clone();
+        tampered[20] ^= 0xFF;
+        assert_ne!(
+            cache.ingest_bytes(&tampered),
+            crate::poawx_gossip::GossipOutcome::AcceptedNew,
+            "tampered served admission rejected by the receiver"
+        );
+        let mut ingested = 0usize;
+        for raw in &served {
+            if cache.ingest_bytes(raw) == crate::poawx_gossip::GossipOutcome::AcceptedNew {
+                ingested += 1;
+            }
+        }
+        assert_eq!(
+            ingested,
+            (n_blocks as usize) * 3,
+            "fresh node ingested all served historical admissions"
+        );
+
+        // (c) The fresh node now connects every block normally through phase21e.
+        let mut st_fresh = base_chain(None);
+        let before = st_fresh.height;
+        for (i, blk) in blocks.iter().enumerate() {
+            st_fresh
+                .connect_block(blk.clone())
+                .unwrap_or_else(|e| panic!("fresh sync H{} failed: {e}", i + 1));
+        }
+        assert_eq!(
+            st_fresh.height,
+            before + n_blocks,
+            "fresh node synced the 6-block chain to the tip via served admissions"
+        );
+
+        cache.clear();
+        phase26b_clear_gate_env();
+    }
+
+    #[test]
     fn phase22d_true_vrf_enforcement() {
         use crate::poawx::{
             ROLE_COMPUTE_CONTRIBUTOR, ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
