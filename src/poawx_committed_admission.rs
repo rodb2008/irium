@@ -222,6 +222,35 @@ impl AdmissionCommitmentV1 {
     }
 }
 
+// ── Admission epoch seed (Phase 26B seed reconciliation) ─────────────────────
+
+/// The candidate-admission EPOCH seed for a block at height `H`.
+///
+/// The candidate set / admissions for `H` are FROZEN one block ahead by the
+/// parent's outgoing committed admission, whose freeze seed is the parent block's
+/// `prev_hash` (= the grandparent hash, `hash(H-2)`). So the epoch seed for `H` is
+/// the parent's `prev_hash`. At the activation boundary — when the parent is the
+/// genesis block, whose `prev_hash` is all-zero — the epoch seed is THIS block's
+/// `prev_hash` (the genesis hash), and the incoming committed-admission check is
+/// graced. This reconciles the phase21d candidate-set gate (which validates this
+/// seed) with the phase22a committed-admission gate (whose parent commitment
+/// carries exactly this seed), making multi-block chains satisfiable WITHOUT
+/// weakening either gate. Pure; no wire-format change. Mainnet behavior is
+/// unaffected (the PoAW-X gates remain hard-off for `network_id == 0`).
+///
+/// `parent_prev_hash` is the parent (tip) block's own `prev_hash` (`None` if there
+/// is no parent). `block_prev_hash` is the current block's `prev_hash`.
+pub fn admission_epoch_seed(parent_prev_hash: Option<[u8; 32]>, block_prev_hash: [u8; 32]) -> [u8; 32] {
+    match parent_prev_hash {
+        // Parent is a real (non-genesis) block: its prev_hash is the grandparent
+        // hash and equals the seed it froze for this height.
+        Some(p) if p != [0u8; 32] => p,
+        // Activation boundary (parent is genesis, or no parent): use this block's
+        // prev_hash (the genesis hash); incoming committed admission is graced.
+        _ => block_prev_hash,
+    }
+}
+
 // ── Gates (param-driven; mainnet hard-off) ───────────────────────────────────
 
 pub fn committed_admission_window() -> u64 {

@@ -36,8 +36,8 @@ use crate::poawx::{
 };
 use crate::poawx_admission::CandidateAdmissionV1;
 use crate::poawx_candidate::{AssignmentProofV2, CandidateSet, RoleCandidate};
-use crate::poawx_committed_admission::AdmissionCommitmentV1;
-use crate::poawx_dominance::{PersistentDominance, DOMINANCE_BASE_WORK_SCORE};
+use crate::poawx_committed_admission::{admission_epoch_seed, AdmissionCommitmentV1};
+use crate::poawx_dominance::{PersistentDominance, RoleRewardKind, DOMINANCE_BASE_WORK_SCORE};
 use crate::poawx_finality::{
     finality_threshold, FinalityProofV1, FinalityVoteType, FinalityVoteV1,
 };
@@ -165,10 +165,21 @@ pub struct AllGatesProof {
 /// Gate env (network, activation heights, `IRIUM_POAWX_PUZZLE_BITS`, finality
 /// threshold) must be set identically in this process and the target node so the
 /// built sections match the node validators.
+///
+/// `parent_prev_hash` is the parent (tip) block's own `prev_hash` (`None` for the
+/// genesis-parent / activation case). It is used ONLY to compute the
+/// candidate-admission epoch seed (Phase 26B): the candidate set / admissions /
+/// AVR2 are seeded by [`admission_epoch_seed`] (the grandparent hash), while the
+/// puzzle/finality/claim sections and the outgoing committed admission keep using
+/// this block's `prev_hash`. For `height == 1` (genesis parent) the epoch seed is
+/// `prev_hash` (the genesis hash) and behavior is unchanged. This makes blocks at
+/// `height >= 2` satisfy BOTH the phase21d candidate-set gate and the phase22a
+/// committed-admission gate.
 pub fn build_devnet_all_gates_block(
     network_id: u8,
     height: u64,
     prev_hash: [u8; 32],
+    parent_prev_hash: Option<[u8; 32]>,
     bits: u32,
     time: u32,
     receipt_difficulty_bits: u32,
@@ -186,7 +197,6 @@ pub fn build_devnet_all_gates_block(
         ),
     );
     let net = network_id;
-    let seed = prev_hash; // every gate section binds the seed to the block's prev_hash.
 
     // Identities (deterministic dev keys; the SUPPORT solver MUST be
     // hash160(finality member pubkey) so the committee vote validates).
@@ -202,35 +212,69 @@ pub fn build_devnet_all_gates_block(
     let compute_solver = [0xC1u8; 20];
     let verify_solver = [0xC2u8; 20];
 
-    let dom = PersistentDominance::from_env();
-    let dw = |pkh: &[u8; 20]| dom.weight(DOMINANCE_BASE_WORK_SCORE, pkh, height);
-
-    // V2 (true-VRF) proofs + candidates.
-    let mk = |secret: u8, role: u8, solver: [u8; 20], ticket: [u8; 32]| {
-        let p = AssignmentProofV2::prove(&[secret; 32], net, height, role, solver, ticket, seed)?;
-        let c = RoleCandidate::from_assignment_v2(
-            &p,
-            PenaltyStatus::Clean.id(),
-            dw(&solver),
-            [role; 32],
-        );
-        Ok::<_, String>((p, c))
+    // Anti-domination weights are validated against the node's PERSISTED dominance
+    // state, which evolves as each accepted block credits its role rewards. A
+    // standalone builder has no ChainState, so replay every prior height's reward
+    // events into a local tracker to compute weights at any target height. This
+    // builder makes deterministic, identical blocks (fixed role identities above),
+    // so each prior height `h` credited exactly these 4 role pkhs with
+    // `multi_role_amounts(block_reward(h))` — the SAME events the node applies in
+    // `apply_block_dominance`. `dom_at(upto)` holds events for blocks `[1, upto)`;
+    // for height 1 the replay is empty (genesis baseline weights == 1000).
+    let dom_at = |upto: u64| -> PersistentDominance {
+        let mut d = PersistentDominance::from_env();
+        for h in 1..upto {
+            let amts = multi_role_amounts(block_reward(h));
+            d.apply_event(worker_pkh, RoleRewardKind::Primary, amts[0], h);
+            d.apply_event(compute_solver, RoleRewardKind::Compute, amts[1], h);
+            d.apply_event(verify_solver, RoleRewardKind::Verify, amts[2], h);
+            d.apply_event(support_solver, RoleRewardKind::Support, amts[3], h);
+        }
+        d
     };
-    let (pc, cc) = mk(7, ROLE_COMPUTE_CONTRIBUTOR, compute_solver, [0x11u8; 32])?;
-    let (pv, cv) = mk(8, ROLE_VERIFY_CONTRIBUTOR, verify_solver, [0x12u8; 32])?;
-    let (ps, csup) = mk(9, ROLE_SUPPORT_CONTRIBUTOR, support_solver, [0x13u8; 32])?;
 
-    let mut cs = CandidateSet::new(net, height, seed);
-    for c in [cc.clone(), cv.clone(), csup.clone()] {
-        cs.push(c);
-    }
-    cs.sort_canonical();
+    // Phase 26B: candidate-admission EPOCH seed for THIS block — the grandparent
+    // hash the parent froze in its outgoing committed admission, decoupled from
+    // the block's own `prev_hash`. The candidate set / admissions / AVR2 use the
+    // epoch seed (what phase21d/21e/22d validate); the puzzle/finality/claim
+    // sections and the outgoing commitment use `prev_hash`.
+    let epoch_seed = admission_epoch_seed(parent_prev_hash, prev_hash);
 
-    // Candidate admissions (canonical wire bytes the node must ingest).
-    let admissions: Vec<Vec<u8>> = [(&pc, &cc), (&pv, &cv), (&ps, &csup)]
+    // Build the 3 role candidates + V2 proofs for a `(target_height, seed)` under a
+    // dominance state. Returns proofs + candidates in [compute, verify, support]
+    // order plus the canonical candidate set.
+    let build_roles = |th: u64,
+                       sd: [u8; 32],
+                       dom: &PersistentDominance|
+     -> Result<([AssignmentProofV2; 3], [RoleCandidate; 3], CandidateSet), String> {
+        let mk = |secret: u8, role: u8, solver: [u8; 20], ticket: [u8; 32]| {
+            let p = AssignmentProofV2::prove(&[secret; 32], net, th, role, solver, ticket, sd)?;
+            let w = dom.weight(DOMINANCE_BASE_WORK_SCORE, &solver, th);
+            let c = RoleCandidate::from_assignment_v2(&p, PenaltyStatus::Clean.id(), w, [role; 32]);
+            Ok::<_, String>((p, c))
+        };
+        let (pc, cc) = mk(7, ROLE_COMPUTE_CONTRIBUTOR, compute_solver, [0x11u8; 32])?;
+        let (pv, cv) = mk(8, ROLE_VERIFY_CONTRIBUTOR, verify_solver, [0x12u8; 32])?;
+        let (ps, csup) = mk(9, ROLE_SUPPORT_CONTRIBUTOR, support_solver, [0x13u8; 32])?;
+        let mut cs = CandidateSet::new(net, th, sd);
+        for c in [cc.clone(), cv.clone(), csup.clone()] {
+            cs.push(c);
+        }
+        cs.sort_canonical();
+        Ok(([pc, pv, ps], [cc, cv, csup], cs))
+    };
+
+    // INCOMING set for THIS block (height H, epoch seed, weights at H).
+    let dom_in = dom_at(height);
+    let (in_proofs, in_cands, cs) = build_roles(height, epoch_seed, &dom_in)?;
+    let dw_in = |pkh: &[u8; 20]| dom_in.weight(DOMINANCE_BASE_WORK_SCORE, pkh, height);
+
+    // Candidate admissions (canonical wire bytes the node must ingest), epoch-seeded.
+    let admissions: Vec<Vec<u8>> = in_proofs
         .iter()
+        .zip(in_cands.iter())
         .map(|(p, c)| {
-            CandidateAdmissionV1::new_with_v2(net, height, seed, (*c).clone(), Some((*p).clone()))
+            CandidateAdmissionV1::new_with_v2(net, height, epoch_seed, c.clone(), Some(p.clone()))
                 .serialize()
         })
         .collect();
@@ -259,7 +303,7 @@ pub fn build_devnet_all_gates_block(
             cand.ticket_digest,
             cand.assignment_proof_digest,
             cdg,
-            seed,
+            prev_hash,
             profile,
         );
         sols.push(solve_dev(&challenge).ok_or_else(|| "harness: puzzle solve failed".to_string())?);
@@ -280,23 +324,23 @@ pub fn build_devnet_all_gates_block(
     ));
     fproof.sort_canonical();
 
-    // OUTGOING committed-admission commitment for H+1 (incoming graced at the
-    // activation height). Self-consistent: commit_height = H, seed = prev_hash.
-    let mut cs2 = CandidateSet::new(net, height + 1, seed);
-    for c in [cc, cv, csup] {
-        cs2.push(c);
-    }
-    cs2.sort_canonical();
-    let commitment = AdmissionCommitmentV1::from_candidate_set(&cs2, height);
+    // OUTGOING committed-admission commitment for H+1. The committed set is EXACTLY
+    // what block H+1 will present: candidates for `(H+1, seed = this block's
+    // prev_hash)` — i.e. H+1's epoch seed — with weights at H+1. Self-consistent:
+    // commit_height = H, freeze seed = prev_hash (== `admission_epoch_seed` of H+1).
+    // Incoming committed admission is graced at the activation height (H1).
+    let dom_out = dom_at(height + 1);
+    let (_out_proofs, _out_cands, cs_next) = build_roles(height + 1, prev_hash, &dom_out)?;
+    let commitment = AdmissionCommitmentV1::from_candidate_set(&cs_next, height);
 
     let claim = |role: u8, solver: [u8; 20]| -> PoawxRoleClaim {
-        let lane = crate::poawx::assign_lane(net, height, &seed, role, 0);
+        let lane = crate::poawx::assign_lane(net, height, &prev_hash, role, 0);
         let nonce = [0x01u8; 32];
         let secret = [0x02u8; 32];
         let cd = crate::poawx::role_claim_digest(
             net,
             height,
-            &seed,
+            &prev_hash,
             role,
             lane.id(),
             &solver,
@@ -328,16 +372,16 @@ pub fn build_devnet_all_gates_block(
         precommit_root: None,
         role_ticket_proofs: None,
         role_dominance_weights: Some([
-            dw(&worker_pkh),
-            dw(&compute_solver),
-            dw(&verify_solver),
-            dw(&support_solver),
+            dw_in(&worker_pkh),
+            dw_in(&compute_solver),
+            dw_in(&verify_solver),
+            dw_in(&support_solver),
         ]),
         candidate_set: Some(cs),
         role_puzzle_proofs: Some([sols[0], sols[1], sols[2]]),
         finality_proof: Some(fproof),
         committed_admission: Some(commitment),
-        role_assignment_v2: Some([pc, pv, ps]),
+        role_assignment_v2: Some(in_proofs),
     };
 
     // Worker receipt: real receipt PoW solution + signed challenge (mode-0).
@@ -548,7 +592,7 @@ mod tests {
     #[test]
     fn build_devnet_all_gates_block_rejects_mainnet() {
         assert!(
-            build_devnet_all_gates_block(0, 1, [0x44u8; 32], 0x207fffff, 1, 1).is_err(),
+            build_devnet_all_gates_block(0, 1, [0x44u8; 32], None, 0x207fffff, 1, 1).is_err(),
             "builder refuses mainnet"
         );
     }

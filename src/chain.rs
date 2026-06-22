@@ -1344,6 +1344,18 @@ impl ChainState {
             Some(r) => r,
             None => return Ok(()),
         };
+        // Phase 26B: the candidate set / admissions for height H are frozen one
+        // block ahead by the parent's committed admission, whose freeze seed is the
+        // parent block's prev_hash (the grandparent hash). So the candidate-set seed
+        // for H is that EPOCH seed, NOT the immediate prev_hash; at the activation
+        // boundary (genesis parent, whose prev_hash is all-zero) it falls back to
+        // this block's prev_hash. The parent is the current tip (this block is not
+        // yet pushed). This reconciles phase21d with phase22a without weakening
+        // either gate. `prev_hash`-bound gates (puzzle/finality/claims) are unchanged.
+        let epoch_seed = crate::poawx_committed_admission::admission_epoch_seed(
+            self.chain.last().map(|p| p.header.prev_hash),
+            block.header.prev_hash,
+        );
         let dom_active = anti_domination_active(height);
         for r in receipts {
             let ext = match &r.phase20_ext {
@@ -1360,7 +1372,7 @@ impl ChainState {
             if cs.target_height != height {
                 return Err("phase21d: candidate set wrong height".to_string());
             }
-            if cs.seed != block.header.prev_hash {
+            if cs.seed != epoch_seed {
                 return Err("phase21d: candidate set wrong seed".to_string());
             }
             if !cs.is_canonical() {
@@ -1419,7 +1431,7 @@ impl ChainState {
             // admitted to THIS node in the window, not among unseen offline miners.
             if crate::poawx_admission::candidate_admission_enforced(height) {
                 let cache = crate::poawx_admission::global_admission_cache();
-                let admitted = cache.admitted_candidate_set(net, height, &block.header.prev_hash);
+                let admitted = cache.admitted_candidate_set(net, height, &epoch_seed);
                 if cs.serialize() != admitted.serialize() {
                     return Err(
                         "phase21e: candidate set does not match admitted candidates".to_string()
@@ -9406,6 +9418,7 @@ mod tests {
             net,
             height,
             genesis_hash,
+            None, // genesis parent: epoch seed falls back to prev_hash (genesis)
             bits,
             time,
             4, // receipt PoW difficulty == IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS
@@ -9462,6 +9475,298 @@ mod tests {
         ] {
             std::env::remove_var(k);
         }
+    }
+
+    // Shared gate env for the Phase 26B multi-block tests (all gates required from
+    // height 1; devnet; finality 1/1; puzzle bits 4).
+    fn phase26b_set_gate_env() {
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        for (k, v) in [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4"),
+            ("IRIUM_POAWX_PUZZLE_BITS", "4"),
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+        ] {
+            std::env::set_var(k, v);
+        }
+    }
+
+    fn phase26b_clear_gate_env() {
+        for k in [
+            "IRIUM_NETWORK",
+            "IRIUM_POAWX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_MODE",
+            "IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS",
+            "IRIUM_POAWX_PUZZLE_BITS",
+            "IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_SET_REQUIRED",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PUZZLE_WORK_REQUIRED",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_NUM",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_DEN",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TRUE_VRF_REQUIRED",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn phase26b_multiblock_epoch_seed_soak() {
+        // Phase 26B: with epoch-seed alignment the multi-block all-gates chain is
+        // satisfiable. Build + connect 6 sequential blocks (genesis -> 6) via the
+        // EXACT live-proof builder, every gate enforced each step (connect_block
+        // runs phase21c/d/e + puzzle + finality + phase22a committed-admission +
+        // true-VRF). Assert the candidate-set seed equals the admission epoch seed
+        // (grandparent) at every height and that dominance weights evolve. phase22a
+        // is exercised on EVERY block >= 2 (the parent's commitment must match), so
+        // a passing soak proves both gates hold together.
+        use crate::poawx_admission::global_admission_cache;
+        use crate::poawx_committed_admission::admission_epoch_seed;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        phase26b_set_gate_env();
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let cache = global_admission_cache();
+
+        let n_blocks = 6u64;
+        let mut prev = genesis_hash;
+        let mut parent_prev: Option<[u8; 32]> = None;
+        for h in 1..=n_blocks {
+            let bits = st.target_for_height(h).bits;
+            let time = genesis.header.time + h as u32;
+            let proof = crate::poawx_mining_harness::build_devnet_all_gates_block(
+                net, h, prev, parent_prev, bits, time, 4,
+            )
+            .unwrap_or_else(|e| panic!("build H{h}: {e}"));
+
+            // Candidate-set seed invariant: equals the epoch seed (grandparent).
+            let ext = proof.block.poawx_receipts.as_ref().unwrap()[0]
+                .phase20_ext
+                .as_ref()
+                .unwrap();
+            let cs = ext.candidate_set.as_ref().unwrap();
+            assert_eq!(
+                cs.seed,
+                admission_epoch_seed(parent_prev, prev),
+                "H{h}: candidate-set seed must equal the admission epoch seed"
+            );
+            assert_eq!(cs.target_height, h, "H{h}: candidate-set target height");
+            let weights = ext.role_dominance_weights.unwrap();
+
+            // Ingest the (epoch-seeded) admissions then connect — all gates enforced.
+            cache.clear();
+            cache.set_tip(h);
+            for adm in &proof.admissions {
+                assert_eq!(
+                    cache.ingest_bytes(adm),
+                    crate::poawx_gossip::GossipOutcome::AcceptedNew,
+                    "H{h}: admission ingested"
+                );
+            }
+            let before = st.height;
+            let blk_hash = proof.block_hash;
+            let blk_prev = prev;
+            st.connect_block(proof.block)
+                .unwrap_or_else(|e| panic!("connect_block H{h} failed: {e}"));
+            assert_eq!(st.height, before + 1, "H{h}: tip advanced by one");
+
+            // Dominance evolves: H1 is the genesis baseline; later blocks are below.
+            if h == 1 {
+                assert_eq!(weights, [1000u64; 4], "H1: genesis baseline weights");
+            } else {
+                assert!(
+                    weights.iter().all(|&w| w < 1000),
+                    "H{h}: dominance weights evolved below baseline: {weights:?}"
+                );
+            }
+
+            // Advance: this block's prev becomes the next block's grandparent; this
+            // block's hash becomes the next block's prev_hash (tip).
+            parent_prev = Some(blk_prev);
+            prev = blk_hash;
+        }
+        assert!(
+            st.height >= 6,
+            "at least 5 sequential all-gates blocks accepted (final tip height {})",
+            st.height
+        );
+
+        cache.clear();
+        phase26b_clear_gate_env();
+    }
+
+    #[test]
+    fn phase26b_stale_immediate_parent_seed_rejected() {
+        // Negative: a height-2 block whose candidate set is seeded by the IMMEDIATE
+        // parent hash (the pre-26B / stale seeding — reproduced by building with
+        // parent_prev = None so the epoch seed falls back to prev_hash = hash(H1))
+        // must be REJECTED by phase21d, because the node expects the epoch seed
+        // (grandparent = genesis). Proves phase21d is preserved, not bypassed.
+        use crate::poawx_admission::global_admission_cache;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        phase26b_set_gate_env();
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let cache = global_admission_cache();
+
+        // H1 (correct).
+        let p1 = crate::poawx_mining_harness::build_devnet_all_gates_block(
+            net,
+            1,
+            genesis_hash,
+            None,
+            st.target_for_height(1).bits,
+            genesis.header.time + 1,
+            4,
+        )
+        .expect("build H1");
+        let h1_hash = p1.block_hash;
+        cache.clear();
+        cache.set_tip(1);
+        for adm in &p1.admissions {
+            assert_eq!(
+                cache.ingest_bytes(adm),
+                crate::poawx_gossip::GossipOutcome::AcceptedNew
+            );
+        }
+        st.connect_block(p1.block).expect("connect H1");
+
+        // H2 built with the STALE seed (parent_prev = None => epoch seed = prev_hash
+        // = hash(H1), instead of the correct grandparent = genesis).
+        let bad = crate::poawx_mining_harness::build_devnet_all_gates_block(
+            net,
+            2,
+            h1_hash,
+            None,
+            st.target_for_height(2).bits,
+            genesis.header.time + 2,
+            4,
+        )
+        .expect("build stale H2");
+        cache.clear();
+        cache.set_tip(2);
+        for adm in &bad.admissions {
+            let _ = cache.ingest_bytes(adm);
+        }
+        let err = st
+            .connect_block(bad.block)
+            .expect_err("stale immediate-parent candidate-set seed must be rejected");
+        assert!(
+            err.contains("phase21d") && err.contains("seed"),
+            "expected phase21d seed rejection, got: {err}"
+        );
+
+        cache.clear();
+        phase26b_clear_gate_env();
+    }
+
+    #[test]
+    fn phase26b_committed_admission_root_and_replay_rejected() {
+        // Negative (phase22a binding): the committed-admission commitment binds the
+        // candidate set by (network, target_height, seed, root, count). A tampered
+        // root, a wrong seed (replay/stale from a different epoch), or a wrong
+        // target_height must all fail `matches_candidate_set`. Pure; no block mining.
+        use crate::poawx_candidate::{CandidateSet, RoleCandidate};
+        use crate::poawx_committed_admission::AdmissionCommitmentV1;
+        use crate::poawx_penalty::PenaltyStatus;
+        let net = 2u8;
+        let mk_set = |th: u64, sd: [u8; 32]| -> CandidateSet {
+            let mut cs = CandidateSet::new(net, th, sd);
+            for role in 0u8..3 {
+                cs.push(RoleCandidate::build(
+                    net,
+                    th,
+                    &sd,
+                    role,
+                    [role + 1; 20],
+                    [role + 2; 33],
+                    [role + 3; 32],
+                    PenaltyStatus::Clean.id(),
+                    1000,
+                    [role + 4; 32],
+                ));
+            }
+            cs.sort_canonical();
+            cs
+        };
+
+        let seed = [0x55u8; 32];
+        let target = 7u64;
+        let cs = mk_set(target, seed);
+
+        // Correct commitment matches the set.
+        let good = AdmissionCommitmentV1::from_candidate_set(&cs, target - 1);
+        assert!(good.matches_candidate_set(&cs), "honest commitment matches");
+
+        // Tampered root: a set with different candidates (different height-bound
+        // assignment digests) has a different root.
+        let cs_tampered = mk_set(target + 100, seed);
+        let mut cs_tampered = cs_tampered;
+        cs_tampered.target_height = target; // force the height field to match...
+        assert!(
+            !good.matches_candidate_set(&cs_tampered),
+            "commitment must reject a set with a different candidate root"
+        );
+
+        // Replay / stale: a commitment frozen for a DIFFERENT seed (epoch) must not
+        // match this set.
+        let stale = AdmissionCommitmentV1::from_candidate_set(&mk_set(target, [0xAAu8; 32]), target - 1);
+        assert!(
+            !stale.matches_candidate_set(&cs),
+            "commitment frozen for a different seed/epoch must not match (replay-safe)"
+        );
+
+        // Wrong target height must not match either.
+        let wrong_h = AdmissionCommitmentV1::from_candidate_set(&mk_set(target + 1, seed), target);
+        assert!(
+            !wrong_h.matches_candidate_set(&cs),
+            "commitment for a different target height must not match"
+        );
     }
 
     #[test]

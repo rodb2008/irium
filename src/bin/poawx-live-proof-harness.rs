@@ -257,8 +257,33 @@ fn run(a: &Args) -> Result<String, String> {
         .and_then(|v| v.as_u64())
         .unwrap_or(u64::MAX);
 
+    // 3b) Phase 26B: the candidate-admission epoch seed for height H is the parent
+    // (tip) block's own prev_hash (the grandparent hash). Fetch the parent block at
+    // height-1 and read its prev_hash; the genesis block's prev_hash is all-zero,
+    // which the builder maps back to this block's prev_hash (activation grace at H1).
+    let parent_prev_hash: Option<[u8; 32]> = if height == 0 {
+        None
+    } else {
+        let pblk = get_json(
+            &c,
+            &format!("{base}/rpc/block?height={}", height - 1),
+            &a.rpc_token,
+        )?;
+        pblk.get("header")
+            .and_then(|h| h.get("prev_hash"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+            .filter(|b| b.len() == 32)
+            .map(|b| {
+                let mut o = [0u8; 32];
+                o.copy_from_slice(&b);
+                o
+            })
+    };
+
     // 4) build the all-gates block with Irium-native PoW (mainnet hard-off).
-    let proof = build_devnet_all_gates_block(net, height, prev_hash, bits, time, receipt_diff)?;
+    let proof =
+        build_devnet_all_gates_block(net, height, prev_hash, parent_prev_hash, bits, time, receipt_diff)?;
 
     // 5) ingest the candidate admissions (raw canonical wire bytes).
     for (i, adm) in proof.admissions.iter().enumerate() {
@@ -454,7 +479,7 @@ mod tests {
             std::env::set_var(k, v);
         }
         let proof =
-            build_devnet_all_gates_block(2, 1, [0x44u8; 32], 0x207fffff, 1, 4).expect("build");
+            build_devnet_all_gates_block(2, 1, [0x44u8; 32], None, 0x207fffff, 1, 4).expect("build");
         let req = build_submit_request(&proof).expect("req");
         // The request keys are mechanical block fields; assert none of the JSON
         // *keys* leak secret material and the header/hash fields are present.
