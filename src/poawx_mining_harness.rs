@@ -238,7 +238,16 @@ pub fn build_devnet_all_gates_block(
     // the block's own `prev_hash`. The candidate set / admissions / AVR2 use the
     // epoch seed (what phase21d/21e/22d validate); the puzzle/finality/claim
     // sections and the outgoing commitment use `prev_hash`.
-    let epoch_seed = admission_epoch_seed(parent_prev_hash, prev_hash);
+    // Gap 3: harness builds height-1 over genesis, so the PARENT (genesis) carries
+    // no finality/precommit => the multi-source seed components are zero; the gate
+    // (off by default) then returns the legacy grandparent hash byte-identically.
+    let base_seed = admission_epoch_seed(parent_prev_hash, prev_hash);
+    let epoch_seed = crate::poawx_committed_admission::resolve_epoch_seed_parts(
+        height,
+        base_seed,
+        [0u8; 32],
+        [0u8; 32],
+    );
 
     // Build the 3 role candidates + V2 proofs for a `(target_height, seed)` under a
     // dominance state. Returns proofs + candidates in [compute, verify, support]
@@ -330,7 +339,16 @@ pub fn build_devnet_all_gates_block(
     // commit_height = H, freeze seed = prev_hash (== `admission_epoch_seed` of H+1).
     // Incoming committed admission is graced at the activation height (H1).
     let dom_out = dom_at(height + 1);
-    let (_out_proofs, _out_cands, cs_next) = build_roles(height + 1, prev_hash, &dom_out)?;
+    // Gap 3: freeze H+1's epoch seed. Base = this block's prev_hash (grandparent of
+    // H+1); under the multi-source gate it mixes THIS block's finality digest +
+    // precommit (None here => zero). Gate off => legacy prev_hash, byte-identical.
+    let out_seed = crate::poawx_committed_admission::resolve_epoch_seed_parts(
+        height + 1,
+        prev_hash,
+        fproof.digest(),
+        [0u8; 32],
+    );
+    let (_out_proofs, _out_cands, cs_next) = build_roles(height + 1, out_seed, &dom_out)?;
     let commitment = AdmissionCommitmentV1::from_candidate_set(&cs_next, height);
 
     let claim = |role: u8, solver: [u8; 20]| -> PoawxRoleClaim {

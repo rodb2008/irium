@@ -1300,7 +1300,15 @@ impl ChainState {
                     if ca.commit_height != height {
                         return Err("phase22a: own commitment wrong commit height".to_string());
                     }
-                    if ca.seed != block.header.prev_hash {
+                    // Gap 3: the outgoing commitment freezes H+1's epoch seed. Legacy
+                    // = this block's prev_hash (grandparent of H+1); multi-source mixes
+                    // THIS block's finality/precommit. Gate off => byte-identical.
+                    let expected_out = crate::poawx_committed_admission::expected_epoch_seed(
+                        height + 1,
+                        block.header.hash_for_height(height),
+                        Some(block),
+                    );
+                    if ca.seed != expected_out {
                         return Err("phase22a: own commitment wrong freeze seed".to_string());
                     }
                 }
@@ -1323,12 +1331,16 @@ impl ChainState {
         match parent_commit {
             Some(pc) => {
                 pc.validate(net, height)?;
-                if let Some(prev) = previous {
-                    if pc.seed != prev.header.prev_hash {
-                        return Err(
-                            "phase22a: parent commitment seed != grandparent hash".to_string()
-                        );
-                    }
+                // Gap 3: the parent's commitment must carry H's epoch seed. Legacy =
+                // grandparent hash; multi-source mixes the parent's finality/precommit.
+                // Same resolver as the candidate-set gate, so they never diverge.
+                let expected_in = crate::poawx_committed_admission::expected_epoch_seed(
+                    height,
+                    block.header.prev_hash,
+                    previous,
+                );
+                if pc.seed != expected_in {
+                    return Err("phase22a: parent commitment seed != grandparent hash".to_string());
                 }
                 for r in receipts {
                     let ext = match &r.phase20_ext {
@@ -1456,9 +1468,13 @@ impl ChainState {
         // this block's prev_hash. The parent is the current tip (this block is not
         // yet pushed). This reconciles phase21d with phase22a without weakening
         // either gate. `prev_hash`-bound gates (puzzle/finality/claims) are unchanged.
-        let epoch_seed = crate::poawx_committed_admission::admission_epoch_seed(
-            self.chain.last().map(|p| p.header.prev_hash),
+        // Gap 3: the candidate-set / VRF seed. Legacy = grandparent hash; when the
+        // multi-source gate is active it mixes the parent's finality-proof digest +
+        // precommit + epoch keying (gate off => byte-identical grandparent hash).
+        let epoch_seed = crate::poawx_committed_admission::expected_epoch_seed(
+            height,
             block.header.prev_hash,
+            self.chain.last(),
         );
         let dom_active = anti_domination_active(height);
         for r in receipts {
@@ -9578,6 +9594,133 @@ mod tests {
             "IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED",
             "IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT",
             "IRIUM_POAWX_TRUE_VRF_REQUIRED",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn gap3_multisource_seed_all_gates_connect_block() {
+        // Gap 3: with the multi-source seed gate ON, the assignment (candidate-set/
+        // VRF) seed is the v2 value (grandparent + parent finality digest + precommit
+        // + epoch keying), NOT the bare grandparent hash. The harness builder and the
+        // node validator must agree, and connect_block must accept the block.
+        use crate::poawx_admission::global_admission_cache;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        for (k, v) in [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4"),
+            ("IRIUM_POAWX_PUZZLE_BITS", "4"),
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+            ("IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT", "1"),
+        ] {
+            std::env::set_var(k, v);
+        }
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let height = 1u64;
+        let bits = st.target_for_height(height).bits;
+        let time = genesis.header.time + 1;
+
+        let proof = crate::poawx_mining_harness::build_devnet_all_gates_block(
+            net,
+            height,
+            genesis_hash,
+            None,
+            bits,
+            time,
+            4,
+        )
+        .expect("builder produces a mined multi-source-seed all-gates block");
+
+        // The candidate-set seed must be the v2 multi-source value, not the legacy
+        // grandparent hash, and must equal what the validator independently expects.
+        let legacy = crate::poawx_committed_admission::admission_epoch_seed(None, genesis_hash);
+        let expected =
+            crate::poawx_committed_admission::expected_epoch_seed(height, genesis_hash, Some(&genesis));
+        let cs_seed = proof.block.poawx_receipts.as_ref().unwrap()[0]
+            .phase20_ext
+            .as_ref()
+            .unwrap()
+            .candidate_set
+            .as_ref()
+            .unwrap()
+            .seed;
+        assert_ne!(cs_seed, legacy, "seed is multi-source, not the legacy grandparent hash");
+        assert_eq!(cs_seed, expected, "builder seed matches validator-expected multi-source seed");
+
+        let cache = global_admission_cache();
+        cache.clear();
+        cache.set_tip(height);
+        for adm in &proof.admissions {
+            assert_eq!(
+                cache.ingest_bytes(adm),
+                crate::poawx_gossip::GossipOutcome::AcceptedNew,
+                "node ingests builder admission"
+            );
+        }
+
+        let before = st.height;
+        st.connect_block(proof.block)
+            .expect("connect_block accepts the multi-source-seed all-gates block");
+        assert_eq!(st.height, before + 1, "chain advanced one block");
+
+        cache.clear();
+        for k in [
+            "IRIUM_NETWORK",
+            "IRIUM_POAWX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_MODE",
+            "IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS",
+            "IRIUM_POAWX_PUZZLE_BITS",
+            "IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_SET_REQUIRED",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PUZZLE_WORK_REQUIRED",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_NUM",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_DEN",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TRUE_VRF_REQUIRED",
+            "IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT",
         ] {
             std::env::remove_var(k);
         }

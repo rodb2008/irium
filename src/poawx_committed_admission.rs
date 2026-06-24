@@ -18,6 +18,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::activation::network_id_byte;
+use crate::block::Block;
 use crate::poawx_candidate::CandidateSet;
 
 const COMMITMENT_DOMAIN: &[u8] = b"IRIUM_POAWX_ADMISSION_COMMITMENT_V1";
@@ -251,6 +252,114 @@ pub fn admission_epoch_seed(parent_prev_hash: Option<[u8; 32]>, block_prev_hash:
     }
 }
 
+// ── Gap 3: multi-source assignment seed (gated; mainnet hard-off) ─────────────
+//
+// The legacy assignment seed (above) is the single grandparent hash, which a
+// party mining consecutive blocks can grind. When the multi-source gate is
+// active, the seed for height T mixes FOUR sources, all sealed by/at block T-1
+// (so the committed-admission freeze one block ahead and the validator at T
+// agree, and the proposer of T cannot set them):
+//   1. base grandparent hash  (= legacy `admission_epoch_seed`; the prev-block source)
+//   2. parent finality-proof digest  (committee signatures -> the anti-grind core)
+//   3. parent precommit_root         (hidden-precommit miner commitments)
+//   4. epoch index keying            (epoch_entropy; domain-separates per epoch)
+// Off by default => `resolve_epoch_seed` returns the legacy base, byte-identical.
+
+const ASSIGNMENT_SEED_DOMAIN_V2: &[u8] = b"IRIUM_POAWX_ASSIGNMENT_SEED_V2";
+/// Blocks per seed epoch (epoch index = target_height / SEED_EPOCH_LEN).
+pub const SEED_EPOCH_LEN: u64 = 2016;
+
+pub fn multisource_seed_activation_height() -> Option<u64> {
+    std::env::var("IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Pure gate (network 0 = mainnet hard-off); param-driven for race-free tests.
+pub fn multisource_seed_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
+    if network_id == 0 {
+        return false;
+    }
+    matches!(activation, Some(h) if height >= h)
+}
+
+/// Whether the multi-source assignment seed is active at `height`. Mainnet hard-off.
+pub fn multisource_seed_active(height: u64) -> bool {
+    multisource_seed_gate(
+        network_id_byte(),
+        multisource_seed_activation_height(),
+        height,
+    )
+}
+
+/// Pure v2 seed math: SHA256(DOMAIN ‖ base ‖ finality_sig_digest ‖
+/// precommit_digest ‖ epoch_index_le). Deterministic; integer-only.
+pub fn assignment_seed_v2(
+    base: &[u8; 32],
+    finality_sig_digest: &[u8; 32],
+    precommit_digest: &[u8; 32],
+    epoch_index: u64,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ASSIGNMENT_SEED_DOMAIN_V2);
+    h.update(base);
+    h.update(finality_sig_digest);
+    h.update(precommit_digest);
+    h.update(epoch_index.to_le_bytes());
+    h.finalize().into()
+}
+
+/// Extract the (finality_sig_digest, precommit_digest) seed components from a
+/// block's first PoAW-X receipt extension. Absent block / receipt / section =>
+/// the zero digest (so pre-gate parents contribute nothing). Pure.
+pub fn seed_components_from_block(b: Option<&Block>) -> ([u8; 32], [u8; 32]) {
+    let ext = b
+        .and_then(|bl| bl.poawx_receipts.as_ref())
+        .and_then(|rs| rs.first())
+        .and_then(|r| r.phase20_ext.as_ref());
+    let finality_sig_digest = ext
+        .and_then(|e| e.finality_proof.as_ref())
+        .map(|fp| fp.digest())
+        .unwrap_or([0u8; 32]);
+    let precommit_digest = ext.and_then(|e| e.precommit_root).unwrap_or([0u8; 32]);
+    (finality_sig_digest, precommit_digest)
+}
+
+/// Resolve the epoch (assignment) seed for `target_height` from explicit parts.
+/// Off (gate inactive) => the legacy `base` grandparent hash, byte-identical.
+/// Used by builders (e.g. the harness) that hold the parts directly.
+pub fn resolve_epoch_seed_parts(
+    target_height: u64,
+    base: [u8; 32],
+    finality_sig_digest: [u8; 32],
+    precommit_digest: [u8; 32],
+) -> [u8; 32] {
+    if !multisource_seed_active(target_height) {
+        return base;
+    }
+    assignment_seed_v2(
+        &base,
+        &finality_sig_digest,
+        &precommit_digest,
+        target_height / SEED_EPOCH_LEN,
+    )
+}
+
+/// Resolve the epoch (assignment) seed for `target_height` given the block whose
+/// hash is `target_prev_hash` (T's prev) and T's `parent` block (T-1) from which
+/// the finality/precommit components are taken. Off => legacy grandparent hash.
+/// This is the single source of truth used by the candidate-set gate and BOTH
+/// committed-admission seed checks so they never diverge.
+pub fn expected_epoch_seed(
+    target_height: u64,
+    target_prev_hash: [u8; 32],
+    parent: Option<&Block>,
+) -> [u8; 32] {
+    let base = admission_epoch_seed(parent.map(|p| p.header.prev_hash), target_prev_hash);
+    let (fin, pre) = seed_components_from_block(parent);
+    resolve_epoch_seed_parts(target_height, base, fin, pre)
+}
+
 // ── Gates (param-driven; mainnet hard-off) ───────────────────────────────────
 
 pub fn committed_admission_window() -> u64 {
@@ -415,5 +524,46 @@ mod tests {
             !committed_admission_enforced_gate(0, Some(1), true, 100),
             "mainnet hard-off"
         );
+    }
+
+    #[test]
+    fn multisource_seed_gate_pure() {
+        assert!(!multisource_seed_gate(0, Some(1), 100), "mainnet hard-off");
+        assert!(multisource_seed_gate(1, Some(1), 100));
+        assert!(!multisource_seed_gate(1, None, 100));
+        assert!(!multisource_seed_gate(1, Some(50), 10));
+    }
+
+    #[test]
+    fn assignment_seed_v2_anti_grind() {
+        let base = [0x11u8; 32];
+        let fin = [0x22u8; 32];
+        let pre = [0x33u8; 32];
+        let s = assignment_seed_v2(&base, &fin, &pre, 0);
+        // distinct from the legacy base (single grandparent hash).
+        assert_ne!(s, base);
+        // changing ANY of the four sources changes the seed (anti-grind).
+        assert_ne!(s, assignment_seed_v2(&[0x12u8; 32], &fin, &pre, 0), "base matters");
+        assert_ne!(s, assignment_seed_v2(&base, &[0x23u8; 32], &pre, 0), "finality sig matters");
+        assert_ne!(s, assignment_seed_v2(&base, &fin, &[0x34u8; 32], 0), "precommit matters");
+        assert_ne!(s, assignment_seed_v2(&base, &fin, &pre, 1), "epoch index matters");
+        // deterministic.
+        assert_eq!(s, assignment_seed_v2(&base, &fin, &pre, 0));
+    }
+
+    #[test]
+    fn resolve_epoch_seed_parts_off_is_legacy_passthrough() {
+        // Gate off (no activation height) => returns the legacy base unchanged,
+        // byte-identical, regardless of the other components. Env-mutating =>
+        // serialized via the crate-wide PoAW-X test env lock.
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::remove_var("IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT");
+        let base = [0xABu8; 32];
+        let got = resolve_epoch_seed_parts(100, base, [0x01u8; 32], [0x02u8; 32]);
+        assert_eq!(got, base, "gate off => legacy grandparent hash");
+        std::env::remove_var("IRIUM_NETWORK");
     }
 }
