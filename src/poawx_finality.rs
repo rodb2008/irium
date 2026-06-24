@@ -485,20 +485,27 @@ pub fn finality_committee_required() -> bool {
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
 }
-/// Threshold (num, den), default 1/1 (unanimous of the present committee). Tunable
-/// only behind the testnet/devnet gate.
+/// Pure resolution of the (num, den) finality threshold from optional, already
+/// parsed env values. Applies the `>= 1` floor and the **2/3 supermajority
+/// default** (Gap 7). Param-driven so tests need not mutate global env (mirrors
+/// the `anti_domination_gate` / `penalty_gate` pure-helper pattern).
+pub fn finality_threshold_values(num: Option<u16>, den: Option<u16>) -> (u16, u16) {
+    let num = num.filter(|n| *n >= 1).unwrap_or(2);
+    let den = den.filter(|d| *d >= 1).unwrap_or(3);
+    (num, den)
+}
+
+/// Threshold (num, den), default **2/3** (supermajority of the present committee).
+/// Tunable only behind the testnet/devnet gate via
+/// `IRIUM_POAWX_FINALITY_THRESHOLD_{NUM,DEN}`.
 pub fn finality_threshold() -> (u16, u16) {
     let num = std::env::var("IRIUM_POAWX_FINALITY_THRESHOLD_NUM")
         .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(1);
+        .and_then(|v| v.trim().parse::<u16>().ok());
     let den = std::env::var("IRIUM_POAWX_FINALITY_THRESHOLD_DEN")
         .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .filter(|d| *d >= 1)
-        .unwrap_or(1);
-    (num, den)
+        .and_then(|v| v.trim().parse::<u16>().ok());
+    finality_threshold_values(num, den)
 }
 pub fn finality_committee_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
     if network_id == 0 {
@@ -735,6 +742,24 @@ pub fn global_finality_vote_cache() -> &'static NodeFinalityVoteCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finality_threshold_defaults_to_two_thirds() {
+        // Gap 7: with no env override the threshold is 2/3 (supermajority),
+        // not the old 1/1 unanimous. Pure + race-free (no env mutation).
+        assert_eq!(finality_threshold_values(None, None), (2, 3));
+        // sub-1 values are floored to the default.
+        assert_eq!(finality_threshold_values(Some(0), Some(0)), (2, 3));
+        // explicit overrides are honored, including the legacy 1/1 unanimous.
+        assert_eq!(finality_threshold_values(Some(2), Some(3)), (2, 3));
+        assert_eq!(finality_threshold_values(Some(3), Some(4)), (3, 4));
+        assert_eq!(finality_threshold_values(Some(1), Some(1)), (1, 1));
+        // the 2/3 default yields a real supermajority for multi-member committees.
+        let (n, d) = finality_threshold_values(None, None);
+        let p = FinalityProofV1::new(1, 1, [0u8; 32], [0u8; 32], 0, n, d);
+        assert_eq!(p.required_votes(3), 2); // ceil(3*2/3) = 2 of 3
+        assert_eq!(p.required_votes(1), 1); // clamped to >= 1 for tiny committees
+    }
 
     #[test]
     fn phase24a_finality_wire_malformed_rejected() {
