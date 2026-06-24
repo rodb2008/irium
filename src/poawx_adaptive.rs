@@ -19,6 +19,18 @@ pub enum AdaptiveMode {
     Recovery,
 }
 
+impl AdaptiveMode {
+    /// Stable lowercase label for status/RPC exposure.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdaptiveMode::Normal => "normal",
+            AdaptiveMode::Caution => "caution",
+            AdaptiveMode::Defense => "defense",
+            AdaptiveMode::Recovery => "recovery",
+        }
+    }
+}
+
 /// Observed network signals (caller-supplied, deterministic snapshot).
 #[derive(Debug, Clone, Copy)]
 pub struct NetworkSignals {
@@ -73,7 +85,7 @@ impl NetworkSignals {
     }
 }
 
-fn policy_for(mode: AdaptiveMode) -> AdaptivePolicy {
+pub fn policy_for(mode: AdaptiveMode) -> AdaptivePolicy {
     match mode {
         AdaptiveMode::Normal => AdaptivePolicy {
             mode,

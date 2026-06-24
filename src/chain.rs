@@ -297,6 +297,15 @@ pub struct ChainState {
     /// rebuilt by chain replay on restart / rebuild-style reorg (proofs live in
     /// the blocks). Mirrors `dominance`.
     pub penalty: crate::poawx_penalty::PersistentPenalty,
+    /// Gap 10: node-local adaptive security posture (Normal/Caution/Defense/
+    /// Recovery), recomputed each `connect_block` from chain-derived signals
+    /// (reward concentration, participation, recent slashes, finality) plus the
+    /// node-local `reorg_signal`. Advisory only -- never gates block validity
+    /// (some inputs are node-local / non-deterministic). Gated + mainnet hard-off.
+    pub adaptive_mode: crate::poawx_adaptive::AdaptiveMode,
+    /// Node-local reorg pressure: incremented on `disconnect_tip_block`, decayed
+    /// on `connect_block`. Feeds the adaptive Defense trigger. Not consensus.
+    pub reorg_signal: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -374,6 +383,8 @@ impl ChainState {
             reorg_orphaned_blocks: Vec::new(),
             dominance: crate::poawx_dominance::PersistentDominance::from_env(),
             penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
+            adaptive_mode: crate::poawx_adaptive::AdaptiveMode::Normal,
+            reorg_signal: 0,
         };
         let genesis = state.params.genesis_block.clone();
         state
@@ -913,6 +924,7 @@ impl ChainState {
         self.best_tip = hash;
         self.apply_block_dominance(expected_height);
         self.apply_block_fraud_slashing(expected_height);
+        self.update_adaptive_mode(expected_height);
         self.prune_caches();
 
         Ok(())
@@ -1000,6 +1012,8 @@ impl ChainState {
             .unwrap_or([0u8; 32]);
         self.revert_block_dominance(&tip_block, tip_height);
         self.revert_block_fraud_slashing(&tip_block, tip_height);
+        // Gap 10: node-local reorg pressure feeds the adaptive Defense trigger.
+        self.reorg_signal = self.reorg_signal.saturating_add(1);
         Ok(tip_block)
     }
 
@@ -1180,6 +1194,72 @@ impl ChainState {
         for (offender, target_height, kind) in Self::fraud_events_from_block(block) {
             self.penalty.revert_slash(offender, target_height, kind);
         }
+    }
+
+    /// Gap 10: snapshot the adaptive-engine signals from chain-derived state plus
+    /// the node-local reorg counter. Deterministic for the chain-derived parts
+    /// (participation, reward concentration, recent slashes, finality); the reorg
+    /// signal is node-local. Advisory only -- never gates block validity.
+    fn compute_network_signals(&self, height: u64) -> crate::poawx_adaptive::NetworkSignals {
+        use std::collections::BTreeSet;
+        const ADAPTIVE_SIGNAL_WINDOW: u64 = 32;
+        let start = self
+            .chain
+            .len()
+            .saturating_sub(ADAPTIVE_SIGNAL_WINDOW as usize);
+        let mut miners: BTreeSet<[u8; 20]> = BTreeSet::new();
+        let mut roles: BTreeSet<[u8; 20]> = BTreeSet::new();
+        for b in &self.chain[start..] {
+            if let Some(rs) = &b.poawx_receipts {
+                for r in rs {
+                    miners.insert(r.worker_pkh);
+                    if let Some(ext) = &r.phase20_ext {
+                        roles.insert(ext.role_reward.compute_contributor_pkh);
+                        roles.insert(ext.role_reward.verify_contributor_pkh);
+                        roles.insert(ext.role_reward.support_contributor_pkh);
+                    }
+                }
+            }
+        }
+        let mut max_share = 0u32;
+        for m in &miners {
+            let s = self.dominance.recent_reward_share_permille(m, height);
+            if s > max_share {
+                max_share = s;
+            }
+        }
+        let since = height.saturating_sub(ADAPTIVE_SIGNAL_WINDOW);
+        crate::poawx_adaptive::NetworkSignals {
+            active_miner_count: miners.len().min(u32::MAX as usize) as u32,
+            valid_role_count: roles.len().min(u32::MAX as usize) as u32,
+            recent_invalid_work: self.penalty.recent_offence_count(since).min(u32::MAX as usize)
+                as u32,
+            recent_reorg_signal: self.reorg_signal,
+            reward_concentration_permille: max_share,
+            finality_available: crate::poawx_finality::finality_committee_active(height),
+        }
+    }
+
+    /// Gap 10: recompute the node-local adaptive posture after a block connects
+    /// (gated; mainnet hard-off). Decays the reorg pressure once consumed.
+    fn update_adaptive_mode(&mut self, height: u64) {
+        if !crate::poawx_adaptive::adaptive_mode_active(height) {
+            return;
+        }
+        let signals = self.compute_network_signals(height);
+        self.adaptive_mode = crate::poawx_adaptive::assess(&signals, self.adaptive_mode).mode;
+        self.reorg_signal = self.reorg_signal.saturating_sub(1);
+    }
+
+    /// Current node-local adaptive security posture.
+    pub fn adaptive_mode(&self) -> crate::poawx_adaptive::AdaptiveMode {
+        self.adaptive_mode
+    }
+
+    /// Policy (confirmation multiplier, stricter verification, etc.) for the
+    /// current adaptive posture.
+    pub fn current_adaptive_policy(&self) -> crate::poawx_adaptive::AdaptivePolicy {
+        crate::poawx_adaptive::policy_for(self.adaptive_mode)
     }
 
     /// Phase 21F: when puzzle-work enforcement is on, every production receipt
@@ -2352,6 +2432,8 @@ impl ChainState {
             reorg_orphaned_blocks: Vec::new(),
             dominance: crate::poawx_dominance::PersistentDominance::from_env(),
             penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
+            adaptive_mode: crate::poawx_adaptive::AdaptiveMode::Normal,
+            reorg_signal: 0,
         };
 
         let branch = self.gather_branch_to_genesis(tip_hash)?;
@@ -9724,6 +9806,59 @@ mod tests {
         ] {
             std::env::remove_var(k);
         }
+    }
+
+    #[test]
+    fn gap10_adaptive_posture_tracks_signals() {
+        use crate::poawx_adaptive::{AdaptiveMode, DEFENSE_REORG_SIGNAL};
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_ADAPTIVE_MODE_ACTIVATION_HEIGHT", "1");
+        let mut st = base_chain(None);
+        assert_eq!(st.adaptive_mode(), AdaptiveMode::Normal, "starts Normal");
+
+        // High node-local reorg pressure -> Defense (instability takes precedence).
+        st.reorg_signal = DEFENSE_REORG_SIGNAL;
+        st.update_adaptive_mode(1);
+        assert_eq!(st.adaptive_mode(), AdaptiveMode::Defense);
+        assert_eq!(
+            st.reorg_signal,
+            DEFENSE_REORG_SIGNAL - 1,
+            "reorg pressure decays once consumed"
+        );
+
+        // Clean signals after Defense -> Recovery (hysteresis).
+        st.reorg_signal = 0;
+        st.update_adaptive_mode(1);
+        assert_eq!(st.adaptive_mode(), AdaptiveMode::Recovery);
+        assert!(
+            st.current_adaptive_policy().stricter_verification,
+            "Recovery posture is stricter"
+        );
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_ADAPTIVE_MODE_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn gap10_adaptive_gate_off_is_noop() {
+        use crate::poawx_adaptive::{AdaptiveMode, DEFENSE_REORG_SIGNAL};
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::remove_var("IRIUM_POAWX_ADAPTIVE_MODE_ACTIVATION_HEIGHT");
+        let mut st = base_chain(None);
+        st.reorg_signal = DEFENSE_REORG_SIGNAL;
+        st.update_adaptive_mode(1); // gate off => no-op
+        assert_eq!(
+            st.adaptive_mode(),
+            AdaptiveMode::Normal,
+            "gate off: posture stays Normal"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
     }
 
     // Shared gate env for the Phase 26B multi-block tests (all gates required from

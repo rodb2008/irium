@@ -296,6 +296,16 @@ impl PersistentPenalty {
         self.offences.len()
     }
 
+    /// Count of currently-active offences whose `target_height >= since_height`.
+    /// Used by the adaptive engine as a windowed "recent invalid work" signal so
+    /// it does not latch into Defense permanently after old slashes.
+    pub fn recent_offence_count(&self, since_height: u64) -> usize {
+        self.offences
+            .iter()
+            .filter(|(_, target_height, _)| *target_height >= since_height)
+            .count()
+    }
+
     /// Current status for an identity (`Clean` if untracked).
     pub fn status(&self, pkh: &[u8; 20]) -> PenaltyStatus {
         self.records

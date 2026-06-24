@@ -502,6 +502,10 @@ struct StatusResponse {
     /// `fee_mode` is supplied. Wallets can read this directly without a
     /// second call to `/rpc/fee_estimate`.
     fee_rate_sat_per_byte: u64,
+    /// Gap 10: node-local PoAW-X adaptive security posture
+    /// ("normal"/"caution"/"defense"/"recovery"; "unknown" if the chain lock was
+    /// busy). Advisory; reflects this node's observed signals, not a consensus value.
+    poawx_adaptive_mode: String,
 }
 
 #[derive(Serialize)]
@@ -3896,7 +3900,7 @@ async fn status(
         .as_ref()
         .map(|a| a.payload_digest().to_string());
 
-    let (height, best_header_tip) = match state.chain.try_lock() {
+    let (height, best_header_tip, poawx_adaptive_mode) = match state.chain.try_lock() {
         Ok(guard) => {
             let h = guard.tip_height();
             state.status_height_cache.store(h, Ordering::Relaxed);
@@ -3906,7 +3910,9 @@ async fn status(
                     *cached = best.hash.clone();
                 }
             }
-            (h, best)
+            // Gap 10: surface the node-local adaptive security posture.
+            let mode = guard.adaptive_mode().as_str().to_string();
+            (h, best, mode)
         }
         Err(_) => {
             let h = state.status_height_cache.load(Ordering::Relaxed);
@@ -3918,6 +3924,7 @@ async fn status(
             (
                 h,
                 cached_best_header_tip(h, &cached_hash, &state.genesis_hash),
+                "unknown".to_string(),
             )
         }
     };
@@ -4007,6 +4014,7 @@ async fn status(
         gap_healer_last_filled_height,
         gap_healer_pending_count,
         fee_rate_sat_per_byte,
+        poawx_adaptive_mode,
     }))
 }
 
