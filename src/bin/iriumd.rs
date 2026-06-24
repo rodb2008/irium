@@ -16749,8 +16749,15 @@ async fn main() {
         }
     }
 
-    let pow_limit = Target { bits: 0x1d00_ffff };
     let network = network_kind_from_env();
+    // Phase 3 devnet: easy pow_limit so PoAW-X all-gates blocks can be CPU-mined
+    // in-process (the harness mine_pow caps attempts; difficulty-1 is infeasible).
+    // Mainnet/testnet keep the historical difficulty-1 floor (byte-identical).
+    let pow_limit = if network == NetworkKind::Devnet {
+        Target { bits: 0x207f_ffff }
+    } else {
+        Target { bits: 0x1d00_ffff }
+    };
     // Resolve the standard-header (Fix 2a) activation height for this network and
     // pin it process-wide before any header serialization/validation. Mainnet is
     // always the historical constant; testnet/devnet default to 1
