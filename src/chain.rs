@@ -306,6 +306,12 @@ pub struct ChainState {
     /// Node-local reorg pressure: incremented on `disconnect_tip_block`, decayed
     /// on `connect_block`. Feeds the adaptive Defense trigger. Not consensus.
     pub reorg_signal: u32,
+    /// Deepest height finalized by an accepted finality-committee proof on the
+    /// current main chain. `reorg_to_tip` refuses to disconnect at/below it.
+    /// Advanced in `connect_block` (gated by the finality gate), reverted in
+    /// `disconnect_tip_block`, and rebuilt deterministically by chain replay.
+    /// 0 when finality is off => no protection (behavior identical to pre-fix).
+    pub finalized_height: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -385,6 +391,7 @@ impl ChainState {
             penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
             adaptive_mode: crate::poawx_adaptive::AdaptiveMode::Normal,
             reorg_signal: 0,
+            finalized_height: 0,
         };
         let genesis = state.params.genesis_block.clone();
         state
@@ -925,6 +932,14 @@ impl ChainState {
         self.apply_block_dominance(expected_height);
         self.apply_block_fraud_slashing(expected_height);
         self.update_adaptive_mode(expected_height);
+        // Finality-checkpoint watermark: when finality is enforced, an accepted
+        // block's validated finality proof finalizes the PARENT (height H-1).
+        // Gated => stays 0 / no-op when finality is off.
+        if crate::poawx_finality::finality_committee_enforced(expected_height) {
+            self.finalized_height = self
+                .finalized_height
+                .max(expected_height.saturating_sub(1));
+        }
         self.prune_caches();
 
         Ok(())
@@ -1005,6 +1020,10 @@ impl ChainState {
         self.chain.pop();
         self.height = self.chain.len() as u64;
         let new_tip_height = self.height.saturating_sub(1);
+        // Finality-checkpoint watermark revert: the proof finalizing the
+        // just-removed tip's parent is gone, so the deepest still-backed finalized
+        // height is at most (new_tip - 1). `min` only ever lowers it.
+        self.finalized_height = self.finalized_height.min(new_tip_height.saturating_sub(1));
         self.best_tip = self
             .chain
             .last()
@@ -1748,6 +1767,16 @@ impl ChainState {
         if ancestor_height >= current_tip_height {
             return Ok(());
         }
+        // Finality-checkpoint protection: refuse a reorg whose fork point is at or
+        // below the deepest finalized height (it would disconnect a finalized
+        // block), regardless of cumulative work. Self-gating: `finalized_height`
+        // is 0 when finality is off, so this never fires in the legacy regime.
+        if self.finalized_height > ancestor_height {
+            return Err(format!(
+                "reorg rejected: fork ancestor height {} is at/below finalized height {} (finality-checkpoint protection)",
+                ancestor_height, self.finalized_height
+            ));
+        }
 
         // Observability: capture old-tip hash and counts before mutating
         // chain state. Emitted as a single [reorg] log line on success
@@ -2434,6 +2463,7 @@ impl ChainState {
             penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
             adaptive_mode: crate::poawx_adaptive::AdaptiveMode::Normal,
             reorg_signal: 0,
+            finalized_height: 0,
         };
 
         let branch = self.gather_branch_to_genesis(tip_hash)?;
@@ -9977,6 +10007,112 @@ mod tests {
         ] {
             std::env::remove_var(k);
         }
+    }
+
+    #[test]
+    fn finality_checkpoint_reorg_protection() {
+        // Fixes the Phase 2 simulation scenario-6 gap: a heavier fork forking BELOW
+        // a finalized block must be rejected, while a fork at/above it (and the
+        // legacy work-monotonic behavior) still works.
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let gates = [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1"),
+            ("IRIUM_POAWX_PUZZLE_BITS", "1"),
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+        ];
+        for (k, v) in gates {
+            std::env::set_var(k, v);
+        }
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let g_time = genesis.header.time;
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let secret = [0x6Au8; 32];
+        let build = |height: u64, prev: [u8; 32], pp: Option<[u8; 32]>, t: u32, bits: u32| {
+            crate::poawx_mining_harness::build_solo_poawx_block(
+                &secret, net, height, prev, pp, bits, t, 1,
+            )
+            .expect("build block")
+        };
+
+        // Main chain h1, h2, h3 (h3 finalizes h2).
+        for _ in 0..3u64 {
+            let height = st.tip_height() + 1;
+            let (prev, pp) = {
+                let tip = st.chain.last().unwrap();
+                let th = st.tip_height();
+                (
+                    tip.header.hash_for_height(th),
+                    if height <= 1 {
+                        None
+                    } else {
+                        Some(tip.header.prev_hash)
+                    },
+                )
+            };
+            let bits = st.target_for_height(height).bits;
+            let p = build(height, prev, pp, g_time + height as u32, bits);
+            st.connect_block(p.block).expect("connect main");
+        }
+        assert_eq!(st.tip_height(), 3);
+        assert_eq!(st.finalized_height, 2, "h3 finalizes h2");
+
+        let bits = st.target_for_height(2).bits;
+        let h1 = st.chain[1].clone();
+        let h1_hash = h1.header.hash_for_height(1);
+        let h1_prev = h1.header.prev_hash;
+        let h2_hash = st.chain[2].clone().header.hash_for_height(2);
+
+        // Fork at h1 (below finalized 2): equal work => no reorg; heavier => REJECTED.
+        let p2b = build(2, h1_hash, Some(h1_prev), g_time + 1000 + 2, bits);
+        let h2b_hash = p2b.block.header.hash_for_height(2);
+        let _ = st.process_block(p2b.block);
+        let p3b = build(3, h2b_hash, Some(h1_hash), g_time + 1000 + 3, bits);
+        let h3b_hash = p3b.block.header.hash_for_height(3);
+        let _ = st.process_block(p3b.block);
+        assert_eq!(st.tip_height(), 3, "equal-work fork must NOT reorg");
+        let p4b = build(4, h3b_hash, Some(h2b_hash), g_time + 1000 + 4, bits);
+        let r = st.process_block(p4b.block);
+        assert!(
+            r.is_err(),
+            "heavier fork forking below the finalized height must be rejected"
+        );
+        assert_eq!(st.tip_height(), 3, "main chain intact after rejected reorg");
+        assert_eq!(st.finalized_height, 2, "finalized watermark unchanged");
+
+        // Fork at h2 (== finalized): heavier fork IS allowed (finalized block survives).
+        let p3c = build(3, h2_hash, Some(h1_hash), g_time + 2000 + 3, bits);
+        let h3c_hash = p3c.block.header.hash_for_height(3);
+        let _ = st.process_block(p3c.block);
+        let p4c = build(4, h3c_hash, Some(h2_hash), g_time + 2000 + 4, bits);
+        let _ = st.process_block(p4c.block);
+        assert_eq!(
+            st.tip_height(),
+            4,
+            "a heavier fork at/above the finalized height is allowed"
+        );
+
+        for (k, _) in gates {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("IRIUM_NETWORK");
     }
 
     // Shared gate env for the Phase 26B multi-block tests (all gates required from

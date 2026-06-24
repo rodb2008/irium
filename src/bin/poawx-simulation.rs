@@ -421,21 +421,20 @@ fn scenario_6_reorg() -> Verdict {
         build_solo_poawx_block(&secret, NET, 4, h3b_hash, Some(h2b_hash), bits, g_time + 2000 + 4, 1),
         "h4b"
     );
-    let _ = st.process_block(h4b.block); // fork height 4 > main 3 => reorg
+    let r = st.process_block(h4b.block); // fork height 4 > main 3, but forks BELOW finalized
     let reorged = st.tip_height() == 4;
-
-    let finding = if reorged {
-        "FINDING: a heavier fork reorged past the finalized block (no finality-checkpoint reorg protection)."
-    } else {
-        "reorg did not occur (unexpected)."
-    };
+    // Finality-checkpoint protection: the heavier fork forks at h1 (below the
+    // finalized height 2), so reorg_to_tip must reject it and the main chain stays.
+    let rejected = r.is_err() && !reorged && st.tip_height() == main_tip_before;
+    let ok = work_monotonic_ok && rejected;
     Verdict {
         name: "6. reorg past finality",
-        status: Status::Info,
+        status: if ok { Status::Pass } else { Status::Fail },
         detail: format!(
-            "work-monotonic reorg enforced (equal-work fork did NOT reorg)={}; {} \
-             Finality reorg protection is NOT implemented — required before testnet.",
-            work_monotonic_ok, finding
+            "finalized_height={}; equal-work fork did NOT reorg (work-monotonic)={}; \
+             heavier fork forking below the finalized height was REJECTED={} (main chain intact at height {}). \
+             Finality-checkpoint reorg protection is implemented.",
+            st.finalized_height, work_monotonic_ok, rejected, st.tip_height()
         ),
     }
 }
