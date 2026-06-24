@@ -291,6 +291,12 @@ pub struct ChainState {
     /// (both gated + mainnet hard-off); deterministically rebuilt by chain
     /// replay on restart / rebuild-style reorg.
     pub dominance: crate::poawx_dominance::PersistentDominance,
+    /// Phase 26+: persistent, reorg-safe penalty/slashing state driven by
+    /// accepted fraud proofs. Applied in `connect_block` and reverted in
+    /// `disconnect_tip_block` (both gated + mainnet hard-off); deterministically
+    /// rebuilt by chain replay on restart / rebuild-style reorg (proofs live in
+    /// the blocks). Mirrors `dominance`.
+    pub penalty: crate::poawx_penalty::PersistentPenalty,
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +373,7 @@ impl ChainState {
             claimed_ltc_outpoints: HashSet::new(),
             reorg_orphaned_blocks: Vec::new(),
             dominance: crate::poawx_dominance::PersistentDominance::from_env(),
+            penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
         };
         let genesis = state.params.genesis_block.clone();
         state
@@ -873,6 +880,9 @@ impl ChainState {
         if crate::poawx_candidate::true_vrf_enforced(expected_height) {
             self.validate_block_true_vrf(&block, expected_height)?;
         }
+        if crate::poawx_challenge::fraud_proof_enforced(expected_height) {
+            self.validate_block_fraud_proofs(&block, expected_height)?;
+        }
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -902,6 +912,7 @@ impl ChainState {
         self.undo_logs.insert(hash, undo);
         self.best_tip = hash;
         self.apply_block_dominance(expected_height);
+        self.apply_block_fraud_slashing(expected_height);
         self.prune_caches();
 
         Ok(())
@@ -988,6 +999,7 @@ impl ChainState {
             .map(|b| b.header.hash_for_height(new_tip_height))
             .unwrap_or([0u8; 32]);
         self.revert_block_dominance(&tip_block, tip_height);
+        self.revert_block_fraud_slashing(&tip_block, tip_height);
         Ok(tip_block)
     }
 
@@ -1076,6 +1088,98 @@ impl ChainState {
             fp.validate(net, height, &block.header.prev_hash, &committee)?;
         }
         Ok(())
+    }
+
+    /// Phase 26+: when fraud-proof enforcement is on, every fraud proof carried by
+    /// the block (trailing FRD1 section) must verify (deterministic, self-contained)
+    /// and must not duplicate an offence (within the block OR already slashed in
+    /// persisted state). Read-only: fails closed; the actual slash is applied in
+    /// `apply_block_fraud_slashing` after the block is accepted. Mainnet hard-off
+    /// (the caller gates on `fraud_proof_enforced`).
+    fn validate_block_fraud_proofs(&self, block: &Block, height: u64) -> Result<(), String> {
+        let net = crate::activation::network_id_byte();
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let mut seen: std::collections::BTreeSet<([u8; 20], u64, u8)> =
+            std::collections::BTreeSet::new();
+        for r in receipts {
+            let ext = match &r.phase20_ext {
+                Some(e) => e,
+                None => continue,
+            };
+            let proofs = match &ext.fraud_proofs {
+                Some(p) => p,
+                None => continue,
+            };
+            if proofs.len() > crate::poawx_challenge::FRAUD_PROOF_MAX_PER_BLOCK {
+                return Err("fraudproof: too many fraud proofs in receipt".to_string());
+            }
+            for fp in proofs {
+                let off = crate::poawx_challenge::verify_fraud_proof(fp, net, height)?;
+                let key = (off.offender_pkh, off.target_height, off.kind);
+                if !seen.insert(key) {
+                    return Err("fraudproof: duplicate offence within block".to_string());
+                }
+                if self
+                    .penalty
+                    .is_offence_recorded(off.offender_pkh, off.target_height, off.kind)
+                {
+                    return Err("fraudproof: offence already slashed".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Extract the canonical (offender, target_height, kind) slash events from a
+    /// block's fraud-proof section. Deterministic; order follows receipt + proof
+    /// order. (Proofs were already verified in `validate_block_fraud_proofs`.)
+    fn fraud_events_from_block(block: &Block) -> Vec<([u8; 20], u64, u8)> {
+        let mut events = Vec::new();
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return events,
+        };
+        for r in receipts {
+            if let Some(ext) = &r.phase20_ext {
+                if let Some(proofs) = &ext.fraud_proofs {
+                    for fp in proofs {
+                        events.push((fp.offender_pkh, fp.target_height, fp.kind));
+                    }
+                }
+            }
+        }
+        events
+    }
+
+    /// Apply the accepted tip block's fraud-proof slash events to the persistent
+    /// penalty state. Gated identically to `validate_block_fraud_proofs` so an
+    /// unvalidated slash is never applied and connect/disconnect are exact
+    /// inverses. Mainnet hard-off.
+    fn apply_block_fraud_slashing(&mut self, height: u64) {
+        if !crate::poawx_challenge::fraud_proof_enforced(height) {
+            return;
+        }
+        let events = match self.chain.last() {
+            Some(b) => Self::fraud_events_from_block(b),
+            None => return,
+        };
+        for (offender, target_height, kind) in events {
+            self.penalty.apply_slash(offender, target_height, kind, height);
+        }
+    }
+
+    /// Exact reverse of `apply_block_fraud_slashing` for a disconnected block.
+    /// Gated identically. Mainnet hard-off.
+    fn revert_block_fraud_slashing(&mut self, block: &Block, height: u64) {
+        if !crate::poawx_challenge::fraud_proof_enforced(height) {
+            return;
+        }
+        for (offender, target_height, kind) in Self::fraud_events_from_block(block) {
+            self.penalty.revert_slash(offender, target_height, kind);
+        }
     }
 
     /// Phase 21F: when puzzle-work enforcement is on, every production receipt
@@ -2231,6 +2335,7 @@ impl ChainState {
             claimed_ltc_outpoints: self.claimed_ltc_outpoints.clone(),
             reorg_orphaned_blocks: Vec::new(),
             dominance: crate::poawx_dominance::PersistentDominance::from_env(),
+            penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
         };
 
         let branch = self.gather_branch_to_genesis(tip_hash)?;
@@ -7999,6 +8104,7 @@ mod tests {
             finality_proof: None,
             committed_admission: None,
             role_assignment_v2: None,
+            fraud_proofs: None,
         }
     }
 
@@ -11391,6 +11497,7 @@ mod tests {
                 finality_proof: None,
                 committed_admission: None,
                 role_assignment_v2: None,
+                fraud_proofs: None,
             }
         };
         let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {
@@ -11735,5 +11842,178 @@ mod tests {
             Block::deserialize_for_height(&bytes, 1).expect("legacy block must still parse");
         assert_eq!(used, bytes.len());
         assert!(decoded.poawx_receipts.is_none());
+    }
+
+    // ── Phase 26+ fraud-proof (finality equivocation) connect_block tests ─────
+
+    /// Build a canonical finality-equivocation proof + the offender pkh.
+    fn fraud_equivocation(
+        net: u8,
+        seed: u8,
+        height: u64,
+    ) -> (crate::poawx_challenge::FraudProofV1, [u8; 20]) {
+        use crate::poawx_finality::{FinalityVoteType, FinalityVoteV1};
+        let sk = signing_key(seed);
+        let va = FinalityVoteV1::signed(
+            &sk,
+            net,
+            height,
+            [0xAAu8; 32],
+            [0x07u8; 32],
+            5,
+            [0x09u8; 32],
+            FinalityVoteType::Commit,
+        );
+        let vb = FinalityVoteV1::signed(
+            &sk,
+            net,
+            height,
+            [0xBBu8; 32],
+            [0x07u8; 32],
+            5,
+            [0x09u8; 32],
+            FinalityVoteType::Commit,
+        );
+        let offender = va.member_pkh;
+        let fp = crate::poawx_challenge::FraudProofV1::finality_equivocation(net, [0x01u8; 20], va, vb);
+        (fp, offender)
+    }
+
+    /// A minimal block carrying a fraud-proof section (only `phase20_ext.fraud_proofs`
+    /// is read by the validator; PoW/sigs are irrelevant for these unit tests).
+    fn fraud_block(net: u8, fps: Vec<crate::poawx_challenge::FraudProofV1>) -> Block {
+        use crate::block::BlockHeader;
+        let mut ext = p20_ext(net, 1, &[0u8; 32], 0, [0u8; 20]);
+        ext.fraud_proofs = Some(fps);
+        let receipt = crate::poawx::PoawxBlockReceipt {
+            height: 1,
+            lane: b'A',
+            worker_pkh: [0u8; 20],
+            worker_pubkey: [2u8; 33],
+            worker_sig: [0u8; 64],
+            solution: [0u8; 8],
+            commitment_nonce: [0u8; 32],
+            delegation: None,
+            phase20_ext: Some(ext),
+        };
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![receipt]),
+        }
+    }
+
+    #[test]
+    fn fraudproof_valid_equivocation_accepts() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let net = crate::activation::network_id_byte();
+        let cs = base_chain(None);
+        let (fp, _off) = fraud_equivocation(net, 0x11, 100);
+        let block = fraud_block(net, vec![fp]);
+        assert!(cs.validate_block_fraud_proofs(&block, 200).is_ok());
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn fraudproof_invalid_fails_closed() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let net = crate::activation::network_id_byte();
+        let cs = base_chain(None);
+        let (mut fp, _off) = fraud_equivocation(net, 0x11, 100);
+        fp.vote_a.signature[0] ^= 0xFF; // corrupt -> signature verification fails
+        let block = fraud_block(net, vec![fp]);
+        assert!(cs.validate_block_fraud_proofs(&block, 200).is_err());
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn fraudproof_duplicate_within_block_rejected() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let net = crate::activation::network_id_byte();
+        let cs = base_chain(None);
+        let (fp, _off) = fraud_equivocation(net, 0x11, 100);
+        let block = fraud_block(net, vec![fp.clone(), fp]);
+        let err = cs.validate_block_fraud_proofs(&block, 200).unwrap_err();
+        assert!(err.contains("duplicate offence within block"), "got: {}", err);
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn fraudproof_apply_then_revert_exact_inverse() {
+        use crate::poawx_penalty::PenaltyStatus;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT", "0");
+        std::env::set_var("IRIUM_POAWX_FRAUD_PROOF_REQUIRED", "1");
+        let net = crate::activation::network_id_byte();
+        let mut cs = base_chain(None);
+        // Offence at height 1 (== the carrying block height); target_height must
+        // not be in the future relative to the validating height.
+        let (fp, offender) = fraud_equivocation(net, 0x11, 1);
+        let block = fraud_block(net, vec![fp]);
+        // also proves the validator accepts it under the live gate.
+        assert!(cs.validate_block_fraud_proofs(&block, 1).is_ok());
+        cs.chain.push(block.clone());
+        assert_eq!(cs.penalty.status(&offender), PenaltyStatus::Clean);
+        cs.apply_block_fraud_slashing(1);
+        assert!(cs.penalty.is_slashed(&offender), "offender slashed after apply");
+        assert!(cs.penalty.is_offence_recorded(offender, 1, 0));
+        cs.revert_block_fraud_slashing(&block, 1);
+        assert_eq!(
+            cs.penalty.status(&offender),
+            PenaltyStatus::Clean,
+            "revert is an exact inverse"
+        );
+        assert!(cs.penalty.is_empty());
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FRAUD_PROOF_REQUIRED");
+    }
+
+    #[test]
+    fn fraudproof_gate_not_required_no_slashing() {
+        use crate::poawx_penalty::PenaltyStatus;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Active height but REQUIRED unset => not enforced => apply is a no-op.
+        // (Mainnet network-0 hard-off is covered by the pure gate tests in
+        // poawx_challenge, avoiding a global IRIUM_NETWORK=mainnet env race.)
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT", "0");
+        std::env::remove_var("IRIUM_POAWX_FRAUD_PROOF_REQUIRED");
+        let net = crate::activation::network_id_byte();
+        let (fp, offender) = fraud_equivocation(net, 0x11, 1);
+        let mut cs = base_chain(None);
+        let block = fraud_block(net, vec![fp]);
+        cs.chain.push(block.clone());
+        cs.apply_block_fraud_slashing(1); // not required => fraud_proof_enforced == false
+        assert_eq!(
+            cs.penalty.status(&offender),
+            PenaltyStatus::Clean,
+            "gate not required: no slashing"
+        );
+        assert!(cs.penalty.is_empty());
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT");
     }
 }

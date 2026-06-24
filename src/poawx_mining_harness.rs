@@ -382,6 +382,7 @@ pub fn build_devnet_all_gates_block(
         finality_proof: Some(fproof),
         committed_admission: Some(commitment),
         role_assignment_v2: Some(in_proofs),
+        fraud_proofs: None,
     };
 
     // Worker receipt: real receipt PoW solution + signed challenge (mode-0).

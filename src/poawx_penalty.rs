@@ -4,8 +4,14 @@
 //! finality/SUPPORT role) can be withheld from misbehaving identities. This is a
 //! FOUNDATION layer: it is not wired into live block acceptance yet (Phase 21B),
 //! and is hard-off on mainnet and disabled unless the activation gate is set.
-//! `SlashedPlaceholder` is a placeholder only — no economic slashing is performed.
+//! `SlashedPlaceholder` (id 4) remains a no-op placeholder for backward
+//! compatibility. The real, fraud-proof-triggered economic exclusion is
+//! `Slashed` (id 5): applied by [`PersistentPenalty::apply_slash`] when a
+//! verified [`crate::poawx_challenge::FraudProofV1`] is accepted in
+//! `connect_block`, and reverted on `disconnect_tip_block`. Mainnet hard-off.
 #![allow(dead_code)]
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::activation::network_id_byte;
 
@@ -16,7 +22,11 @@ pub enum PenaltyStatus {
     Warned = 1,
     TemporarilyReduced = 2,
     SuspendedForEpoch = 3,
+    /// Legacy no-op placeholder (no economic effect). Kept for wire/id stability.
     SlashedPlaceholder = 4,
+    /// Real slash: identity is permanently excluded from high-trust roles and
+    /// earns zero role-reward weight. Set only by an accepted fraud proof.
+    Slashed = 5,
 }
 
 impl PenaltyStatus {
@@ -30,6 +40,7 @@ impl PenaltyStatus {
             2 => PenaltyStatus::TemporarilyReduced,
             3 => PenaltyStatus::SuspendedForEpoch,
             4 => PenaltyStatus::SlashedPlaceholder,
+            5 => PenaltyStatus::Slashed,
             _ => return None,
         })
     }
@@ -53,6 +64,7 @@ impl PenaltyStatus {
             PenaltyStatus::TemporarilyReduced => 500,
             PenaltyStatus::SuspendedForEpoch => 0,
             PenaltyStatus::SlashedPlaceholder => 0,
+            PenaltyStatus::Slashed => 0,
         }
     }
 }
@@ -86,6 +98,10 @@ pub struct PenaltyRecord {
     pub valid_count: u32,
     pub suspended_until_epoch: u64,
     pub last_update_height: u64,
+    /// Number of distinct accepted fraud offences currently slashing this
+    /// identity. While `> 0` the status is `Slashed`; reaching `0` restores
+    /// `Clean`. Tracked so `slash`/`unslash` are EXACT inverses under reorg.
+    pub slash_count: u32,
 }
 
 impl Default for PenaltyRecord {
@@ -96,9 +112,14 @@ impl Default for PenaltyRecord {
             valid_count: 0,
             suspended_until_epoch: 0,
             last_update_height: 0,
+            slash_count: 0,
         }
     }
 }
+
+/// Fixed wire size of a serialized `PenaltyRecord`:
+/// status(1)+invalid(4)+valid(4)+suspended_until(8)+last_update(8)+slash(4) = 29.
+pub const PENALTY_RECORD_WIRE: usize = 1 + 4 + 4 + 8 + 8 + 4;
 
 impl PenaltyRecord {
     pub fn new() -> Self {
@@ -136,6 +157,63 @@ impl PenaltyRecord {
 
     pub fn eligible_for_high_trust_role(&self) -> bool {
         self.status.eligible_for_high_trust_role()
+    }
+
+    /// Apply one fraud-proof slash (saturating). The status becomes `Slashed`
+    /// and stays there while any offence remains. EXACT inverse of `unslash`.
+    pub fn slash(&mut self, height: u64) {
+        self.slash_count = self.slash_count.saturating_add(1);
+        self.status = PenaltyStatus::Slashed;
+        if height > self.last_update_height {
+            self.last_update_height = height;
+        }
+    }
+
+    /// Reverse one previously-applied slash (reorg disconnect). When the last
+    /// slash is removed the status returns to `Clean`.
+    pub fn unslash(&mut self) {
+        self.slash_count = self.slash_count.saturating_sub(1);
+        if self.slash_count == 0 && self.status == PenaltyStatus::Slashed {
+            self.status = PenaltyStatus::Clean;
+        }
+    }
+
+    /// True when the record carries no state (a fresh `Clean` default).
+    pub fn is_clean_default(&self) -> bool {
+        *self == PenaltyRecord::default()
+    }
+
+    /// Fixed-size little-endian serialization (`PENALTY_RECORD_WIRE` bytes).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut o = Vec::with_capacity(PENALTY_RECORD_WIRE);
+        o.push(self.status.id());
+        o.extend_from_slice(&self.invalid_count.to_le_bytes());
+        o.extend_from_slice(&self.valid_count.to_le_bytes());
+        o.extend_from_slice(&self.suspended_until_epoch.to_le_bytes());
+        o.extend_from_slice(&self.last_update_height.to_le_bytes());
+        o.extend_from_slice(&self.slash_count.to_le_bytes());
+        o
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() != PENALTY_RECORD_WIRE {
+            return Err("penalty record: bad length".to_string());
+        }
+        let status =
+            PenaltyStatus::from_id(raw[0]).ok_or_else(|| "penalty record: bad status".to_string())?;
+        let invalid_count = u32::from_le_bytes(raw[1..5].try_into().expect("4"));
+        let valid_count = u32::from_le_bytes(raw[5..9].try_into().expect("4"));
+        let suspended_until_epoch = u64::from_le_bytes(raw[9..17].try_into().expect("8"));
+        let last_update_height = u64::from_le_bytes(raw[17..25].try_into().expect("8"));
+        let slash_count = u32::from_le_bytes(raw[25..29].try_into().expect("4"));
+        Ok(Self {
+            status,
+            invalid_count,
+            valid_count,
+            suspended_until_epoch,
+            last_update_height,
+            slash_count,
+        })
     }
 }
 
@@ -178,6 +256,114 @@ pub fn penalty_state_enforced(height: u64) -> bool {
     penalty_state_active(height) && penalty_state_required()
 }
 
+/// Domain tag for the persistent penalty-state commitment digest.
+const PENALTY_DIGEST_TAG: &[u8] = b"IRIUM_POAWX_PENALTY_STATE_V1";
+
+/// Persistent, reorg-safe penalty state driven by accepted fraud proofs. Held on
+/// `ChainState`, applied on `connect_block` and reverted on
+/// `disconnect_tip_block`, and deterministically rebuilt by chain replay on
+/// restart / rebuild-style reorg (the proofs live in the blocks). This MIRRORS
+/// `crate::poawx_dominance::PersistentDominance`: explicit per-offence keys so
+/// `apply_slash`/`revert_slash` are EXACT inverses. Integer-only; mainnet
+/// hard-off (gated by the caller).
+#[derive(Debug, Clone, Default)]
+pub struct PersistentPenalty {
+    records: BTreeMap<[u8; 20], PenaltyRecord>,
+    /// Accepted, currently-active offences keyed by `(offender, target_height,
+    /// kind_id)`. Drives both de-duplication and exact revert.
+    offences: BTreeSet<([u8; 20], u64, u8)>,
+}
+
+impl PersistentPenalty {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construction parity with the dominance tracker (no env params in v1).
+    pub fn from_env() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.offences.is_empty()
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn offence_count(&self) -> usize {
+        self.offences.len()
+    }
+
+    /// Current status for an identity (`Clean` if untracked).
+    pub fn status(&self, pkh: &[u8; 20]) -> PenaltyStatus {
+        self.records
+            .get(pkh)
+            .map(|r| r.status)
+            .unwrap_or(PenaltyStatus::Clean)
+    }
+
+    pub fn record(&self, pkh: &[u8; 20]) -> Option<&PenaltyRecord> {
+        self.records.get(pkh)
+    }
+
+    /// Whether an identity is currently slashed (excluded from high-trust roles).
+    pub fn is_slashed(&self, pkh: &[u8; 20]) -> bool {
+        self.status(pkh) == PenaltyStatus::Slashed
+    }
+
+    /// Whether this exact offence has already been recorded (de-dup guard).
+    pub fn is_offence_recorded(&self, offender: [u8; 20], target_height: u64, kind: u8) -> bool {
+        self.offences.contains(&(offender, target_height, kind))
+    }
+
+    /// Apply one verified fraud offence (idempotent on a duplicate key). EXACT
+    /// inverse of `revert_slash`.
+    pub fn apply_slash(&mut self, offender: [u8; 20], target_height: u64, kind: u8, height: u64) {
+        if self.offences.insert((offender, target_height, kind)) {
+            self.records.entry(offender).or_default().slash(height);
+        }
+    }
+
+    /// Reverse one previously-applied offence (reorg disconnect). Removes the
+    /// record once it returns to a clean default.
+    pub fn revert_slash(&mut self, offender: [u8; 20], target_height: u64, kind: u8) {
+        if self.offences.remove(&(offender, target_height, kind)) {
+            if let Some(rec) = self.records.get_mut(&offender) {
+                rec.unslash();
+                // In the fraud-proof flow a record exists ONLY because of
+                // slashing, so once no offences remain it is removed entirely.
+                // This keeps apply/revert an EXACT inverse (the informational
+                // `last_update_height` set by `slash` does not linger).
+                if rec.slash_count == 0 {
+                    self.records.remove(&offender);
+                }
+            }
+        }
+    }
+
+    /// Canonical state commitment over all offences + records (sorted by key).
+    /// Two nodes with identical accepted chains produce the identical digest.
+    pub fn digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(PENALTY_DIGEST_TAG);
+        h.update((self.offences.len() as u64).to_le_bytes());
+        for (pkh, height, kind) in self.offences.iter() {
+            h.update(pkh);
+            h.update(height.to_le_bytes());
+            h.update([*kind]);
+        }
+        h.update((self.records.len() as u64).to_le_bytes());
+        for (pkh, rec) in self.records.iter() {
+            h.update(pkh);
+            h.update(rec.serialize());
+        }
+        h.finalize().into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +376,7 @@ mod tests {
             PenaltyStatus::TemporarilyReduced,
             PenaltyStatus::SuspendedForEpoch,
             PenaltyStatus::SlashedPlaceholder,
+            PenaltyStatus::Slashed,
         ] {
             assert_eq!(PenaltyStatus::from_id(s.id()), Some(s));
         }
@@ -200,6 +387,7 @@ mod tests {
         assert!(PenaltyStatus::TemporarilyReduced.eligible_for_high_trust_role());
         assert!(!PenaltyStatus::SuspendedForEpoch.eligible_for_high_trust_role());
         assert!(!PenaltyStatus::SlashedPlaceholder.eligible_for_high_trust_role());
+        assert!(!PenaltyStatus::Slashed.eligible_for_high_trust_role());
     }
 
     #[test]
@@ -218,6 +406,85 @@ mod tests {
             PenaltyStatus::SlashedPlaceholder.weight_multiplier_permille(),
             0
         );
+        assert_eq!(PenaltyStatus::Slashed.weight_multiplier_permille(), 0);
+    }
+
+    #[test]
+    fn penalty_record_wire_roundtrip() {
+        let mut r = PenaltyRecord::new();
+        r.slash(42);
+        r.invalid_count = 7;
+        r.valid_count = 3;
+        let bytes = r.serialize();
+        assert_eq!(bytes.len(), PENALTY_RECORD_WIRE);
+        assert_eq!(PenaltyRecord::deserialize(&bytes).unwrap(), r);
+        assert!(PenaltyRecord::deserialize(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn record_slash_unslash_exact_inverse() {
+        let mut r = PenaltyRecord::new();
+        assert_eq!(r.status, PenaltyStatus::Clean);
+        r.slash(10);
+        assert_eq!(r.status, PenaltyStatus::Slashed);
+        assert_eq!(r.slash_count, 1);
+        assert!(!r.eligible_for_high_trust_role());
+        // a second offence keeps it slashed; one revert is not enough.
+        r.slash(11);
+        assert_eq!(r.slash_count, 2);
+        r.unslash();
+        assert_eq!(r.status, PenaltyStatus::Slashed, "still slashed at count 1");
+        r.unslash();
+        assert_eq!(r.status, PenaltyStatus::Clean, "clean once last offence gone");
+        assert_eq!(r.slash_count, 0);
+    }
+
+    #[test]
+    fn persistent_penalty_apply_revert_exact_inverse() {
+        let mut p = PersistentPenalty::new();
+        let empty = p.digest();
+        let off = [0xABu8; 20];
+        p.apply_slash(off, 100, 0, 150);
+        assert!(p.is_slashed(&off));
+        assert!(p.is_offence_recorded(off, 100, 0));
+        assert_ne!(p.digest(), empty);
+        // duplicate apply is a no-op (de-dup).
+        p.apply_slash(off, 100, 0, 150);
+        assert_eq!(p.offence_count(), 1);
+        // revert restores the empty state exactly.
+        p.revert_slash(off, 100, 0);
+        assert!(!p.is_slashed(&off));
+        assert_eq!(p.status(&off), PenaltyStatus::Clean);
+        assert!(p.is_empty());
+        assert_eq!(p.digest(), empty, "apply then revert is an exact inverse");
+    }
+
+    #[test]
+    fn persistent_penalty_multi_offence_per_offender() {
+        let mut p = PersistentPenalty::new();
+        let off = [0x07u8; 20];
+        p.apply_slash(off, 100, 0, 150);
+        p.apply_slash(off, 101, 0, 151); // distinct offence (different height)
+        assert_eq!(p.offence_count(), 2);
+        assert!(p.is_slashed(&off));
+        p.revert_slash(off, 101, 0);
+        assert!(p.is_slashed(&off), "still slashed by the first offence");
+        p.revert_slash(off, 100, 0);
+        assert!(!p.is_slashed(&off));
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn persistent_penalty_digest_order_independent() {
+        let a = [0x11u8; 20];
+        let b = [0x22u8; 20];
+        let mut p1 = PersistentPenalty::new();
+        p1.apply_slash(a, 10, 0, 100);
+        p1.apply_slash(b, 20, 0, 110);
+        let mut p2 = PersistentPenalty::new();
+        p2.apply_slash(b, 20, 0, 110);
+        p2.apply_slash(a, 10, 0, 100);
+        assert_eq!(p1.digest(), p2.digest());
     }
 
     #[test]
