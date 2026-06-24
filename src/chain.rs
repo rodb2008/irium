@@ -10010,6 +10010,257 @@ mod tests {
     }
 
     #[test]
+    fn all_gates_solo_poawx_builder_connect_block() {
+        // Gap-extension: the solo builder, with ALL gates active (the Tier-A set PLUS
+        // the four formerly-deferred gates: multi-source seed, hidden precommit,
+        // tickets, penalty), produces node-acceptable blocks across a multi-height
+        // chain, and each new gate is independently enforced (negatives below).
+        use crate::poawx_admission::global_admission_cache;
+        use crate::poawx_committed_admission::{
+            admission_epoch_seed, expected_epoch_seed, seed_components_from_block,
+        };
+        use crate::poawx_mining_harness::build_solo_poawx_block_with_parent;
+        use crate::poawx_penalty::PenaltyStatus;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let gates = [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1"),
+            ("IRIUM_POAWX_PUZZLE_BITS", "1"),
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+            // The four formerly-deferred gates.
+            ("IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TICKETS_REQUIRED", "1"),
+            ("IRIUM_POAWX_TICKET_SYBIL_BITS", "4"),
+            ("IRIUM_POAWX_PENALTY_STATE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PENALTY_STATE_REQUIRED", "1"),
+        ];
+        for (k, v) in gates {
+            std::env::set_var(k, v);
+        }
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let secret = [0x4Du8; 32];
+        let cache = global_admission_cache();
+
+        // Build + connect h1..h3, feeding the REAL parent seed components each height.
+        let n_blocks = 3u64;
+        let mut prev = genesis_hash;
+        let mut parent_prev: Option<[u8; 32]> = None;
+        for h in 1..=n_blocks {
+            let parent_components = seed_components_from_block(st.chain.last());
+            let bits = st.target_for_height(h).bits;
+            let time = genesis.header.time + h as u32;
+            let proof = build_solo_poawx_block_with_parent(
+                &secret,
+                net,
+                h,
+                prev,
+                parent_prev,
+                bits,
+                time,
+                1,
+                parent_components,
+            )
+            .unwrap_or_else(|e| panic!("build H{h}: {e}"));
+
+            let ext = proof.block.poawx_receipts.as_ref().unwrap()[0]
+                .phase20_ext
+                .as_ref()
+                .unwrap();
+            // All four new-gate artifacts are present.
+            assert!(ext.precommit_root.is_some(), "H{h}: precommit_root present");
+            assert!(
+                ext.role_ticket_proofs.is_some(),
+                "H{h}: ticket proofs present"
+            );
+            let cs = ext.candidate_set.as_ref().unwrap();
+            // The builder seed equals the node's multi-source resolver exactly.
+            let exp = expected_epoch_seed(h, prev, st.chain.last());
+            assert_eq!(cs.seed, exp, "H{h}: candidate-set seed == multi-source resolver");
+            if h >= 2 {
+                assert_ne!(
+                    cs.seed,
+                    admission_epoch_seed(parent_prev, prev),
+                    "H{h}: multi-source seed differs from the bare grandparent hash"
+                );
+            }
+
+            cache.clear();
+            cache.set_tip(h);
+            for adm in &proof.admissions {
+                assert_eq!(
+                    cache.ingest_bytes(adm),
+                    crate::poawx_gossip::GossipOutcome::AcceptedNew,
+                    "H{h}: admission ingested"
+                );
+            }
+            let before = st.height;
+            let blk_prev = prev;
+            let blk_hash = proof.block_hash;
+            st.connect_block(proof.block)
+                .unwrap_or_else(|e| panic!("connect_block H{h} failed: {e}"));
+            assert_eq!(st.height, before + 1, "H{h}: tip advanced by one");
+            parent_prev = Some(blk_prev);
+            prev = blk_hash;
+        }
+        assert!(st.height >= 3, "all-gates chain advanced to >= 3 (tip {})", st.height);
+
+        // ── Negative 1: multi-source seed enforced ──
+        // Build H4 with WRONG (zero) parent components; the node expects the real ones.
+        {
+            let bits = st.target_for_height(4).bits;
+            let bad = build_solo_poawx_block_with_parent(
+                &secret,
+                net,
+                4,
+                prev,
+                parent_prev,
+                bits,
+                genesis.header.time + 4,
+                1,
+                ([0u8; 32], [0u8; 32]),
+            )
+            .expect("build bad H4");
+            cache.clear();
+            cache.set_tip(4);
+            for adm in &bad.admissions {
+                let _ = cache.ingest_bytes(adm);
+            }
+            let err = st
+                .connect_block(bad.block)
+                .expect_err("a wrong multi-source seed must be rejected");
+            assert!(
+                err.contains("phase21d") && err.contains("seed"),
+                "expected phase21d seed rejection, got: {err}"
+            );
+            assert_eq!(st.tip_height(), 3, "main chain intact after rejected block");
+        }
+
+        // A fresh, VALID H4 receipt set for the validator-level negatives below.
+        let parent_components = seed_components_from_block(st.chain.last());
+        let probe = build_solo_poawx_block_with_parent(
+            &secret,
+            net,
+            4,
+            prev,
+            parent_prev,
+            st.target_for_height(4).bits,
+            genesis.header.time + 4,
+            1,
+            parent_components,
+        )
+        .expect("probe H4");
+        let base_receipts = probe.block.poawx_receipts.clone().unwrap();
+        let previous_block = st.chain.last().cloned();
+
+        // ── Negative 2: tickets required but missing ──
+        {
+            let mut rs = base_receipts.clone();
+            rs[0].phase20_ext.as_mut().unwrap().role_ticket_proofs = None;
+            let err = validate_phase20_ticket_proofs(&rs, 4, net)
+                .expect_err("missing ticket proofs must be rejected");
+            assert!(err.contains("ticket"), "expected ticket error, got: {err}");
+        }
+
+        // ── Negative 3: penalty enforced — ineligible (slashed) high-trust role ──
+        {
+            let mut rs = base_receipts.clone();
+            // index 1 == VERIFY (a high-trust role).
+            rs[0]
+                .phase20_ext
+                .as_mut()
+                .unwrap()
+                .role_ticket_proofs
+                .as_mut()
+                .unwrap()[1]
+                .penalty_status = PenaltyStatus::Slashed.id();
+            let err = validate_phase20_ticket_proofs(&rs, 4, net)
+                .expect_err("a slashed identity must be ineligible for a high-trust role");
+            let lc = err.to_lowercase();
+            assert!(
+                lc.contains("high-trust") || lc.contains("ineligible"),
+                "expected penalty/high-trust error, got: {err}"
+            );
+        }
+
+        // ── Negative 4: hidden-precommit reveal broken ──
+        {
+            let mut rs = base_receipts.clone();
+            rs[0].phase20_ext.as_mut().unwrap().compute_claim.commitment_hash = None;
+            let err = validate_hidden_precommit(&rs, 4, net, previous_block.as_ref())
+                .expect_err("a broken hidden-precommit reveal must be rejected");
+            assert!(err.contains("precommit"), "expected precommit error, got: {err}");
+        }
+
+        cache.clear();
+        for k in [
+            "IRIUM_NETWORK",
+            "IRIUM_POAWX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_MODE",
+            "IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS",
+            "IRIUM_POAWX_PUZZLE_BITS",
+            "IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_SET_REQUIRED",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PUZZLE_WORK_REQUIRED",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_NUM",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_DEN",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TRUE_VRF_REQUIRED",
+            "IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TICKETS_REQUIRED",
+            "IRIUM_POAWX_TICKET_SYBIL_BITS",
+            "IRIUM_POAWX_PENALTY_STATE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PENALTY_STATE_REQUIRED",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
     fn finality_checkpoint_reorg_protection() {
         // Fixes the Phase 2 simulation scenario-6 gap: a heavier fork forking BELOW
         // a finalized block must be rejected, while a fork at/above it (and the

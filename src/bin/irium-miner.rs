@@ -3296,9 +3296,15 @@ fn build_poawx_submit_request(
     }))
 }
 
-fn poawx_fetch_parent_prev_hash(client: &Client, height: u64) -> Result<Option<[u8; 32]>, String> {
+type PoawxParentInfo = (Option<[u8; 32]>, ([u8; 32], [u8; 32]));
+
+/// Fetch the parent (H-1) block prev_hash PLUS its PoAW-X multi-source seed
+/// components (finality-proof digest, precommit root). For height <= 1 the parent is
+/// genesis: prev_hash None and zero components. The components feed the multi-source
+/// assignment seed so blocks at height >= 2 validate once that gate is active.
+fn poawx_fetch_parent_info(client: &Client, height: u64) -> Result<PoawxParentInfo, String> {
     if height <= 1 {
-        return Ok(None);
+        return Ok((None, ([0u8; 32], [0u8; 32])));
     }
     with_rpc_base(|base| {
         let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/'), height - 1);
@@ -3311,12 +3317,20 @@ fn poawx_fetch_parent_prev_hash(client: &Client, height: u64) -> Result<Option<[
             return Err(rpc_status_error("get parent block", resp.status()));
         }
         let v: serde_json::Value = resp.json().map_err(|e| format!("parent parse: {e}"))?;
-        let h = v
+        let prev = v
             .get("header")
             .and_then(|h| h.get("prev_hash"))
             .and_then(|x| x.as_str())
             .ok_or("parent block missing header.prev_hash")?;
-        Ok(Some(poawx_decode_hash32(h)?))
+        let comp = |key: &str| -> Result<[u8; 32], String> {
+            match v.get(key).and_then(|x| x.as_str()) {
+                Some(s) => poawx_decode_hash32(s),
+                None => Ok([0u8; 32]),
+            }
+        };
+        let fin = comp("poawx_finality_digest")?;
+        let pre = comp("poawx_precommit_root")?;
+        Ok((Some(poawx_decode_hash32(prev)?), (fin, pre)))
     })
 }
 
@@ -3379,10 +3393,12 @@ fn run_poawx_solo() -> Result<(), String> {
         let prev_hash = poawx_decode_hash32(&tmpl.prev_hash)?;
         let bits = u32::from_str_radix(tmpl.bits.trim_start_matches("0x"), 16)
             .map_err(|e| format!("bad template bits {}: {e}", tmpl.bits))?;
-        let parent_prev_hash = poawx_fetch_parent_prev_hash(&client, height)?;
+        let (parent_prev_hash, parent_seed_components) =
+            poawx_fetch_parent_info(&client, height)?;
 
-        let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block(
+        let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block_with_parent(
             &secret, net, height, prev_hash, parent_prev_hash, bits, tmpl.time, diff,
+            parent_seed_components,
         ) {
             Ok(p) => p,
             Err(e) => {

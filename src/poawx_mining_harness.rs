@@ -143,6 +143,29 @@ fn hash160(data: &[u8]) -> [u8; 20] {
     o
 }
 
+/// Deterministic per-(height, role) hidden-precommit claim secret, bound to the
+/// identity set claim_seed so the block at H-1 (which commits H leaves) and the
+/// block at H (which reveals them) derive byte-identical values. Dev/devnet only;
+/// not production key material.
+fn derive_claim_secret(claim_seed: &[u8; 32], height: u64, role: u8) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"IRIUM_POAWX_CLAIM_SECRET_V1");
+    h.update(claim_seed);
+    h.update(height.to_le_bytes());
+    h.update([role]);
+    h.finalize().into()
+}
+
+/// Companion of [`derive_claim_secret`] for the claim nonce (domain-separated).
+fn derive_claim_nonce(claim_seed: &[u8; 32], height: u64, role: u8) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"IRIUM_POAWX_CLAIM_NONCE_V1");
+    h.update(claim_seed);
+    h.update(height.to_le_bytes());
+    h.update([role]);
+    h.finalize().into()
+}
+
 /// A complete, mined all-gates block plus the candidate admissions a node must
 /// have ingested for `connect_block` to accept it. Returned by
 /// [`build_devnet_all_gates_block`]. `admissions` are the canonical wire bytes a
@@ -187,6 +210,9 @@ pub struct AllGatesIdentities {
     pub compute_assign: [u8; 32],
     pub verify_assign: [u8; 32],
     pub support_assign: [u8; 32],
+    /// Base entropy for the deterministic per-(height,role) hidden-precommit claim
+    /// secret/nonce. Identity-bound so H-1 commit and H reveal derive identically.
+    pub claim_seed: [u8; 32],
 }
 
 impl AllGatesIdentities {
@@ -207,6 +233,7 @@ impl AllGatesIdentities {
             compute_assign: [7u8; 32],
             verify_assign: [8u8; 32],
             support_assign: [9u8; 32],
+            claim_seed: [0x2Au8; 32],
         })
     }
 
@@ -237,6 +264,7 @@ impl AllGatesIdentities {
             compute_assign: derive(b"compute"),
             verify_assign: derive(b"verify"),
             support_assign: derive(b"support"),
+            claim_seed: derive(b"claim"),
         })
     }
 }
@@ -261,6 +289,7 @@ pub fn build_devnet_all_gates_block(
         bits,
         time,
         receipt_difficulty_bits,
+        ([0u8; 32], [0u8; 32]),
     )
 }
 
@@ -286,9 +315,40 @@ pub fn build_solo_poawx_block(
         bits,
         time,
         receipt_difficulty_bits,
+        ([0u8; 32], [0u8; 32]),
     )
 }
 
+/// Like [`build_solo_poawx_block`] but threads the PARENT block seed components
+/// (finality-proof digest, precommit root) into the multi-source assignment seed so
+/// blocks at `height >= 2` validate once the multi-source gate is active. For the
+/// genesis-parent case pass `([0u8; 32], [0u8; 32])`. Mainnet-hard-off.
+#[allow(clippy::too_many_arguments)]
+pub fn build_solo_poawx_block_with_parent(
+    miner_secret: &[u8; 32],
+    network_id: u8,
+    height: u64,
+    prev_hash: [u8; 32],
+    parent_prev_hash: Option<[u8; 32]>,
+    bits: u32,
+    time: u32,
+    receipt_difficulty_bits: u32,
+    parent_seed_components: ([u8; 32], [u8; 32]),
+) -> Result<AllGatesProof, String> {
+    build_all_gates_block_with(
+        &AllGatesIdentities::solo(miner_secret)?,
+        network_id,
+        height,
+        prev_hash,
+        parent_prev_hash,
+        bits,
+        time,
+        receipt_difficulty_bits,
+        parent_seed_components,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_all_gates_block_with(
     ids: &AllGatesIdentities,
     network_id: u8,
@@ -298,6 +358,7 @@ fn build_all_gates_block_with(
     bits: u32,
     time: u32,
     receipt_difficulty_bits: u32,
+    parent_seed_components: ([u8; 32], [u8; 32]),
 ) -> Result<AllGatesProof, String> {
     guard_network(network_id)?;
     // Resolve the standard-header activation height into the process global the
@@ -354,13 +415,17 @@ fn build_all_gates_block_with(
     // Gap 3: harness builds height-1 over genesis, so the PARENT (genesis) carries
     // no finality/precommit => the multi-source seed components are zero; the gate
     // (off by default) then returns the legacy grandparent hash byte-identically.
+    let (parent_finality_digest, parent_precommit_digest) = parent_seed_components;
     let base_seed = admission_epoch_seed(parent_prev_hash, prev_hash);
     let epoch_seed = crate::poawx_committed_admission::resolve_epoch_seed_parts(
         height,
         base_seed,
-        [0u8; 32],
-        [0u8; 32],
+        parent_finality_digest,
+        parent_precommit_digest,
     );
+    // Gap-extension gate state used by the hidden-precommit reveal + commit below.
+    let hp_active = crate::chain::hidden_precommit_active(height);
+    let claim_seed = ids.claim_seed;
 
     // Build the 3 role candidates + V2 proofs for a `(target_height, seed)` under a
     // dominance state. Returns proofs + candidates in [compute, verify, support]
@@ -452,22 +517,50 @@ fn build_all_gates_block_with(
     // commit_height = H, freeze seed = prev_hash (== `admission_epoch_seed` of H+1).
     // Incoming committed admission is graced at the activation height (H1).
     let dom_out = dom_at(height + 1);
-    // Gap 3: freeze H+1's epoch seed. Base = this block's prev_hash (grandparent of
-    // H+1); under the multi-source gate it mixes THIS block's finality digest +
-    // precommit (None here => zero). Gate off => legacy prev_hash, byte-identical.
+    // Gap-extension: hidden-precommit root committing H+1 role-claim leaves (the SAME
+    // leaves H+1 will reveal, via the deterministic derivation above). Gate off =>
+    // None (byte-identical). Used both as the ext field and as the precommit
+    // component of H+1 frozen epoch seed.
+    let precommit_root = if hp_active {
+        let leaf = |role: u8, solver: [u8; 20]| -> [u8; 32] {
+            let s = derive_claim_secret(&claim_seed, height + 1, role);
+            let n = derive_claim_nonce(&claim_seed, height + 1, role);
+            let c = crate::poawx::role_precommit_commitment(&s, &n);
+            crate::poawx::role_precommit_leaf(net, height + 1, role, &solver, &c)
+        };
+        let leaves = [
+            leaf(ROLE_COMPUTE_CONTRIBUTOR, compute_solver),
+            leaf(ROLE_VERIFY_CONTRIBUTOR, verify_solver),
+            leaf(ROLE_SUPPORT_CONTRIBUTOR, support_solver),
+        ];
+        Some(crate::poawx::role_precommit_root(&leaves))
+    } else {
+        None
+    };
+    // Gap 3: freeze H+1 epoch seed. Base = this block prev_hash (grandparent of H+1);
+    // under the multi-source gate it mixes THIS block finality digest + precommit.
+    // Gate off => legacy prev_hash, byte-identical.
     let out_seed = crate::poawx_committed_admission::resolve_epoch_seed_parts(
         height + 1,
         prev_hash,
         fproof.digest(),
-        [0u8; 32],
+        precommit_root.unwrap_or([0u8; 32]),
     );
     let (_out_proofs, _out_cands, cs_next) = build_roles(height + 1, out_seed, &dom_out)?;
     let commitment = AdmissionCommitmentV1::from_candidate_set(&cs_next, height);
 
     let claim = |role: u8, solver: [u8; 20]| -> PoawxRoleClaim {
         let lane = crate::poawx::assign_lane(net, height, &prev_hash, role, 0);
-        let nonce = [0x01u8; 32];
-        let secret = [0x02u8; 32];
+        // Hidden-precommit reveal: derived secret/nonce + hiding commitment when the
+        // gate is active; legacy fixed values + None otherwise (byte-identical).
+        let (secret, nonce) = if hp_active {
+            (
+                derive_claim_secret(&claim_seed, height, role),
+                derive_claim_nonce(&claim_seed, height, role),
+            )
+        } else {
+            ([0x02u8; 32], [0x01u8; 32])
+        };
         let cd = crate::poawx::role_claim_digest(
             net,
             height,
@@ -478,6 +571,11 @@ fn build_all_gates_block_with(
             &nonce,
             &secret,
         );
+        let commitment_hash = if hp_active {
+            Some(crate::poawx::role_precommit_commitment(&secret, &nonce))
+        } else {
+            None
+        };
         PoawxRoleClaim {
             role_id: role,
             lane_id: lane.id(),
@@ -485,8 +583,53 @@ fn build_all_gates_block_with(
             nonce,
             secret,
             claim_digest: cd,
-            commitment_hash: None,
+            commitment_hash,
         }
+    };
+
+    // Gap-extension: per-role ticket proofs (Sybil-work + penalty eligibility). Emit
+    // when the ticket gate is active at H; the node validates them when tickets are
+    // REQUIRED. Solo: every role solver is the miner pkh; the assignment pubkey is
+    // the miner compressed key (bound into the digests, not cross-checked). Penalty
+    // status = Clean (a non-slashed miner is eligible for high-trust roles).
+    let role_ticket_proofs = if crate::poawx_ticket::tickets_active(height) {
+        let mut apk = [0u8; 33];
+        apk.copy_from_slice(worker_pubkey_bytes);
+        let sybil_bits = crate::poawx_ticket::sybil_threshold_bits();
+        let epoch = height;
+        let expiry = height + 100_000;
+        let mk_ticket =
+            |role: u8, solver: [u8; 20]| -> Result<crate::poawx_ticket::TicketProof, String> {
+                let nonce = if sybil_bits > 0 {
+                    crate::poawx_ticket::grind_sybil_nonce(
+                        net, &solver, epoch, &apk, sybil_bits, 50_000_000,
+                    )
+                    .map(|(n, _d)| n)
+                    .ok_or_else(|| {
+                        format!("harness: ticket sybil-work grind failed for role {role}")
+                    })?
+                } else {
+                    [0u8; 32]
+                };
+                Ok(crate::poawx_ticket::TicketProof::new(
+                    net,
+                    height,
+                    role,
+                    solver,
+                    epoch,
+                    expiry,
+                    apk,
+                    nonce,
+                    PenaltyStatus::Clean.id(),
+                ))
+            };
+        Some([
+            mk_ticket(ROLE_COMPUTE_CONTRIBUTOR, compute_solver)?,
+            mk_ticket(ROLE_VERIFY_CONTRIBUTOR, verify_solver)?,
+            mk_ticket(ROLE_SUPPORT_CONTRIBUTOR, support_solver)?,
+        ])
+    } else {
+        None
     };
 
     let ext = Phase20ReceiptExt {
@@ -500,8 +643,8 @@ fn build_all_gates_block_with(
         support_claim: claim(ROLE_SUPPORT_CONTRIBUTOR, support_solver),
         fee_bps: 0,
         fee_pkh: [0u8; 20],
-        precommit_root: None,
-        role_ticket_proofs: None,
+        precommit_root,
+        role_ticket_proofs,
         role_dominance_weights: Some([
             dw_in(&worker_pkh),
             dw_in(&compute_solver),

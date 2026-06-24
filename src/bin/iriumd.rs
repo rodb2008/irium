@@ -15004,6 +15004,10 @@ fn irx1_root_from_block(block: &Block) -> Option<String> {
 
 fn block_json_for(height: u64, block: &Block) -> Value {
     let header = &block.header;
+    // PoAW-X multi-source seed components for this block (finality-proof digest,
+    // precommit root); the solo --poawx miner reads these to seed the NEXT block.
+    let (poawx_finality_digest, poawx_precommit_root) =
+        irium_node_rs::poawx_committed_admission::seed_components_from_block(Some(block));
     serde_json::json!({
         "height": height,
         "header": {
@@ -15023,6 +15027,8 @@ fn block_json_for(height: u64, block: &Block) -> Value {
         "coinbase_tag": block.transactions.first()
             .and_then(|tx| tx.inputs.first())
             .and_then(|inp| extract_coinbase_tag(&inp.script_sig)),
+        "poawx_finality_digest": hex::encode(poawx_finality_digest),
+        "poawx_precommit_root": hex::encode(poawx_precommit_root),
     })
 }
 async fn get_block(
