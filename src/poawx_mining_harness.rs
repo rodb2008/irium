@@ -175,7 +175,122 @@ pub struct AllGatesProof {
 /// `prev_hash` (the genesis hash) and behavior is unchanged. This makes blocks at
 /// `height >= 2` satisfy BOTH the phase21d candidate-set gate and the phase22a
 /// committed-admission gate.
+/// The PoAW-X identities an all-gates block needs. `dev()` reproduces the fixed
+/// devnet keys (byte-identical to the original harness); `solo()` derives every
+/// role from a single miner secret so a real solo miner plays all roles.
+pub struct AllGatesIdentities {
+    pub worker_sk: SigningKey,
+    pub member_sk: SigningKey,
+    pub compute_solver: [u8; 20],
+    pub verify_solver: [u8; 20],
+    pub support_solver: [u8; 20],
+    pub compute_assign: [u8; 32],
+    pub verify_assign: [u8; 32],
+    pub support_assign: [u8; 32],
+}
+
+impl AllGatesIdentities {
+    /// Fixed devnet identities (matches the original harness exactly; the SUPPORT
+    /// solver MUST be hash160(finality member pubkey) so the committee vote validates).
+    pub fn dev() -> Result<Self, String> {
+        let member_sk = SigningKey::from_bytes((&[0xC3u8; 32]).into())
+            .map_err(|_| "harness: bad member key".to_string())?;
+        let member_pub = member_sk.verifying_key().to_encoded_point(true);
+        let support_solver = hash160(member_pub.as_bytes());
+        Ok(Self {
+            worker_sk: SigningKey::from_bytes((&[0x55u8; 32]).into())
+                .map_err(|_| "harness: bad worker key".to_string())?,
+            member_sk,
+            compute_solver: [0xC1u8; 20],
+            verify_solver: [0xC2u8; 20],
+            support_solver,
+            compute_assign: [7u8; 32],
+            verify_assign: [8u8; 32],
+            support_assign: [9u8; 32],
+        })
+    }
+
+    /// Solo identities: one miner secret plays worker + finality member + all three
+    /// roles (compute/verify/support all == the miner pkh). Per-role assignment
+    /// secrets are domain-separated from the miner secret. The SUPPORT solver equals
+    /// hash160(miner pubkey) == the finality member pkh, so the committee validates.
+    pub fn solo(miner_secret: &[u8; 32]) -> Result<Self, String> {
+        let sk = SigningKey::from_bytes(miner_secret.into())
+            .map_err(|_| "solo: bad miner key".to_string())?;
+        let pub_pt = sk.verifying_key().to_encoded_point(true);
+        let pkh = hash160(pub_pt.as_bytes());
+        let derive = |tag: &[u8]| -> [u8; 32] {
+            let mut h = Sha256::new();
+            h.update(b"IRIUM_POAWX_SOLO_ASSIGN_V1");
+            h.update(tag);
+            h.update(miner_secret);
+            h.finalize().into()
+        };
+        let member_sk = SigningKey::from_bytes(miner_secret.into())
+            .map_err(|_| "solo: bad miner key".to_string())?;
+        Ok(Self {
+            worker_sk: sk,
+            member_sk,
+            compute_solver: pkh,
+            verify_solver: pkh,
+            support_solver: pkh,
+            compute_assign: derive(b"compute"),
+            verify_assign: derive(b"verify"),
+            support_assign: derive(b"support"),
+        })
+    }
+}
+
+/// Build a mined all-gates block with the fixed devnet identities (test/proof
+/// tooling). Byte-identical to the original harness output.
 pub fn build_devnet_all_gates_block(
+    network_id: u8,
+    height: u64,
+    prev_hash: [u8; 32],
+    parent_prev_hash: Option<[u8; 32]>,
+    bits: u32,
+    time: u32,
+    receipt_difficulty_bits: u32,
+) -> Result<AllGatesProof, String> {
+    build_all_gates_block_with(
+        &AllGatesIdentities::dev()?,
+        network_id,
+        height,
+        prev_hash,
+        parent_prev_hash,
+        bits,
+        time,
+        receipt_difficulty_bits,
+    )
+}
+
+/// Build a mined all-gates block where a single miner secret plays every role
+/// (worker + finality member + compute/verify/support). For solo devnet/testnet
+/// PoAW-X mining with the miner's own reward key. Mainnet-hard-off.
+pub fn build_solo_poawx_block(
+    miner_secret: &[u8; 32],
+    network_id: u8,
+    height: u64,
+    prev_hash: [u8; 32],
+    parent_prev_hash: Option<[u8; 32]>,
+    bits: u32,
+    time: u32,
+    receipt_difficulty_bits: u32,
+) -> Result<AllGatesProof, String> {
+    build_all_gates_block_with(
+        &AllGatesIdentities::solo(miner_secret)?,
+        network_id,
+        height,
+        prev_hash,
+        parent_prev_hash,
+        bits,
+        time,
+        receipt_difficulty_bits,
+    )
+}
+
+fn build_all_gates_block_with(
+    ids: &AllGatesIdentities,
     network_id: u8,
     height: u64,
     prev_hash: [u8; 32],
@@ -198,19 +313,17 @@ pub fn build_devnet_all_gates_block(
     );
     let net = network_id;
 
-    // Identities (deterministic dev keys; the SUPPORT solver MUST be
-    // hash160(finality member pubkey) so the committee vote validates).
-    let worker_sk = SigningKey::from_bytes((&[0x55u8; 32]).into())
-        .map_err(|_| "harness: bad worker key".to_string())?;
+    // Identities supplied by the caller (dev or solo). The SUPPORT solver MUST be
+    // hash160(finality member pubkey) so the committee vote validates (guaranteed
+    // by both AllGatesIdentities constructors).
+    let worker_sk = &ids.worker_sk;
     let worker_pubkey_pt = worker_sk.verifying_key().to_encoded_point(true);
     let worker_pubkey_bytes = worker_pubkey_pt.as_bytes();
     let worker_pkh = hash160(worker_pubkey_bytes);
-    let member_sk = SigningKey::from_bytes((&[0xC3u8; 32]).into())
-        .map_err(|_| "harness: bad member key".to_string())?;
-    let member_pub = member_sk.verifying_key().to_encoded_point(true);
-    let support_solver = hash160(member_pub.as_bytes());
-    let compute_solver = [0xC1u8; 20];
-    let verify_solver = [0xC2u8; 20];
+    let member_sk = &ids.member_sk;
+    let compute_solver = ids.compute_solver;
+    let verify_solver = ids.verify_solver;
+    let support_solver = ids.support_solver;
 
     // Anti-domination weights are validated against the node's PERSISTED dominance
     // state, which evolves as each accepted block credits its role rewards. A
@@ -256,15 +369,15 @@ pub fn build_devnet_all_gates_block(
                        sd: [u8; 32],
                        dom: &PersistentDominance|
      -> Result<([AssignmentProofV2; 3], [RoleCandidate; 3], CandidateSet), String> {
-        let mk = |secret: u8, role: u8, solver: [u8; 20], ticket: [u8; 32]| {
-            let p = AssignmentProofV2::prove(&[secret; 32], net, th, role, solver, ticket, sd)?;
+        let mk = |secret: &[u8; 32], role: u8, solver: [u8; 20], ticket: [u8; 32]| {
+            let p = AssignmentProofV2::prove(secret, net, th, role, solver, ticket, sd)?;
             let w = dom.weight(DOMINANCE_BASE_WORK_SCORE, &solver, th);
             let c = RoleCandidate::from_assignment_v2(&p, PenaltyStatus::Clean.id(), w, [role; 32]);
             Ok::<_, String>((p, c))
         };
-        let (pc, cc) = mk(7, ROLE_COMPUTE_CONTRIBUTOR, compute_solver, [0x11u8; 32])?;
-        let (pv, cv) = mk(8, ROLE_VERIFY_CONTRIBUTOR, verify_solver, [0x12u8; 32])?;
-        let (ps, csup) = mk(9, ROLE_SUPPORT_CONTRIBUTOR, support_solver, [0x13u8; 32])?;
+        let (pc, cc) = mk(&ids.compute_assign, ROLE_COMPUTE_CONTRIBUTOR, compute_solver, [0x11u8; 32])?;
+        let (pv, cv) = mk(&ids.verify_assign, ROLE_VERIFY_CONTRIBUTOR, verify_solver, [0x12u8; 32])?;
+        let (ps, csup) = mk(&ids.support_assign, ROLE_SUPPORT_CONTRIBUTOR, support_solver, [0x13u8; 32])?;
         let mut cs = CandidateSet::new(net, th, sd);
         for c in [cc.clone(), cv.clone(), csup.clone()] {
             cs.push(c);
@@ -322,7 +435,7 @@ pub fn build_devnet_all_gates_block(
     let (num, den) = finality_threshold();
     let mut fproof = FinalityProofV1::new(net, height, prev_hash, [0u8; 32], 0, num, den);
     fproof.push(FinalityVoteV1::signed(
-        &member_sk,
+        member_sk,
         net,
         height,
         prev_hash,

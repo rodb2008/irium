@@ -3207,7 +3207,221 @@ fn run_solo_stratum_server(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── Gap 12: solo PoAW-X mining (--poawx) ─────────────────────────────────────
+//
+// Build a complete all-gates PoAW-X block where the miner's own key plays every
+// role, then ingest its candidate admissions and submit via the node's extended
+// RPC. Devnet/testnet only (mainnet hard-off). Requires the gate env to match the
+// target node (same IRIUM_POAWX_* activation/required vars) and the miner secret
+// in IRIUM_POAWX_MINER_SECRET_HEX (64 hex chars). The block validity proof for
+// this builder is the lib test chain::tests::gap12_solo_poawx_builder_connect_block;
+// this function is the (not unit-testable) live node round-trip.
+
+fn poawx_miner_secret() -> Result<[u8; 32], String> {
+    let hexs = env::var("IRIUM_POAWX_MINER_SECRET_HEX").map_err(|_| {
+        "solo PoAW-X mining requires IRIUM_POAWX_MINER_SECRET_HEX (64 hex chars)".to_string()
+    })?;
+    let bytes =
+        hex::decode(hexs.trim()).map_err(|e| format!("bad IRIUM_POAWX_MINER_SECRET_HEX: {e}"))?;
+    if bytes.len() != 32 {
+        return Err("IRIUM_POAWX_MINER_SECRET_HEX must be 32 bytes (64 hex chars)".to_string());
+    }
+    let mut o = [0u8; 32];
+    o.copy_from_slice(&bytes);
+    Ok(o)
+}
+
+fn poawx_decode_hash32(s: &str) -> Result<[u8; 32], String> {
+    let b = hex::decode(s.trim()).map_err(|e| format!("bad hash hex: {e}"))?;
+    if b.len() != 32 {
+        return Err(format!("hash must be 32 bytes, got {}", b.len()));
+    }
+    let mut o = [0u8; 32];
+    o.copy_from_slice(&b);
+    Ok(o)
+}
+
+fn poawx_receipt_difficulty_bits() -> u32 {
+    env::var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(4)
+}
+
+/// Build the `/rpc/submit_block_extended` JSON request from a built proof (public
+/// block data only; no secret key material). Mirrors the live-proof harness shape.
+fn build_poawx_submit_request(
+    proof: &irium_node_rs::poawx_mining_harness::AllGatesProof,
+) -> Result<serde_json::Value, String> {
+    let block = &proof.block;
+    let coinbase = block
+        .transactions
+        .first()
+        .ok_or("missing coinbase in built block")?;
+    let receipt = block
+        .poawx_receipts
+        .as_ref()
+        .and_then(|r| r.first())
+        .ok_or("missing receipt in built block")?;
+    let ext_hex = receipt
+        .phase20_ext
+        .as_ref()
+        .map(|e: &irium_node_rs::poawx::Phase20ReceiptExt| hex::encode(e.serialize()))
+        .unwrap_or_default();
+    let header = &block.header;
+    Ok(json!({
+        "height": proof.height,
+        "header": {
+            "version": header.version,
+            "prev_hash": hex::encode(header.prev_hash),
+            "merkle_root": hex::encode(header.merkle_root),
+            "time": header.time,
+            "bits": format!("{:08x}", header.bits),
+            "nonce": header.nonce,
+            "hash": hex::encode(proof.block_hash),
+        },
+        "tx_hex": [hex::encode(coinbase.serialize())],
+        "submit_source": "irium-miner-poawx",
+        "poawx_receipts": [{
+            "height": receipt.height,
+            "lane": (receipt.lane as char).to_string(),
+            "worker_pkh": hex::encode(receipt.worker_pkh),
+            "solution": hex::encode(receipt.solution),
+            "commitment_nonce": hex::encode(receipt.commitment_nonce),
+            "worker_pubkey": hex::encode(receipt.worker_pubkey),
+            "worker_sig": hex::encode(receipt.worker_sig),
+            "phase20_ext": ext_hex,
+        }],
+        "poawx_receipts_root": hex::encode(proof.irx1_root),
+    }))
+}
+
+fn poawx_fetch_parent_prev_hash(client: &Client, height: u64) -> Result<Option<[u8; 32]>, String> {
+    if height <= 1 {
+        return Ok(None);
+    }
+    with_rpc_base(|base| {
+        let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/'), height - 1);
+        let mut req = client.get(&url);
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("get parent block: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("get parent block", resp.status()));
+        }
+        let v: serde_json::Value = resp.json().map_err(|e| format!("parent parse: {e}"))?;
+        let h = v
+            .get("header")
+            .and_then(|h| h.get("prev_hash"))
+            .and_then(|x| x.as_str())
+            .ok_or("parent block missing header.prev_hash")?;
+        Ok(Some(poawx_decode_hash32(h)?))
+    })
+}
+
+fn poawx_post_admission(client: &Client, adm: &[u8]) -> Result<(), String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/poawx/candidate-admission", base.trim_end_matches('/'));
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(adm.to_vec());
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("post admission: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("post admission", resp.status()));
+        }
+        Ok(())
+    })
+}
+
+fn poawx_submit_extended(client: &Client, req_body: &serde_json::Value) -> Result<(), String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/rpc/submit_block_extended", base.trim_end_matches('/'));
+        let mut req = client.post(&url).json(req_body);
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("submit_block_extended: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("submit_block_extended rejected: HTTP {status} body={body}"));
+        }
+        Ok(())
+    })
+}
+
+/// Solo PoAW-X mining loop: fetch template -> build all-gates block with the
+/// miner key -> ingest admissions -> submit extended. Devnet/testnet only.
+fn run_poawx_solo() -> Result<(), String> {
+    let net = irium_node_rs::activation::network_id_byte();
+    if net == 0 {
+        return Err("solo PoAW-X mining is devnet/testnet only (mainnet hard-off)".to_string());
+    }
+    let secret = poawx_miner_secret()?;
+    let client = rpc_client()?;
+    let diff = poawx_receipt_difficulty_bits();
+    println!("[poawx] solo PoAW-X mining started (net={net}); building all-gates blocks with the miner key");
+    loop {
+        let tmpl = match fetch_block_template(&client, false) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[poawx] template fetch failed: {e}; retrying");
+                thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+        };
+        let height = tmpl.height;
+        let prev_hash = poawx_decode_hash32(&tmpl.prev_hash)?;
+        let bits = u32::from_str_radix(tmpl.bits.trim_start_matches("0x"), 16)
+            .map_err(|e| format!("bad template bits {}: {e}", tmpl.bits))?;
+        let parent_prev_hash = poawx_fetch_parent_prev_hash(&client, height)?;
+
+        let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block(
+            &secret, net, height, prev_hash, parent_prev_hash, bits, tmpl.time, diff,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[poawx] build failed at height {height}: {e}; retrying");
+                thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+        };
+
+        let mut ok = true;
+        for (i, adm) in proof.admissions.iter().enumerate() {
+            if let Err(e) = poawx_post_admission(&client, adm) {
+                eprintln!("[poawx] admission[{i}] post failed: {e}");
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            thread::sleep(Duration::from_secs(3));
+            continue;
+        }
+        let req = build_poawx_submit_request(&proof)?;
+        match poawx_submit_extended(&client, &req) {
+            Ok(()) => println!("[poawx] submitted all-gates block height={height}"),
+            Err(e) => eprintln!("[poawx] submit failed at height {height}: {e}"),
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
 fn main() {
+    if env::args().any(|a| a == "--poawx") {
+        load_env_file("/etc/irium/miner.env");
+        if let Err(e) = run_poawx_solo() {
+            eprintln!("[poawx] solo mining error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let loaded_env = load_env_file("/etc/irium/miner.env");
     if loaded_env {
         if json_log_enabled() {

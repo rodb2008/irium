@@ -9861,6 +9861,124 @@ mod tests {
         std::env::remove_var("IRIUM_NETWORK");
     }
 
+    #[test]
+    fn gap12_solo_poawx_builder_connect_block() {
+        // Gap 12: a single miner secret plays ALL roles (worker + finality member +
+        // compute/verify/support). The solo builder must produce a node-acceptable
+        // all-gates block (the lib-level half of solo PoAW-X mining; the live miner
+        // round-trip is exercised by the --poawx irium-miner mode, not unit-tested).
+        use crate::poawx_admission::global_admission_cache;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        for (k, v) in [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4"),
+            ("IRIUM_POAWX_PUZZLE_BITS", "4"),
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+        ] {
+            std::env::set_var(k, v);
+        }
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let height = 1u64;
+        let bits = st.target_for_height(height).bits;
+        let time = genesis.header.time + 1;
+
+        let miner_secret = [0x42u8; 32];
+        let proof = crate::poawx_mining_harness::build_solo_poawx_block(
+            &miner_secret,
+            net,
+            height,
+            genesis_hash,
+            None,
+            bits,
+            time,
+            4,
+        )
+        .expect("solo builder produces a mined all-gates block");
+
+        // Solo: the miner is every role identity.
+        let r0 = &proof.block.poawx_receipts.as_ref().unwrap()[0];
+        let ext = r0.phase20_ext.as_ref().unwrap();
+        assert_eq!(ext.role_reward.compute_contributor_pkh, r0.worker_pkh);
+        assert_eq!(ext.role_reward.verify_contributor_pkh, r0.worker_pkh);
+        assert_eq!(ext.role_reward.support_contributor_pkh, r0.worker_pkh);
+
+        let cache = global_admission_cache();
+        cache.clear();
+        cache.set_tip(height);
+        for adm in &proof.admissions {
+            assert_eq!(
+                cache.ingest_bytes(adm),
+                crate::poawx_gossip::GossipOutcome::AcceptedNew,
+                "node ingests solo builder admission"
+            );
+        }
+
+        let before = st.height;
+        st.connect_block(proof.block)
+            .expect("connect_block accepts the solo miner all-gates block");
+        assert_eq!(st.height, before + 1, "chain advanced one block");
+
+        cache.clear();
+        for k in [
+            "IRIUM_NETWORK",
+            "IRIUM_POAWX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_MODE",
+            "IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS",
+            "IRIUM_POAWX_PUZZLE_BITS",
+            "IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_SET_REQUIRED",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PUZZLE_WORK_REQUIRED",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_NUM",
+            "IRIUM_POAWX_FINALITY_THRESHOLD_DEN",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TRUE_VRF_REQUIRED",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
     // Shared gate env for the Phase 26B multi-block tests (all gates required from
     // height 1; devnet; finality 1/1; puzzle bits 4).
     fn phase26b_set_gate_env() {
