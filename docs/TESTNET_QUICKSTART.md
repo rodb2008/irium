@@ -12,7 +12,7 @@ on a fresh Linux VM (e.g. an Ubuntu 24.04 LXC/VM on Proxmox).
 
 | | |
 |---|---|
-| Release tag | `poawx-testnet-v0.1` |
+| Release tag | `poawx-testnet-v0.1.3` |
 | Network | `devnet` magic (`network_id = 2`) |
 | Genesis hash | `0000000028f25d65557e9d8d9e991f516c00d68f5aeae10b750645b398bd10a3` |
 | Seed nodes (P2P) | `207.244.247.86:38401`, `157.173.116.134:38401` |
@@ -27,12 +27,15 @@ on a fresh Linux VM (e.g. an Ubuntu 24.04 LXC/VM on Proxmox).
 - ~2 vCPU, 2 GB RAM, 20 GB disk.
 - One inbound TCP port: **38401** (forward it to the VM if behind NAT).
 - `curl`, `tar`, `python3`, `openssl` installed.
+- On **Debian 13**, `ufw` is not installed by default — install it first: `sudo apt install ufw` (used in step 3).
 
 ## 1. Download the software and verify it
 
+> Always check https://github.com/iriumlabs/irium/releases for the latest testnet release and update the version number accordingly.
+
 ```bash
 mkdir -p ~/testnet/bin ~/testnet/data && cd ~/testnet
-BASE=https://github.com/iriumlabs/irium/releases/download/poawx-testnet-v0.1
+BASE=https://github.com/iriumlabs/irium/releases/download/poawx-testnet-v0.1.3
 curl -L -o bin/iriumd        $BASE/iriumd
 curl -L -o bin/irium-miner   $BASE/irium-miner        # optional, only if you will mine
 curl -L -o bootstrap.tar.gz  $BASE/bootstrap.tar.gz

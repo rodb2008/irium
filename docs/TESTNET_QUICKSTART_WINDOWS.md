@@ -10,7 +10,7 @@ Windows 10/11 using PowerShell. For Linux see `TESTNET_QUICKSTART.md`.
 
 | | |
 |---|---|
-| Release tag | `poawx-testnet-v0.1` |
+| Release tag | `poawx-testnet-v0.1.3` |
 | Network | `devnet` magic (`network_id = 2`) |
 | Genesis hash | `0000000028f25d65557e9d8d9e991f516c00d68f5aeae10b750645b398bd10a3` |
 | Seed nodes (P2P) | `207.244.247.86:38401`, `157.173.116.134:38401` |
@@ -25,15 +25,17 @@ of the two ways to get the binaries (§1A download, or §1B build).
 
 ## 1A. Get the binaries — download (easiest)
 
+> Always check https://github.com/iriumlabs/irium/releases for the latest testnet release and update the version number accordingly.
+
 Download the Windows archive + bootstrap from the release, then verify and extract.
 
 ```powershell
-$base = "https://github.com/iriumlabs/irium/releases/download/poawx-testnet-v0.1"
+$base = "https://github.com/iriumlabs/irium/releases/download/poawx-testnet-v0.1.3"
 New-Item -ItemType Directory -Force "$HOME\irium-testnet" | Out-Null
 Set-Location "$HOME\irium-testnet"
 
 # node/miner binaries (Windows zip) + bootstrap + the canonical env + checksums
-Invoke-WebRequest "$base/irium-poawx-testnet-v0.1-windows-x86_64.zip" -OutFile irium-win.zip
+Invoke-WebRequest "$base/irium-poawx-testnet-v0.1.3-windows-x86_64.zip" -OutFile irium-win.zip
 Invoke-WebRequest "$base/SHA256SUMS-windows.txt"                       -OutFile SHA256SUMS-windows.txt
 Invoke-WebRequest "$base/bootstrap.tar.gz"                              -OutFile bootstrap.tar.gz
 Invoke-WebRequest "$base/testnet.env"                                   -OutFile testnet.env
