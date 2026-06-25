@@ -1648,7 +1648,17 @@ impl ChainState {
             // extra candidate => mismatch => reject). Fail closed when a selected
             // role has no admitted candidate. HONEST: best among candidates
             // admitted to THIS node in the window, not among unseen offline miners.
-            if crate::poawx_admission::candidate_admission_enforced(height) {
+            //
+            // IBD-sync fix: skip phase21e when committed-admission (phase22a) is
+            // enforced. phase22a permanently binds the candidate set to the parent's
+            // committed root, and phase21d cryptographically validates it (seed /
+            // true-VRF / puzzle / dominance), so this live gossip-cache match is
+            // redundant AND unsatisfiable for historical / IBD / restart-replay
+            // blocks once admissions are pruned (ADMISSION_PRUNE_KEEP). When
+            // committed-admission is off (e.g. mainnet) phase21e is unchanged.
+            if crate::poawx_admission::candidate_admission_enforced(height)
+                && !crate::poawx_committed_admission::committed_admission_enforced(height)
+            {
                 let cache = crate::poawx_admission::global_admission_cache();
                 let admitted = cache.admitted_candidate_set(net, height, &epoch_seed);
                 if cs.serialize() != admitted.serialize() {
@@ -10720,16 +10730,24 @@ mod tests {
         }
         assert!(path.exists(), "admissions persisted to disk on ingest");
 
-        // ---- (a) Simulated restart with EMPTY cache: phase21e must reject. ----
+        // ---- (a) IBD-sync fix: with committed-admission (phase22a) enforced, a
+        // restart with an EMPTY admission cache now re-connects every block WITHOUT
+        // the ephemeral admissions. phase22a (the parent's committed candidate-set
+        // root) + phase21d are the authority; the redundant phase21e gate is skipped,
+        // so cold replay / IBD no longer depend on admission availability (pruned for
+        // historical heights). ----
         cache.clear();
         {
-            let mut st_neg = base_chain(None);
-            let err = st_neg
-                .connect_block(blocks[0].clone())
-                .expect_err("phase21e must reject without admitted candidates");
-            assert!(
-                err.contains("phase21e"),
-                "expected phase21e admitted-set rejection, got: {err}"
+            let mut st_empty = base_chain(None);
+            for (i, blk) in blocks.iter().enumerate() {
+                st_empty.connect_block(blk.clone()).unwrap_or_else(|e| {
+                    panic!("cold replay H{} with empty admission cache failed: {e}", i + 1)
+                });
+            }
+            assert_eq!(
+                st_empty.tip_height(),
+                n_blocks,
+                "cold replay reached the tip with an EMPTY admission cache (phase22a authoritative)"
             );
         }
 
@@ -10832,15 +10850,23 @@ mod tests {
         cache.clear();
         cache.set_tip(0);
 
-        // (a) Negative: phase21e rejects without the admissions.
+        // (a) IBD-sync fix: a fresh node with an EMPTY admission cache now connects
+        // every block WITHOUT the served admissions. With committed-admission
+        // (phase22a) enforced the redundant phase21e gate is skipped, so a brand-new
+        // node syncs from genesis without depending on (pruned) historical
+        // admissions. The served-admission path below still works but is no longer
+        // required for validity.
         {
-            let mut st_neg = base_chain(None);
-            let err = st_neg
-                .connect_block(blocks[0].clone())
-                .expect_err("phase21e must reject a fresh node lacking admissions");
-            assert!(
-                err.contains("phase21e"),
-                "expected phase21e rejection, got: {err}"
+            let mut st_noadm = base_chain(None);
+            for (i, blk) in blocks.iter().enumerate() {
+                st_noadm.connect_block(blk.clone()).unwrap_or_else(|e| {
+                    panic!("fresh sync H{} with empty cache failed: {e}", i + 1)
+                });
+            }
+            assert_eq!(
+                st_noadm.tip_height(),
+                n_blocks,
+                "fresh node synced to tip with an EMPTY admission cache (phase22a authoritative)"
             );
         }
 

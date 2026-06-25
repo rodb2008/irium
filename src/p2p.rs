@@ -5859,8 +5859,13 @@ impl P2PNode {
                                             }
                                         }
 
+                                        // IBD-sync fix (Fix 2): unknown start hash => fall back to
+                                        // serving from the genesis-child so the client re-anchors
+                                        // instead of dead-ending. Treated as a genesis locator
+                                        // (rate-limited below) via matched_pos = Some(0).
                                         if matched_pos.is_none() && !is_zero {
-                                            return (matched_pos, Vec::new(), 0u64);
+                                            start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
+                                            matched_pos = Some(0);
                                         }
 
                                         let mut blocks = Vec::new();
@@ -8415,8 +8420,13 @@ async fn handle_incoming_with_sybil(
                                     }
                                 }
 
+                                // IBD-sync fix (Fix 2): unknown start hash => fall back to serving
+                                // from the genesis-child so the client re-anchors instead of
+                                // dead-ending. Treated as a genesis locator (rate-limited below)
+                                // via matched_pos = Some(0).
                                 if matched_pos.is_none() && !is_zero {
-                                    return (matched_pos, Vec::new(), 0u64);
+                                    start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
+                                    matched_pos = Some(0);
                                 }
 
                                 let mut blocks = Vec::new();
