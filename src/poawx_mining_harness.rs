@@ -291,6 +291,7 @@ pub fn build_devnet_all_gates_block(
         receipt_difficulty_bits,
         ([0u8; 32], [0u8; 32]),
         None,
+        None,
     )
 }
 
@@ -317,6 +318,7 @@ pub fn build_solo_poawx_block(
         time,
         receipt_difficulty_bits,
         ([0u8; 32], [0u8; 32]),
+        None,
         None,
     )
 }
@@ -348,6 +350,7 @@ pub fn build_solo_poawx_block_with_parent(
         receipt_difficulty_bits,
         parent_seed_components,
         None,
+        None,
     )
 }
 
@@ -366,6 +369,7 @@ pub fn build_solo_poawx_block_with_parent_and_dominance(
     receipt_difficulty_bits: u32,
     parent_seed_components: ([u8; 32], [u8; 32]),
     dominance: &PersistentDominance,
+    node_gates: Option<&NodeGateFlags>,
 ) -> Result<AllGatesProof, String> {
     build_all_gates_block_with(
         &AllGatesIdentities::solo(miner_secret)?,
@@ -378,7 +382,21 @@ pub fn build_solo_poawx_block_with_parent_and_dominance(
         receipt_difficulty_bits,
         parent_seed_components,
         Some(dominance),
+        node_gates,
     )
+}
+
+/// Node-authoritative gate-activation flags for a target height, supplied by the
+/// block template so a standalone miner builds exactly what its node will validate
+/// (instead of reading its own env). `None` at a call site => fall back to the
+/// env-derived gate predicates (existing in-process behavior). Mainnet-off.
+pub struct NodeGateFlags {
+    pub hidden_precommit_active: bool,
+    pub tickets_active: bool,
+    pub multisource_seed_active: bool,
+    pub penalty_state_active: bool,
+    pub puzzle_anchor_bits: u32,
+    pub effective_sybil_bits: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -393,6 +411,7 @@ fn build_all_gates_block_with(
     receipt_difficulty_bits: u32,
     parent_seed_components: ([u8; 32], [u8; 32]),
     dominance_override: Option<&PersistentDominance>,
+    node_gates: Option<&NodeGateFlags>,
 ) -> Result<AllGatesProof, String> {
     guard_network(network_id)?;
     // Resolve the standard-header activation height into the process global the
@@ -451,14 +470,20 @@ fn build_all_gates_block_with(
     // (off by default) then returns the legacy grandparent hash byte-identically.
     let (parent_finality_digest, parent_precommit_digest) = parent_seed_components;
     let base_seed = admission_epoch_seed(parent_prev_hash, prev_hash);
-    let epoch_seed = crate::poawx_committed_admission::resolve_epoch_seed_parts(
+    let multisource_active = node_gates
+        .map(|g| g.multisource_seed_active)
+        .unwrap_or_else(|| crate::poawx_committed_admission::multisource_seed_active(height));
+    let epoch_seed = crate::poawx_committed_admission::resolve_epoch_seed_parts_with(
+        multisource_active,
         height,
         base_seed,
         parent_finality_digest,
         parent_precommit_digest,
     );
     // Gap-extension gate state used by the hidden-precommit reveal + commit below.
-    let hp_active = crate::chain::hidden_precommit_active(height);
+    let hp_active = node_gates
+        .map(|g| g.hidden_precommit_active)
+        .unwrap_or_else(|| crate::chain::hidden_precommit_active(height));
     let claim_seed = ids.claim_seed;
 
     // Build the 3 role candidates + V2 proofs for a `(target_height, seed)` under a
@@ -507,7 +532,10 @@ fn build_all_gates_block_with(
         .collect();
 
     // Per-role assigned puzzle solutions.
-    let profile = default_profile();
+    let profile = match node_gates {
+        Some(g) => crate::poawx_puzzle::profile_with_bits(g.puzzle_anchor_bits as u8),
+        None => default_profile(),
+    };
     let mut sols = Vec::with_capacity(3);
     for role in [
         ROLE_COMPUTE_CONTRIBUTOR,
@@ -621,11 +649,16 @@ fn build_all_gates_block_with(
     // REQUIRED. Solo: every role solver is the miner pkh; the assignment pubkey is
     // the miner compressed key (bound into the digests, not cross-checked). Penalty
     // status = Clean (a non-slashed miner is eligible for high-trust roles).
-    let role_ticket_proofs = if crate::poawx_ticket::tickets_active(height) {
+    let tickets_on = node_gates
+        .map(|g| g.tickets_active)
+        .unwrap_or_else(|| crate::poawx_ticket::tickets_active(height));
+    let role_ticket_proofs = if tickets_on {
         let mut apk = [0u8; 33];
         apk.copy_from_slice(worker_pubkey_bytes);
         // Fix B/C: grind to the EFFECTIVE (floored) bits and bind to prev_hash.
-        let sybil_bits = crate::poawx_ticket::effective_sybil_bits();
+        let sybil_bits = node_gates
+            .map(|g| g.effective_sybil_bits)
+            .unwrap_or_else(|| crate::poawx_ticket::effective_sybil_bits());
         let epoch = height;
         let expiry = height + 100_000;
         let mk_ticket =

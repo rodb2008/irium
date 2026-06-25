@@ -661,6 +661,18 @@ struct BlockTemplate {
     bits: String,
     time: u32,
     txs: Vec<TemplateTx>,
+    #[serde(default)]
+    poawx_hidden_precommit_active: Option<bool>,
+    #[serde(default)]
+    poawx_tickets_active: Option<bool>,
+    #[serde(default)]
+    poawx_multisource_seed_active: Option<bool>,
+    #[serde(default)]
+    poawx_penalty_state_active: Option<bool>,
+    #[serde(default)]
+    poawx_puzzle_anchor_bits: Option<u32>,
+    #[serde(default)]
+    poawx_effective_sybil_bits: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -3440,9 +3452,32 @@ fn run_poawx_solo() -> Result<(), String> {
             }
         };
 
+        // Gate flags from the node template (authoritative). When the node provides
+        // them, build per the node; otherwise (older node) fall back to env.
+        let node_gates = match (
+            tmpl.poawx_hidden_precommit_active,
+            tmpl.poawx_tickets_active,
+            tmpl.poawx_multisource_seed_active,
+            tmpl.poawx_penalty_state_active,
+            tmpl.poawx_puzzle_anchor_bits,
+            tmpl.poawx_effective_sybil_bits,
+        ) {
+            (Some(hp), Some(tk), Some(ms), Some(pn), Some(pb), Some(sb)) => {
+                Some(irium_node_rs::poawx_mining_harness::NodeGateFlags {
+                    hidden_precommit_active: hp,
+                    tickets_active: tk,
+                    multisource_seed_active: ms,
+                    penalty_state_active: pn,
+                    puzzle_anchor_bits: pb,
+                    effective_sybil_bits: sb,
+                })
+            }
+            _ => None,
+        };
+
         let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block_with_parent_and_dominance(
             &secret, net, height, prev_hash, parent_prev_hash, bits, tmpl.time, diff,
-            parent_seed_components, &dominance,
+            parent_seed_components, &dominance, node_gates.as_ref(),
         ) {
             Ok(p) => p,
             Err(e) => {

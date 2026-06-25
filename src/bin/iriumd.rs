@@ -1594,6 +1594,20 @@ struct BlockTemplateResponse {
     poawx_pending_receipts: Vec<PoawxPendingReceipt>,
     #[serde(default)]
     receipts_root: String,
+    // PoAW-X gate-activation flags for `height` (authoritative for the miner so it
+    // builds exactly what this node validates; mainnet-hard-off => false/default).
+    #[serde(default)]
+    poawx_hidden_precommit_active: bool,
+    #[serde(default)]
+    poawx_tickets_active: bool,
+    #[serde(default)]
+    poawx_multisource_seed_active: bool,
+    #[serde(default)]
+    poawx_penalty_state_active: bool,
+    #[serde(default)]
+    poawx_puzzle_anchor_bits: u32,
+    #[serde(default)]
+    poawx_effective_sybil_bits: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -13756,6 +13770,13 @@ async fn get_block_template(
         poawx_mode: poawx_mode_str,
         poawx_pending_receipts: poawx_receipts_for_template,
         receipts_root: receipts_root_str,
+        poawx_hidden_precommit_active: irium_node_rs::chain::hidden_precommit_active(height),
+        poawx_tickets_active: irium_node_rs::poawx_ticket::tickets_active(height),
+        poawx_multisource_seed_active:
+            irium_node_rs::poawx_committed_admission::multisource_seed_active(height),
+        poawx_penalty_state_active: irium_node_rs::poawx_penalty::penalty_state_active(height),
+        poawx_puzzle_anchor_bits: irium_node_rs::poawx_puzzle::default_profile().anchor_bits as u32,
+        poawx_effective_sybil_bits: irium_node_rs::poawx_ticket::effective_sybil_bits(),
     }))
 }
 

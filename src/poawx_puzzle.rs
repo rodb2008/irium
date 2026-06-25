@@ -132,6 +132,15 @@ pub fn default_profile() -> PuzzleDifficultyProfile {
     p.clamped()
 }
 
+/// Like [`default_profile`] but with an explicit anchor-bits value (clamped), for
+/// callers that receive the bits authoritatively (e.g. from the node block template)
+/// instead of reading `IRIUM_POAWX_PUZZLE_BITS`. Mainnet-hard-off unchanged.
+pub fn profile_with_bits(anchor_bits: u8) -> PuzzleDifficultyProfile {
+    let mut p = PuzzleDifficultyProfile::default();
+    p.anchor_bits = anchor_bits;
+    p.clamped()
+}
+
 /// Deterministic mode selection for a candidate/role. Domain-separated; no
 /// hardware identity. Changes if seed/height/role/miner/ticket/assignment change.
 #[allow(clippy::too_many_arguments)]

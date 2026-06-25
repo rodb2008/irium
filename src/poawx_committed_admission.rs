@@ -337,7 +337,27 @@ pub fn resolve_epoch_seed_parts(
     finality_sig_digest: [u8; 32],
     precommit_digest: [u8; 32],
 ) -> [u8; 32] {
-    if !multisource_seed_active(target_height) {
+    resolve_epoch_seed_parts_with(
+        multisource_seed_active(target_height),
+        target_height,
+        base,
+        finality_sig_digest,
+        precommit_digest,
+    )
+}
+
+/// Like [`resolve_epoch_seed_parts`] but with the multi-source gate state supplied
+/// explicitly (e.g. by the node's block template), so a standalone miner uses the
+/// node-authoritative flag instead of its own env. Mainnet-hard-off semantics
+/// unchanged (the node computes the flag from its own gates).
+pub fn resolve_epoch_seed_parts_with(
+    multisource_active: bool,
+    target_height: u64,
+    base: [u8; 32],
+    finality_sig_digest: [u8; 32],
+    precommit_digest: [u8; 32],
+) -> [u8; 32] {
+    if !multisource_active {
         return base;
     }
     assignment_seed_v2(

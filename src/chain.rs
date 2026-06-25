@@ -10217,6 +10217,137 @@ mod tests {
     }
 
     #[test]
+    fn miner_uses_node_gate_flags_over_local_env() {
+        // Option A regression for rodb2008\'s "missing precommit_root": the harness must
+        // build per the NODE-supplied gate flags, not its own env. Here the LOCAL env has
+        // hidden-precommit / tickets / multisource / penalty OFF, but node flags say ON ->
+        // the block must still carry precommit_root, the hidden-precommit reveal, and
+        // ticket proofs. The inverse (node flags OFF) must omit precommit_root with the
+        // SAME local env, proving the FLAG (not env) drives the build.
+        use crate::poawx_dominance::PersistentDominance;
+        use crate::poawx_mining_harness::{
+            build_solo_poawx_block_with_parent_and_dominance, NodeGateFlags,
+        };
+        let _g = chain_poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let gates = [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1"),
+            ("IRIUM_POAWX_PUZZLE_BITS", "1"),
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_WINDOW", "2016"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK", "2"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+            ("IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FRAUD_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_ADAPTIVE_MODE_ACTIVATION_HEIGHT", "1"),
+        ];
+        for (k, v) in gates {
+            std::env::set_var(k, v);
+        }
+        // The four gates the node will override are OFF locally.
+        for k in [
+            "IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PENALTY_STATE_ACTIVATION_HEIGHT",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let net = crate::activation::network_id_byte();
+        let secret = [0x11u8; 32];
+        let dom = PersistentDominance::from_env();
+
+        // Sanity: with the local env, hidden-precommit is OFF.
+        assert!(
+            !crate::chain::hidden_precommit_active(1),
+            "local env: hidden-precommit OFF"
+        );
+
+        // Node flags ON -> block built WITH precommit_root despite local env OFF.
+        let on = NodeGateFlags {
+            hidden_precommit_active: true,
+            tickets_active: true,
+            multisource_seed_active: true,
+            penalty_state_active: true,
+            puzzle_anchor_bits: 1,
+            effective_sybil_bits: 1,
+        };
+        let proof = build_solo_poawx_block_with_parent_and_dominance(
+            &secret, net, 1, genesis_hash, None, 0x207fffff,
+            genesis.header.time + 1, 1, ([0u8; 32], [0u8; 32]), &dom, Some(&on),
+        )
+        .expect("build with node flags ON");
+        let ext = proof.block.poawx_receipts.as_ref().unwrap()[0]
+            .phase20_ext
+            .as_ref()
+            .unwrap();
+        assert!(
+            ext.precommit_root.is_some(),
+            "node ON => precommit_root built despite local env OFF"
+        );
+        assert!(
+            ext.compute_claim.commitment_hash.is_some(),
+            "node ON => hidden-precommit reveal present"
+        );
+        assert!(
+            ext.role_ticket_proofs.is_some(),
+            "node ON => ticket proofs present"
+        );
+
+        // Node flags OFF -> no precommit_root (flag, not env, drives it).
+        let off = NodeGateFlags {
+            hidden_precommit_active: false,
+            tickets_active: false,
+            multisource_seed_active: false,
+            penalty_state_active: false,
+            puzzle_anchor_bits: 1,
+            effective_sybil_bits: 0,
+        };
+        let proof_off = build_solo_poawx_block_with_parent_and_dominance(
+            &secret, net, 1, genesis_hash, None, 0x207fffff,
+            genesis.header.time + 1, 1, ([0u8; 32], [0u8; 32]), &dom, Some(&off),
+        )
+        .expect("build with node flags OFF");
+        let ext_off = proof_off.block.poawx_receipts.as_ref().unwrap()[0]
+            .phase20_ext
+            .as_ref()
+            .unwrap();
+        assert!(
+            ext_off.precommit_root.is_none(),
+            "node OFF => no precommit_root"
+        );
+
+        for (k, _) in gates {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
     fn cross_miner_none_path_requires_real_dominance() {
         // Regression for the v0.1.2 stuck-at-height-1 devnet: when miner B extends a
         // block A mined, the standalone `None`/solo-replay path credits B for A's
@@ -10311,7 +10442,7 @@ mod tests {
 
         // B with the node's REAL dominance snapshot => correct weight => accepted.
         let okb = build_solo_poawx_block_with_parent_and_dominance(
-            &b, net, 2, h1, Some(genesis_hash), bits2, t2, 1, comp1, &st.dominance,
+            &b, net, 2, h1, Some(genesis_hash), bits2, t2, 1, comp1, &st.dominance, None,
         )
         .expect("build B block2 (real dominance)");
         st.connect_block(okb.block)
@@ -10481,7 +10612,7 @@ mod tests {
             let bits = st.target_for_height(h).bits;
             let time = genesis.header.time + h as u32;
             let proof = build_solo_poawx_block_with_parent_and_dominance(
-                secret, net, h, prev, parent_prev, bits, time, 1, parent_components, &st.dominance,
+                secret, net, h, prev, parent_prev, bits, time, 1, parent_components, &st.dominance, None,
             )
             .unwrap_or_else(|e| panic!("build H{h}: {e}"));
 
