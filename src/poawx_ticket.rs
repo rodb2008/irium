@@ -40,6 +40,7 @@ pub struct MinerWorkTicket {
 /// reuse across network/miner/epoch/assignment-key.
 pub fn compute_sybil_digest(
     network_id: u8,
+    prev_hash: &[u8; 32],
     miner_pkh: &[u8; 20],
     epoch: u64,
     assignment_public_key: &[u8; 33],
@@ -48,6 +49,10 @@ pub fn compute_sybil_digest(
     let mut h = Sha256::new();
     h.update(SYBIL_DOMAIN);
     h.update([network_id]);
+    // Fix B/C: bind the sybil work to the target block's prev_hash so a proof
+    // cannot be replayed across blocks AND a miner cannot pre-grind identities
+    // for future blocks (prev_hash is unknown until the previous block exists).
+    h.update(prev_hash);
     h.update(miner_pkh);
     h.update(epoch.to_le_bytes());
     h.update(assignment_public_key);
@@ -85,6 +90,26 @@ pub fn sybil_threshold_bits() -> u32 {
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|&b| b <= 32)
         .unwrap_or(0)
+}
+
+/// Fix C: minimum enforced per-identity sybil-work cost when tickets are REQUIRED
+/// on a non-mainnet network. Prevents costless keypair grinding for favorable VRF
+/// assignment scores even if `IRIUM_POAWX_TICKET_SYBIL_BITS` is misconfigured low.
+pub const MIN_TICKET_SYBIL_BITS: u32 = 8;
+
+/// Effective required sybil bits, used IDENTICALLY by the builder (to grind) and
+/// the validator (to check) so they never diverge. Mainnet hard-off (0). When
+/// tickets are required, the configured value is floored at `MIN_TICKET_SYBIL_BITS`.
+pub fn effective_sybil_bits() -> u32 {
+    if network_id_byte() == 0 {
+        return 0;
+    }
+    let configured = sybil_threshold_bits();
+    if tickets_required() {
+        configured.max(MIN_TICKET_SYBIL_BITS)
+    } else {
+        configured
+    }
 }
 
 impl MinerWorkTicket {
@@ -193,8 +218,11 @@ impl MinerWorkTicket {
     }
 
     fn recompute_sybil(&self) -> [u8; 32] {
+        // MinerWorkTicket is a per-epoch registration token (not block-bound), so it
+        // pins prev_hash to zero; the per-block binding lives in TicketProof.
         compute_sybil_digest(
             self.network_id,
+            &[0u8; 32],
             &self.miner_pkh,
             self.epoch,
             &self.assignment_public_key,
@@ -249,6 +277,7 @@ impl MinerWorkTicket {
 /// Test/dev helper: grind a sybil nonce meeting `bits` (small targets only).
 pub fn grind_sybil_nonce(
     network_id: u8,
+    prev_hash: &[u8; 32],
     miner_pkh: &[u8; 20],
     epoch: u64,
     assignment_public_key: &[u8; 33],
@@ -258,7 +287,7 @@ pub fn grind_sybil_nonce(
     let mut nonce = [0u8; 32];
     for i in 0..max_iters {
         nonce[0..8].copy_from_slice(&i.to_le_bytes());
-        let d = compute_sybil_digest(network_id, miner_pkh, epoch, assignment_public_key, &nonce);
+        let d = compute_sybil_digest(network_id, prev_hash, miner_pkh, epoch, assignment_public_key, &nonce);
         if meets_sybil_target(&d, bits) {
             return Some((nonce, d));
         }
@@ -369,6 +398,7 @@ impl TicketProof {
     pub fn new(
         network_id: u8,
         target_height: u64,
+        prev_hash: [u8; 32],
         role_id: u8,
         miner_pkh: [u8; 20],
         epoch: u64,
@@ -379,6 +409,7 @@ impl TicketProof {
     ) -> Self {
         let sybil_work_digest = compute_sybil_digest(
             network_id,
+            &prev_hash,
             &miner_pkh,
             epoch,
             &assignment_public_key,
@@ -476,10 +507,12 @@ impl TicketProof {
     /// Validate the proof against block context + the rewarded role's solver pkh.
     /// `require_sybil_bits` enforces the sybil cost when > 0; `penalty_enforced`
     /// blocks suspended/slashed identities from high-trust roles.
+    #[allow(clippy::too_many_arguments)]
     pub fn validate(
         &self,
         expected_network: u8,
         height: u64,
+        prev_hash: &[u8; 32],
         role_id: u8,
         role_solver_pkh: &[u8; 20],
         require_sybil_bits: u32,
@@ -505,6 +538,7 @@ impl TicketProof {
         }
         let recomputed_sybil = compute_sybil_digest(
             self.network_id,
+            prev_hash,
             &self.miner_pkh,
             self.epoch,
             &self.assignment_public_key,
@@ -550,7 +584,7 @@ mod tests {
         let pkh = [0xA1u8; 20];
         let apk = [0x02u8; 33];
         let epoch = 7u64;
-        let (nonce, digest) = grind_sybil_nonce(net, &pkh, epoch, &apk, 0, 1).unwrap();
+        let (nonce, digest) = grind_sybil_nonce(net, &[0u8; 32], &pkh, epoch, &apk, 0, 1).unwrap();
         MinerWorkTicket {
             version: TICKET_VERSION,
             network_id: net,
@@ -635,14 +669,14 @@ mod tests {
         let apk = [0x03u8; 33];
         let epoch = 9u64;
         // threshold disabled (bits=0): any nonce permitted.
-        let (n0, d0) = grind_sybil_nonce(net, &pkh, epoch, &apk, 0, 1).unwrap();
+        let (n0, d0) = grind_sybil_nonce(net, &[0u8; 32], &pkh, epoch, &apk, 0, 1).unwrap();
         assert!(meets_sybil_target(&d0, 0));
         // enabled with a tiny target: grind finds a valid nonce.
         let (n1, d1) =
-            grind_sybil_nonce(net, &pkh, epoch, &apk, 8, 200_000).expect("grind tiny target");
+            grind_sybil_nonce(net, &[0u8; 32], &pkh, epoch, &apk, 8, 200_000).expect("grind tiny target");
         assert!(meets_sybil_target(&d1, 8));
         assert_eq!(
-            compute_sybil_digest(net, &pkh, epoch, &apk, &n1),
+            compute_sybil_digest(net, &[0u8; 32], &pkh, epoch, &apk, &n1),
             d1,
             "binding"
         );
@@ -654,7 +688,7 @@ mod tests {
         t.epoch = epoch;
         t.assignment_public_key = apk;
         t.sybil_work_nonce = n0;
-        t.sybil_work_digest = compute_sybil_digest(net, &pkh, epoch, &apk, &n0);
+        t.sybil_work_digest = compute_sybil_digest(net, &[0u8; 32], &pkh, epoch, &apk, &n0);
         let res = t.validate(net, 50, 24); // require 24 bits — astronomically unlikely for d0
         assert!(
             res.is_err(),
@@ -694,6 +728,7 @@ mod tests {
         let p = TicketProof::new(
             net,
             5,
+            [0u8; 32],
             ROLE_VERIFY_CONTRIBUTOR,
             solver,
             2,
@@ -708,27 +743,28 @@ mod tests {
         assert_eq!(TicketProof::deserialize(&b).unwrap(), p);
         // valid against matching context.
         assert!(p
-            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .validate(net, 5, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
             .is_ok());
         // rejects: wrong net / height / role / solver / expired / mainnet.
         assert!(p
-            .validate(2, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .validate(2, 5, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
             .is_err());
         assert!(p
-            .validate(net, 6, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .validate(net, 6, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
             .is_err());
         assert!(p
-            .validate(net, 5, ROLE_SUPPORT_CONTRIBUTOR, &solver, 0, false)
+            .validate(net, 5, &[0u8; 32], ROLE_SUPPORT_CONTRIBUTOR, &solver, 0, false)
             .is_err());
         assert!(p
-            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &[0u8; 20], 0, false)
+            .validate(net, 5, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &[0u8; 20], 0, false)
             .is_err());
         assert!(p
-            .validate(0, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .validate(0, 5, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
             .is_err());
         let exp = TicketProof::new(
             net,
             5,
+            [0u8; 32],
             ROLE_VERIFY_CONTRIBUTOR,
             solver,
             2,
@@ -738,7 +774,7 @@ mod tests {
             0,
         );
         assert!(
-            exp.validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            exp.validate(net, 5, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
                 .is_err(),
             "expired"
         );
@@ -746,16 +782,17 @@ mod tests {
         let mut bad = p.clone();
         bad.sybil_work_nonce[0] ^= 1;
         assert!(bad
-            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .validate(net, 5, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
             .is_err());
         // insufficient sybil work at a high required threshold.
         assert!(p
-            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 28, false)
+            .validate(net, 5, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 28, false)
             .is_err());
         // penalty enforcement: suspended ineligible for high-trust role.
         let susp = TicketProof::new(
             net,
             5,
+            [0u8; 32],
             ROLE_VERIFY_CONTRIBUTOR,
             solver,
             2,
@@ -765,17 +802,18 @@ mod tests {
             crate::poawx_penalty::PenaltyStatus::SuspendedForEpoch.id(),
         );
         assert!(
-            susp.validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, true)
+            susp.validate(net, 5, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, true)
                 .is_err(),
             "suspended high-trust"
         );
         // ...but penalty not enforced -> accepts; and suspended COMPUTE (not high-trust) accepts.
         assert!(susp
-            .validate(net, 5, ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .validate(net, 5, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
             .is_ok());
         let susp_c = TicketProof::new(
             net,
             5,
+            [0u8; 32],
             crate::poawx::ROLE_COMPUTE_CONTRIBUTOR,
             solver,
             2,
@@ -789,6 +827,7 @@ mod tests {
                 .validate(
                     net,
                     5,
+                    &[0u8; 32],
                     crate::poawx::ROLE_COMPUTE_CONTRIBUTOR,
                     &solver,
                     0,

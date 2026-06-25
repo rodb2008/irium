@@ -441,10 +441,20 @@ impl PoawxRoleClaim {
                 }
                 let mut c = [0u8; 32];
                 c.copy_from_slice(&raw[off..off + 32]);
+                off += 32;
                 Some(c)
             }
             other => return Err(format!("role claim: bad commitment flag {}", other)),
         };
+        // Fix D: reject any trailing bytes (exact wire-length match) so two distinct
+        // encodings cannot deserialize to the same claim (consensus malleability).
+        if off != raw.len() {
+            return Err(format!(
+                "role claim: trailing bytes ({} parsed, {} given)",
+                off,
+                raw.len()
+            ));
+        }
         Ok(Self {
             role_id,
             lane_id,
@@ -2100,6 +2110,7 @@ mod tests {
             TicketProof::new(
                 1,
                 60,
+                [0u8; 32],
                 ROLE_COMPUTE_CONTRIBUTOR,
                 [0xC1u8; 20],
                 1,
@@ -2111,6 +2122,7 @@ mod tests {
             TicketProof::new(
                 1,
                 60,
+                [0u8; 32],
                 ROLE_VERIFY_CONTRIBUTOR,
                 [0xC2u8; 20],
                 1,
@@ -2122,6 +2134,7 @@ mod tests {
             TicketProof::new(
                 1,
                 60,
+                [0u8; 32],
                 ROLE_SUPPORT_CONTRIBUTOR,
                 [0xC3u8; 20],
                 1,
@@ -2681,6 +2694,7 @@ mod tests {
             TicketProof::new(
                 1,
                 60,
+                [0u8; 32],
                 ROLE_COMPUTE_CONTRIBUTOR,
                 [0xC1u8; 20],
                 1,
@@ -2692,6 +2706,7 @@ mod tests {
             TicketProof::new(
                 1,
                 60,
+                [0u8; 32],
                 ROLE_VERIFY_CONTRIBUTOR,
                 [0xC2u8; 20],
                 1,
@@ -2703,6 +2718,7 @@ mod tests {
             TicketProof::new(
                 1,
                 60,
+                [0u8; 32],
                 ROLE_SUPPORT_CONTRIBUTOR,
                 [0xC3u8; 20],
                 1,

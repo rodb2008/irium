@@ -290,6 +290,7 @@ pub fn build_devnet_all_gates_block(
         time,
         receipt_difficulty_bits,
         ([0u8; 32], [0u8; 32]),
+        None,
     )
 }
 
@@ -316,6 +317,7 @@ pub fn build_solo_poawx_block(
         time,
         receipt_difficulty_bits,
         ([0u8; 32], [0u8; 32]),
+        None,
     )
 }
 
@@ -345,6 +347,37 @@ pub fn build_solo_poawx_block_with_parent(
         time,
         receipt_difficulty_bits,
         parent_seed_components,
+        None,
+    )
+}
+
+/// Like [`build_solo_poawx_block_with_parent`] but uses a REAL dominance snapshot
+/// (the node's state through H-1) for candidate weights, so alternating / multi-miner
+/// blocks carry weights matching the node. Mainnet-hard-off.
+#[allow(clippy::too_many_arguments)]
+pub fn build_solo_poawx_block_with_parent_and_dominance(
+    miner_secret: &[u8; 32],
+    network_id: u8,
+    height: u64,
+    prev_hash: [u8; 32],
+    parent_prev_hash: Option<[u8; 32]>,
+    bits: u32,
+    time: u32,
+    receipt_difficulty_bits: u32,
+    parent_seed_components: ([u8; 32], [u8; 32]),
+    dominance: &PersistentDominance,
+) -> Result<AllGatesProof, String> {
+    build_all_gates_block_with(
+        &AllGatesIdentities::solo(miner_secret)?,
+        network_id,
+        height,
+        prev_hash,
+        parent_prev_hash,
+        bits,
+        time,
+        receipt_difficulty_bits,
+        parent_seed_components,
+        Some(dominance),
     )
 }
 
@@ -359,6 +392,7 @@ fn build_all_gates_block_with(
     time: u32,
     receipt_difficulty_bits: u32,
     parent_seed_components: ([u8; 32], [u8; 32]),
+    dominance_override: Option<&PersistentDominance>,
 ) -> Result<AllGatesProof, String> {
     guard_network(network_id)?;
     // Resolve the standard-header activation height into the process global the
@@ -451,8 +485,14 @@ fn build_all_gates_block_with(
         Ok(([pc, pv, ps], [cc, cv, csup], cs))
     };
 
-    // INCOMING set for THIS block (height H, epoch seed, weights at H).
-    let dom_in = dom_at(height);
+    // INCOMING set for THIS block (height H, epoch seed, weights at H). A3: with a
+    // real dominance snapshot (the node state through H-1) the candidate weights are
+    // correct regardless of who mined prior blocks; without one, fall back to the
+    // solo replay (single-miner back-compat).
+    let dom_in = match dominance_override {
+        Some(d) => d.clone(),
+        None => dom_at(height),
+    };
     let (in_proofs, in_cands, cs) = build_roles(height, epoch_seed, &dom_in)?;
     let dw_in = |pkh: &[u8; 20]| dom_in.weight(DOMINANCE_BASE_WORK_SCORE, pkh, height);
 
@@ -511,22 +551,18 @@ fn build_all_gates_block_with(
     ));
     fproof.sort_canonical();
 
-    // OUTGOING committed-admission commitment for H+1. The committed set is EXACTLY
-    // what block H+1 will present: candidates for `(H+1, seed = this block's
-    // prev_hash)` — i.e. H+1's epoch seed — with weights at H+1. Self-consistent:
-    // commit_height = H, freeze seed = prev_hash (== `admission_epoch_seed` of H+1).
-    // Incoming committed admission is graced at the activation height (H1).
-    let dom_out = dom_at(height + 1);
-    // Gap-extension: hidden-precommit root committing H+1 role-claim leaves (the SAME
-    // leaves H+1 will reveal, via the deterministic derivation above). Gate off =>
-    // None (byte-identical). Used both as the ext field and as the precommit
-    // component of H+1 frozen epoch seed.
+    // Fix A1: hidden-precommit root committing THIS block's OWN role-claim leaves
+    // (the exact leaves H reveals via `derive_claim_secret(claim_seed, height, role)`),
+    // so any miner can extend any block — no dependency on the previous block's miner.
+    // Binding: the root is in the receipt -> merkle -> header -> PoW; each claim's
+    // commitment_hash binds its secret/nonce. The NEXT block's multi-source seed reads
+    // THIS block's precommit_root from the block itself (miner-independent).
     let precommit_root = if hp_active {
         let leaf = |role: u8, solver: [u8; 20]| -> [u8; 32] {
-            let s = derive_claim_secret(&claim_seed, height + 1, role);
-            let n = derive_claim_nonce(&claim_seed, height + 1, role);
+            let s = derive_claim_secret(&claim_seed, height, role);
+            let n = derive_claim_nonce(&claim_seed, height, role);
             let c = crate::poawx::role_precommit_commitment(&s, &n);
-            crate::poawx::role_precommit_leaf(net, height + 1, role, &solver, &c)
+            crate::poawx::role_precommit_leaf(net, height, role, &solver, &c)
         };
         let leaves = [
             leaf(ROLE_COMPUTE_CONTRIBUTOR, compute_solver),
@@ -537,17 +573,10 @@ fn build_all_gates_block_with(
     } else {
         None
     };
-    // Gap 3: freeze H+1 epoch seed. Base = this block prev_hash (grandparent of H+1);
-    // under the multi-source gate it mixes THIS block finality digest + precommit.
-    // Gate off => legacy prev_hash, byte-identical.
-    let out_seed = crate::poawx_committed_admission::resolve_epoch_seed_parts(
-        height + 1,
-        prev_hash,
-        fproof.digest(),
-        precommit_root.unwrap_or([0u8; 32]),
-    );
-    let (_out_proofs, _out_cands, cs_next) = build_roles(height + 1, out_seed, &dom_out)?;
-    let commitment = AdmissionCommitmentV1::from_candidate_set(&cs_next, height);
+    // Fix A2: committed-admission self-commit — block H commits its OWN candidate set
+    // (target H, commit_height H), NOT H+1's. Removes the cross-block / cross-miner
+    // dependency that prevented a different miner from extending the chain.
+    let commitment = AdmissionCommitmentV1::from_candidate_set(&cs, height);
 
     let claim = |role: u8, solver: [u8; 20]| -> PoawxRoleClaim {
         let lane = crate::poawx::assign_lane(net, height, &prev_hash, role, 0);
@@ -595,14 +624,15 @@ fn build_all_gates_block_with(
     let role_ticket_proofs = if crate::poawx_ticket::tickets_active(height) {
         let mut apk = [0u8; 33];
         apk.copy_from_slice(worker_pubkey_bytes);
-        let sybil_bits = crate::poawx_ticket::sybil_threshold_bits();
+        // Fix B/C: grind to the EFFECTIVE (floored) bits and bind to prev_hash.
+        let sybil_bits = crate::poawx_ticket::effective_sybil_bits();
         let epoch = height;
         let expiry = height + 100_000;
         let mk_ticket =
             |role: u8, solver: [u8; 20]| -> Result<crate::poawx_ticket::TicketProof, String> {
                 let nonce = if sybil_bits > 0 {
                     crate::poawx_ticket::grind_sybil_nonce(
-                        net, &solver, epoch, &apk, sybil_bits, 50_000_000,
+                        net, &prev_hash, &solver, epoch, &apk, sybil_bits, 50_000_000,
                     )
                     .map(|(n, _d)| n)
                     .ok_or_else(|| {
@@ -614,6 +644,7 @@ fn build_all_gates_block_with(
                 Ok(crate::poawx_ticket::TicketProof::new(
                     net,
                     height,
+                    prev_hash,
                     role,
                     solver,
                     epoch,

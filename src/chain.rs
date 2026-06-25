@@ -1381,89 +1381,52 @@ impl ChainState {
         previous: Option<&Block>,
         height: u64,
     ) -> Result<(), String> {
-        use crate::poawx_committed_admission::{
-            committed_admission_activation_height, AdmissionCommitmentV1,
-        };
         let net = crate::activation::network_id_byte();
         let receipts = match &block.poawx_receipts {
             Some(r) => r,
             None => return Ok(()),
         };
-        // (1) Outgoing: if this block carries a commitment (for H+1), it must be
-        // self-consistent: target = H+1, commit_height = H, freeze seed = this
-        // block's prev_hash.
-        for r in receipts {
-            if let Some(ext) = &r.phase20_ext {
-                if let Some(ca) = &ext.committed_admission {
-                    ca.validate(net, height + 1)?;
-                    if ca.commit_height != height {
-                        return Err("phase22a: own commitment wrong commit height".to_string());
-                    }
-                    // Gap 3: the outgoing commitment freezes H+1's epoch seed. Legacy
-                    // = this block's prev_hash (grandparent of H+1); multi-source mixes
-                    // THIS block's finality/precommit. Gate off => byte-identical.
-                    let expected_out = crate::poawx_committed_admission::expected_epoch_seed(
-                        height + 1,
-                        block.header.hash_for_height(height),
-                        Some(block),
-                    );
-                    if ca.seed != expected_out {
-                        return Err("phase22a: own commitment wrong freeze seed".to_string());
-                    }
-                }
-            }
+        // The activation-height block is graced; from the next height on every block
+        // self-commits.
+        if matches!(
+            crate::poawx_committed_admission::committed_admission_activation_height(),
+            Some(a) if a == height
+        ) {
+            return Ok(());
         }
-        // (2) Incoming: H's candidate set must match the parent's committed root
-        // for target H.
-        let is_activation =
-            matches!(committed_admission_activation_height(), Some(a) if a == height);
-        let parent_commit: Option<AdmissionCommitmentV1> = previous.and_then(|p| {
-            p.poawx_receipts.as_ref().and_then(|rs| {
-                rs.iter().find_map(|r| {
-                    r.phase20_ext
-                        .as_ref()
-                        .and_then(|e| e.committed_admission.clone())
-                        .filter(|ca| ca.target_height == height)
-                })
-            })
-        });
-        match parent_commit {
-            Some(pc) => {
-                pc.validate(net, height)?;
-                // Gap 3: the parent's commitment must carry H's epoch seed. Legacy =
-                // grandparent hash; multi-source mixes the parent's finality/precommit.
-                // Same resolver as the candidate-set gate, so they never diverge.
-                let expected_in = crate::poawx_committed_admission::expected_epoch_seed(
-                    height,
-                    block.header.prev_hash,
-                    previous,
-                );
-                if pc.seed != expected_in {
-                    return Err("phase22a: parent commitment seed != grandparent hash".to_string());
-                }
-                for r in receipts {
-                    let ext = match &r.phase20_ext {
-                        Some(e) => e,
-                        None => continue,
-                    };
-                    let cs = ext.candidate_set.as_ref().ok_or_else(|| {
-                        "phase22a: committed admission requires a candidate set".to_string()
-                    })?;
-                    if !pc.matches_candidate_set(cs) {
-                        return Err(
-                            "phase22a: candidate set does not match committed admission root"
-                                .to_string(),
-                        );
-                    }
-                }
+        // Fix A2: committed-admission self-commit. Each receipt must carry a commitment
+        // for THIS block (target H, commit_height H) whose freeze seed equals the same
+        // multi-source epoch seed the candidate-set gate uses, and whose root matches
+        // THIS block's own candidate set. No parent / next-block dependency, so any
+        // miner can extend any block.
+        let expected_seed = crate::poawx_committed_admission::expected_epoch_seed(
+            height,
+            block.header.prev_hash,
+            previous,
+        );
+        for r in receipts {
+            let ext = match &r.phase20_ext {
+                Some(e) => e,
+                None => continue,
+            };
+            let ca = ext
+                .committed_admission
+                .as_ref()
+                .ok_or_else(|| "phase22a: missing own committed admission".to_string())?;
+            ca.validate(net, height)?;
+            if ca.commit_height != height {
+                return Err("phase22a: own commitment wrong commit height".to_string());
             }
-            None => {
-                if !is_activation {
-                    return Err(
-                        "phase22a: missing parent committed admission for height".to_string()
-                    );
-                }
-                // activation-height grace: the parent predates the gate.
+            if ca.seed != expected_seed {
+                return Err("phase22a: own commitment wrong freeze seed".to_string());
+            }
+            let cs = ext.candidate_set.as_ref().ok_or_else(|| {
+                "phase22a: committed admission requires a candidate set".to_string()
+            })?;
+            if !ca.matches_candidate_set(cs) {
+                return Err(
+                    "phase22a: candidate set does not match committed admission root".to_string(),
+                );
             }
         }
         Ok(())
@@ -3154,7 +3117,7 @@ fn validate_phase20_production_block(
     // suspended/slashed identities are blocked from high-trust roles. When the gate
     // is off, the ext's optional ticket proofs are ignored (old behavior unchanged).
     if crate::poawx_ticket::tickets_enforced(height) {
-        validate_phase20_ticket_proofs(receipts, height, network_id)?;
+        validate_phase20_ticket_proofs(receipts, height, prev_hash, network_id)?;
     }
     Ok(())
 }
@@ -3165,9 +3128,11 @@ fn validate_phase20_production_block(
 fn validate_phase20_ticket_proofs(
     receipts: &[crate::poawx::PoawxBlockReceipt],
     height: u64,
+    prev_hash: &[u8; 32],
     network_id: u8,
 ) -> Result<(), String> {
-    let require_sybil = crate::poawx_ticket::sybil_threshold_bits();
+    // Fix B/C: bind to prev_hash + enforce the floored minimum sybil cost.
+    let require_sybil = crate::poawx_ticket::effective_sybil_bits();
     let penalty_enforced = crate::poawx_penalty::penalty_state_enforced(height);
     for (i, r) in receipts.iter().enumerate() {
         let ext = r.phase20_ext.as_ref().ok_or_else(|| {
@@ -3201,6 +3166,7 @@ fn validate_phase20_ticket_proofs(
                 .validate(
                     network_id,
                     height,
+                    prev_hash,
                     *role_id,
                     solver,
                     require_sybil,
@@ -3226,13 +3192,20 @@ fn validate_hidden_precommit(
     receipts: &[crate::poawx::PoawxBlockReceipt],
     height: u64,
     network_id: u8,
-    previous: Option<&Block>,
+    _previous: Option<&Block>,
 ) -> Result<(), String> {
-    let act_h = crate::activation::poawx_hidden_precommit_activation_height()
-        .ok_or_else(|| "hidden precommit: active but no activation height".to_string())?;
-    // Reconstruct this block's role-claim leaves (validating each commitment) and
-    // require every receipt to carry a precommit_root for the next height.
-    let mut leaves: Vec<[u8; 32]> = Vec::new();
+    // The activation-height block is graced (a single special block); from the next
+    // height on, every block self-commits.
+    if let Some(act_h) = crate::activation::poawx_hidden_precommit_activation_height() {
+        if height == act_h {
+            return Ok(());
+        }
+    }
+    // Fix A1: self-contained. Each receipt's precommit_root must equal the sorted root
+    // of THAT receipt's OWN revealed role-claim leaves. No cross-block / cross-miner
+    // dependency, so any valid miner can extend any valid block. The root is bound into
+    // the receipt -> merkle root -> header -> PoW (a miner cannot alter its claims after
+    // mining); each claim's commitment_hash binds its secret/nonce.
     for (i, r) in receipts.iter().enumerate() {
         let ext = r.phase20_ext.as_ref().ok_or_else(|| {
             format!(
@@ -3240,49 +3213,28 @@ fn validate_hidden_precommit(
                 i, height
             )
         })?;
-        if ext.precommit_root.is_none() {
-            return Err(format!(
-                "hidden precommit: receipt[{}] missing precommit_root for next height at {}",
+        let own_root = ext.precommit_root.ok_or_else(|| {
+            format!(
+                "hidden precommit: receipt[{}] missing precommit_root at height {}",
                 i, height
-            ));
-        }
+            )
+        })?;
+        let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(3);
         for claim in [&ext.compute_claim, &ext.verify_claim, &ext.support_claim] {
             leaves.push(crate::poawx::role_precommit_leaf_for_claim(
                 claim, network_id, height,
             )?);
         }
-    }
-    let computed_root = crate::poawx::role_precommit_root(&leaves);
-    // Grace: the single transition block at the activation height has a parent that
-    // predates activation (no committed root), so the parent-root match is skipped.
-    if height == act_h {
-        return Ok(());
-    }
-    let parent = previous.ok_or_else(|| {
-        format!(
-            "hidden precommit: no parent block to load committed root at height {}",
-            height
-        )
-    })?;
-    let parent_root = parent
-        .poawx_receipts
-        .as_ref()
-        .and_then(|v| v.first())
-        .and_then(|r| r.phase20_ext.as_ref())
-        .and_then(|e| e.precommit_root)
-        .ok_or_else(|| {
-            format!(
-                "hidden precommit: parent block has no precommit_root at height {}",
+        let computed_root = crate::poawx::role_precommit_root(&leaves);
+        if computed_root != own_root {
+            return Err(format!(
+                "hidden precommit: receipt[{}] role-claim leaves root {} != own committed root {} at height {}",
+                i,
+                hex::encode(computed_root),
+                hex::encode(own_root),
                 height
-            )
-        })?;
-    if computed_root != parent_root {
-        return Err(format!(
-            "hidden precommit: role-claim leaves root {} != parent committed root {} at height {}",
-            hex::encode(computed_root),
-            hex::encode(parent_root),
-            height
-        ));
+            ));
+        }
     }
     Ok(())
 }
@@ -8958,7 +8910,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn phase24k_native_pow_all_gates_validators() {
         // Phase 24K Stage 1: build ONE PoAW-X block at height 1 over the real
         // locked genesis, carrying EVERY gate section, MINE it with Irium's
@@ -9290,20 +9241,9 @@ mod tests {
             .is_err(),
             "wrong role solver rejects"
         );
-        // E17: wrong committed-admission freeze seed.
-        assert!(
-            st.validate_block_committed_admission(
-                &neg(&|e| {
-                    let mut c = commitment.clone();
-                    c.seed = [0xABu8; 32];
-                    e.committed_admission = Some(c);
-                }),
-                Some(&genesis),
-                height
-            )
-            .is_err(),
-            "wrong committed-admission seed rejects"
-        );
+        // E17: committed-admission self-commit (wrong-seed rejection) is covered by
+        // phase22a_committed_admission_enforcement at a non-activation height; this
+        // block is at the activation height (graced under self-commit).
 
         cache.clear();
         for k in [
@@ -10196,7 +10136,7 @@ mod tests {
         {
             let mut rs = base_receipts.clone();
             rs[0].phase20_ext.as_mut().unwrap().role_ticket_proofs = None;
-            let err = validate_phase20_ticket_proofs(&rs, 4, net)
+            let err = validate_phase20_ticket_proofs(&rs, 4, &prev, net)
                 .expect_err("missing ticket proofs must be rejected");
             assert!(err.contains("ticket"), "expected ticket error, got: {err}");
         }
@@ -10213,7 +10153,7 @@ mod tests {
                 .as_mut()
                 .unwrap()[1]
                 .penalty_status = PenaltyStatus::Slashed.id();
-            let err = validate_phase20_ticket_proofs(&rs, 4, net)
+            let err = validate_phase20_ticket_proofs(&rs, 4, &prev, net)
                 .expect_err("a slashed identity must be ineligible for a high-trust role");
             let lc = err.to_lowercase();
             assert!(
@@ -10268,6 +10208,170 @@ mod tests {
         ] {
             std::env::remove_var(k);
         }
+    }
+
+    #[test]
+    fn two_miner_alternating_reward_system() {
+        // ACCEPTANCE GATE for the multi-miner fix: two DIFFERENT miner identities
+        // alternate blocks (A,B,A,B,...) and every gate accepts, then the whole
+        // reward system is verified end-to-end across both miners.
+        use crate::poawx_committed_admission::{admission_epoch_seed, expected_epoch_seed, seed_components_from_block};
+        use crate::poawx_mining_harness::build_solo_poawx_block_with_parent_and_dominance;
+        use crate::poawx_adaptive::AdaptiveMode;
+        let _g = chain_poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let gates = [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1"),
+            ("IRIUM_POAWX_PUZZLE_BITS", "1"),
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+            ("IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TICKETS_REQUIRED", "1"),
+            ("IRIUM_POAWX_TICKET_SYBIL_BITS", "1"),
+            ("IRIUM_POAWX_PENALTY_STATE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PENALTY_STATE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FRAUD_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_ADAPTIVE_MODE_ACTIVATION_HEIGHT", "1"),
+        ];
+        for (k, v) in gates {
+            std::env::set_var(k, v);
+        }
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let secret_a = [0x11u8; 32];
+        let secret_b = [0x22u8; 32];
+
+        let n_blocks = 6u64;
+        let mut prev = genesis_hash;
+        let mut parent_prev: Option<[u8; 32]> = None;
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut miner_of: Vec<[u8; 20]> = Vec::new();
+        for h in 1..=n_blocks {
+            // Alternate: odd -> A, even -> B. So B always extends A's block and vice
+            // versa (the cross-miner case the fix enables).
+            let secret = if h % 2 == 1 { &secret_a } else { &secret_b };
+            let parent_components = seed_components_from_block(st.chain.last());
+            let bits = st.target_for_height(h).bits;
+            let time = genesis.header.time + h as u32;
+            let proof = build_solo_poawx_block_with_parent_and_dominance(
+                secret, net, h, prev, parent_prev, bits, time, 1, parent_components, &st.dominance,
+            )
+            .unwrap_or_else(|e| panic!("build H{h}: {e}"));
+
+            let ext = proof.block.poawx_receipts.as_ref().unwrap()[0]
+                .phase20_ext
+                .as_ref()
+                .unwrap();
+            let cs = ext.candidate_set.as_ref().unwrap();
+            // CHECK g (multisource): the candidate-set seed equals the multi-source
+            // resolver (which reads the PARENT block's components, regardless of who
+            // mined it) and, at H>=2, differs from the bare grandparent hash.
+            let exp = expected_epoch_seed(h, prev, st.chain.last());
+            assert_eq!(cs.seed, exp, "H{h}: cross-miner multi-source seed");
+            if h >= 2 {
+                assert_ne!(
+                    cs.seed,
+                    admission_epoch_seed(parent_prev, prev),
+                    "H{h}: multi-source seed mixes the parent's components"
+                );
+                let (pfin, _) = seed_components_from_block(st.chain.last());
+                assert_ne!(pfin, [0u8; 32], "H{h}: parent carries a finality digest");
+            }
+            // CHECK b (finality) + d (tickets): present on EVERY block from BOTH miners.
+            assert!(ext.finality_proof.is_some(), "H{h}: finality proof present");
+            let tps = ext.role_ticket_proofs.as_ref().expect("H{h}: ticket proofs present");
+            let miner_pkh = ext.role_reward.compute_contributor_pkh;
+            for tp in tps {
+                assert_eq!(tp.miner_pkh, miner_pkh, "H{h}: ticket bound to this block's miner");
+            }
+
+            // CHECK a (split): coinbase pays 55/22/13/10 to THIS block's miner.
+            let amts = crate::poawx::multi_role_amounts(block_reward(h));
+            let outs = &proof.block.transactions[0].outputs;
+            let expect_script = crate::tx::p2pkh_script(&miner_pkh);
+            for (idx, amt) in amts.iter().enumerate() {
+                assert_eq!(outs[idx + 1].value, *amt, "H{h}: role {idx} amount");
+                assert_eq!(outs[idx + 1].script_pubkey, expect_script, "H{h}: role {idx} pays this miner");
+            }
+            assert_eq!(amts.iter().sum::<u64>(), block_reward(h), "H{h}: split sums to reward");
+
+            let before = st.height;
+            let blk_prev = prev;
+            let blk_hash = proof.block_hash;
+            st.connect_block(proof.block.clone())
+                .unwrap_or_else(|e| panic!("connect_block H{h} (miner {}) failed: {e}", if h % 2 == 1 { "A" } else { "B" }));
+            assert_eq!(st.height, before + 1, "H{h}: tip advanced");
+            blocks.push(proof.block);
+            miner_of.push(miner_pkh);
+            parent_prev = Some(blk_prev);
+            prev = blk_hash;
+        }
+        assert_eq!(st.tip_height(), n_blocks, "two miners alternated the full chain");
+
+        let pkh_a = miner_of[0];
+        let pkh_b = miner_of[1];
+        assert_ne!(pkh_a, pkh_b, "the two miners are distinct identities");
+
+        // CHECK c (anti-domination tracks each miner separately): 3 blocks each over 6
+        // => ~500 permille each, neither dominating.
+        let share_a = st.dominance.recent_reward_share_permille(&pkh_a, n_blocks);
+        let share_b = st.dominance.recent_reward_share_permille(&pkh_b, n_blocks);
+        assert!((300..=700).contains(&share_a), "A share {share_a} permille balanced");
+        assert!((300..=700).contains(&share_b), "B share {share_b} permille balanced");
+
+        // CHECK f (adaptive): two miners => max reward concentration < 700 permille =>
+        // NOT Defense (the single-miner posture). With 2 < 3 participants it lands in
+        // Caution; the point is the concentration-driven Defense is avoided.
+        assert_ne!(st.adaptive_mode(), AdaptiveMode::Defense, "two miners avoid concentration Defense");
+
+        // CHECK e (fraud): a finality equivocation by EITHER miner is detected and
+        // attributed to that miner's pkh.
+        use crate::poawx_finality::{FinalityVoteType, FinalityVoteV1};
+        use k256::ecdsa::SigningKey;
+        let check_equivocation = |secret: &[u8; 32], expect_pkh: [u8; 20], label: &str| {
+            let sk = SigningKey::from_bytes(secret.into()).expect("key");
+            let va = FinalityVoteV1::signed(&sk, net, 3, [0xAAu8; 32], [0u8; 32], 0, [0x11u8; 32], FinalityVoteType::Commit);
+            let vb = FinalityVoteV1::signed(&sk, net, 3, [0xBBu8; 32], [0u8; 32], 0, [0x11u8; 32], FinalityVoteType::Commit);
+            assert_eq!(va.member_pkh, expect_pkh, "{label}: vote pkh == miner pkh");
+            let fp = crate::poawx_challenge::FraudProofV1::finality_equivocation(net, [0x01u8; 20], va, vb);
+            let off = crate::poawx_challenge::verify_fraud_proof(&fp, net, st.tip_height())
+                .unwrap_or_else(|e| panic!("{label}: equivocation must verify: {e}"));
+            assert_eq!(off.offender_pkh, expect_pkh, "{label}: offender attributed to the miner");
+        };
+        check_equivocation(&secret_a, pkh_a, "miner A");
+        check_equivocation(&secret_b, pkh_b, "miner B");
+
+        for (k, _) in gates {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("IRIUM_NETWORK");
     }
 
     #[test]
@@ -11114,10 +11218,15 @@ mod tests {
         };
         let parent_hash = parent.header.hash_for_height(2);
 
-        // CHILD block H=3 carrying the matching candidate set.
-        let child = |set: Option<CandidateSet>| -> Block {
+        // Fix A2 self-commit: the block at H=3 carries its OWN committed admission
+        // (target H, commit_height H, freeze seed = the expected epoch seed, root =
+        // its own candidate set). No parent commitment is consulted.
+        let child = |set: Option<CandidateSet>,
+                     commit: Option<AdmissionCommitmentV1>|
+         -> Block {
             let mut ext = base_ext.clone();
             ext.candidate_set = set;
+            ext.committed_admission = commit;
             let mut r = make_test_receipt(target, &sk, parent_hash, 1);
             r.phase20_ext = Some(ext);
             Block {
@@ -11136,102 +11245,65 @@ mod tests {
         };
 
         let st = base_chain(None);
-        // exact committed set => accept.
+        let own_commit = AdmissionCommitmentV1::from_candidate_set(&cs, target);
+        // own set + own matching commitment => accept.
         assert!(
-            st.validate_block_committed_admission(&child(Some(cs.clone())), Some(&parent), target)
-                .is_ok(),
-            "matching committed candidate set accepts"
+            st.validate_block_committed_admission(
+                &child(Some(cs.clone()), Some(own_commit.clone())),
+                Some(&parent),
+                target
+            )
+            .is_ok(),
+            "self-commit accepts: {:?}",
+            st.validate_block_committed_admission(
+                &child(Some(cs.clone()), Some(own_commit.clone())),
+                Some(&parent),
+                target
+            )
         );
         // mutated candidate set => root mismatch => reject.
         let mut mutated = cs.clone();
         mutated.candidates[0].dominance_weight ^= 1;
         assert!(
-            st.validate_block_committed_admission(&child(Some(mutated)), Some(&parent), target)
-                .is_err(),
+            st.validate_block_committed_admission(
+                &child(Some(mutated), Some(own_commit.clone())),
+                Some(&parent),
+                target
+            )
+            .is_err(),
             "mutated set rejects (root mismatch)"
         );
         // missing candidate set => reject.
         assert!(
-            st.validate_block_committed_admission(&child(None), Some(&parent), target)
-                .is_err(),
-            "missing candidate set rejects"
-        );
-        // parent without a commitment (and not activation height) => reject.
-        let bare_parent = {
-            let mut r = make_test_receipt(2, &sk, grandparent, 1);
-            r.phase20_ext = Some(p20_ext(net, 2, &grandparent, 0, [0u8; 20]));
-            Block {
-                header: BlockHeader {
-                    version: 1,
-                    prev_hash: grandparent,
-                    merkle_root: [0u8; 32],
-                    time: 0,
-                    bits: 0x207fffff,
-                    nonce: 0,
-                },
-                transactions: vec![],
-                auxpow: None,
-                poawx_receipts: Some(vec![r]),
-            }
-        };
-        assert!(
             st.validate_block_committed_admission(
-                &child(Some(cs.clone())),
-                Some(&bare_parent),
+                &child(None, Some(own_commit.clone())),
+                Some(&parent),
                 target
             )
             .is_err(),
-            "missing parent commitment rejects (H>activation)"
+            "missing candidate set rejects"
         );
-        // activation-height grace: at H=2 a bare parent (H=1, pre-gate) is accepted.
-        let h2_block = {
-            let mut r = make_test_receipt(2, &sk, grandparent, 1);
-            r.phase20_ext = Some(p20_ext(net, 2, &grandparent, 0, [0u8; 20]));
-            Block {
-                header: BlockHeader {
-                    version: 1,
-                    prev_hash: grandparent,
-                    merkle_root: [0u8; 32],
-                    time: 0,
-                    bits: 0x207fffff,
-                    nonce: 0,
-                },
-                transactions: vec![],
-                auxpow: None,
-                poawx_receipts: Some(vec![r]),
-            }
-        };
+        // missing OWN commitment => reject.
         assert!(
-            st.validate_block_committed_admission(&h2_block, Some(&bare_parent), 2)
-                .is_ok(),
-            "activation-height grace accepts pre-gate parent"
+            st.validate_block_committed_admission(
+                &child(Some(cs.clone()), None),
+                Some(&parent),
+                target
+            )
+            .is_err(),
+            "missing own commitment rejects"
         );
-        // outgoing self-consistency: a block committing with the WRONG freeze seed rejects.
-        let bad_commit = {
-            let mut ext = p20_ext(net, 2, &grandparent, 0, [0u8; 20]);
-            // commit for target 3 but freeze seed != this block's prev_hash.
-            let mut bogus = cs.clone();
-            bogus.seed = [0x99u8; 32];
-            ext.committed_admission = Some(AdmissionCommitmentV1::from_candidate_set(&bogus, 2));
-            let mut r = make_test_receipt(2, &sk, grandparent, 1);
-            r.phase20_ext = Some(ext);
-            Block {
-                header: BlockHeader {
-                    version: 1,
-                    prev_hash: grandparent,
-                    merkle_root: [0u8; 32],
-                    time: 0,
-                    bits: 0x207fffff,
-                    nonce: 0,
-                },
-                transactions: vec![],
-                auxpow: None,
-                poawx_receipts: Some(vec![r]),
-            }
-        };
+        // own commitment with the WRONG freeze seed => reject.
+        let mut bogus = cs.clone();
+        bogus.seed = [0x99u8; 32];
+        let bad_commit = AdmissionCommitmentV1::from_candidate_set(&bogus, target);
         assert!(
-            st.validate_block_committed_admission(&bad_commit, Some(&bare_parent), 2)
-                .is_err(),
+            st.validate_block_committed_admission(
+                &child(Some(bogus), Some(bad_commit)),
+                Some(&parent),
+                target
+            )
+            .is_err(),
             "own commitment with wrong freeze seed rejects"
         );
 
@@ -12004,41 +12076,29 @@ mod tests {
             }
         };
         // ext role solvers are c/v/s = 0xC1/0xC2/0xC3 (see p20_ext).
+        // Fix B/C: tickets are bound to the block's prev_hash and must meet the
+        // effective (floored) sybil-work bits; grind valid nonces here.
         let tickets = |expiry: u64, verify_status: u8| {
+            let bits = crate::poawx_ticket::effective_sybil_bits();
+            let mk = |role: u8, solver: [u8; 20], penalty: u8| {
+                let apk = [0x02u8; 33];
+                let nonce = if bits > 0 {
+                    crate::poawx_ticket::grind_sybil_nonce(
+                        net, &parent_hash, &solver, 1, &apk, bits, 5_000_000,
+                    )
+                    .expect("grind sybil")
+                    .0
+                } else {
+                    [0u8; 32]
+                };
+                TicketProof::new(
+                    net, height, parent_hash, role, solver, 1, expiry, apk, nonce, penalty,
+                )
+            };
             [
-                TicketProof::new(
-                    net,
-                    height,
-                    ROLE_COMPUTE_CONTRIBUTOR,
-                    [0xC1u8; 20],
-                    1,
-                    expiry,
-                    [0x02u8; 33],
-                    [0x11u8; 32],
-                    PenaltyStatus::Clean.id(),
-                ),
-                TicketProof::new(
-                    net,
-                    height,
-                    ROLE_VERIFY_CONTRIBUTOR,
-                    [0xC2u8; 20],
-                    1,
-                    expiry,
-                    [0x02u8; 33],
-                    [0x12u8; 32],
-                    verify_status,
-                ),
-                TicketProof::new(
-                    net,
-                    height,
-                    ROLE_SUPPORT_CONTRIBUTOR,
-                    [0xC3u8; 20],
-                    1,
-                    expiry,
-                    [0x02u8; 33],
-                    [0x13u8; 32],
-                    PenaltyStatus::Clean.id(),
-                ),
+                mk(ROLE_COMPUTE_CONTRIBUTOR, [0xC1u8; 20], PenaltyStatus::Clean.id()),
+                mk(ROLE_VERIFY_CONTRIBUTOR, [0xC2u8; 20], verify_status),
+                mk(ROLE_SUPPORT_CONTRIBUTOR, [0xC3u8; 20], PenaltyStatus::Clean.id()),
             ]
         };
 
@@ -12351,10 +12411,8 @@ mod tests {
             }
         };
 
-        // Block 1 = grace (activation height): parent predates activation, so the
-        // parent-root match is skipped, but the block must carry a precommit_root
-        // (for block 2) and its claim commitments must be valid.
-        let block1 = build(1, &parent_hash, &mk_ext(1, &parent_hash, Some(root_for(2))));
+        // Block 1 = activation-height grace (a single special block).
+        let block1 = build(1, &parent_hash, &mk_ext(1, &parent_hash, Some(root_for(1))));
         assert!(
             validate_poawx_block_receipts(&block1, 1, Some(&parent)).is_ok(),
             "grace block: {:?}",
@@ -12362,36 +12420,21 @@ mod tests {
         );
         let h1 = block1.header.hash_for_height(1);
 
-        // Block 2 (non-grace): reveals leaves matching block1's committed root.
-        let block2 = build(2, &h1, &mk_ext(2, &h1, Some(root_for(3))));
+        // Fix A1 self-commit: block 2 commits the root of its OWN leaves; any miner
+        // can extend block 1 (no dependency on block 1's miner).
+        let block2 = build(2, &h1, &mk_ext(2, &h1, Some(root_for(2))));
         let r2 = validate_poawx_block_receipts(&block2, 2, Some(&block1));
-        assert!(r2.is_ok(), "valid parent-root reveal: {:?}", r2);
+        assert!(r2.is_ok(), "self-commit reveal: {:?}", r2);
 
-        // (12) parent has no precommit_root => reject.
-        let block1_nr = build(1, &parent_hash, &mk_ext(1, &parent_hash, None));
-        let h1nr = block1_nr.header.hash_for_height(1);
-        let block2_nr = build(2, &h1nr, &mk_ext(2, &h1nr, Some(root_for(3))));
+        // Negative: block commits the WRONG own root => reject.
+        let block2_w = build(2, &h1, &mk_ext(2, &h1, Some(root_for(99))));
         assert!(
-            validate_poawx_block_receipts(&block2_nr, 2, Some(&block1_nr)).is_err(),
-            "missing parent root rejects"
+            validate_poawx_block_receipts(&block2_w, 2, Some(&block1)).is_err(),
+            "wrong own root rejects"
         );
 
-        // (13) parent commits the wrong root => reject.
-        let block1_w = build(
-            1,
-            &parent_hash,
-            &mk_ext(1, &parent_hash, Some(root_for(99))),
-        );
-        let h1w = block1_w.header.hash_for_height(1);
-        let block2_w = build(2, &h1w, &mk_ext(2, &h1w, Some(root_for(3))));
-        assert!(
-            validate_poawx_block_receipts(&block2_w, 2, Some(&block1_w)).is_err(),
-            "wrong parent root rejects"
-        );
-
-        // (17) reveal with a commitment that doesn't match secret/nonce => reject
-        // (fairness still passes; precommit commitment check fails).
-        let mut ext2_mut = mk_ext(2, &h1, Some(root_for(3)));
+        // Negative: revealed secret/nonce do not match the carried commitment => reject.
+        let mut ext2_mut = mk_ext(2, &h1, Some(root_for(2)));
         ext2_mut.compute_claim.commitment_hash = Some([0xEEu8; 32]);
         let block2_mut = build(2, &h1, &ext2_mut);
         assert!(
@@ -12399,7 +12442,7 @@ mod tests {
             "mutated commitment rejects"
         );
 
-        // block missing its OWN precommit_root after activation => reject.
+        // Negative: block missing its OWN precommit_root (above activation) => reject.
         let block2_noown = build(2, &h1, &mk_ext(2, &h1, None));
         assert!(
             validate_poawx_block_receipts(&block2_noown, 2, Some(&block1)).is_err(),

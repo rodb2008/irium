@@ -4646,6 +4646,7 @@ fn cmd_poawx_ticket_emit(args: &[String]) -> Result<(), String> {
     let mut expiry_height: Option<u64> = None;
     let mut apk: [u8; 33] = [0x02u8; 33];
     let mut nonce: [u8; 32] = [0u8; 32];
+    let mut prev_hash: [u8; 32] = [0u8; 32];
     let mut penalty_status: u8 = 0;
     let hex_into = |s: &str, out: &mut [u8]| -> Result<(), String> {
         let b = hex::decode(s.trim()).map_err(|_| "invalid hex".to_string())?;
@@ -4696,6 +4697,7 @@ fn cmd_poawx_ticket_emit(args: &[String]) -> Result<(), String> {
             }
             "--assignment-pubkey" => hex_into(&next_flag_value(args, &mut i)?, &mut apk)?,
             "--sybil-nonce" => hex_into(&next_flag_value(args, &mut i)?, &mut nonce)?,
+            "--prev-hash" => hex_into(&next_flag_value(args, &mut i)?, &mut prev_hash)?,
             "--penalty-status" => {
                 penalty_status = next_flag_value(args, &mut i)?
                     .parse()
@@ -4718,6 +4720,7 @@ fn cmd_poawx_ticket_emit(args: &[String]) -> Result<(), String> {
     let proof = TicketProof::new(
         network_id,
         target_height,
+        prev_hash,
         role,
         solver,
         epoch,

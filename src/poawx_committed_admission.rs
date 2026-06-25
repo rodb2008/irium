@@ -191,8 +191,11 @@ impl AdmissionCommitmentV1 {
         if self.target_height != target_height {
             return Err("admission commitment: wrong target height".to_string());
         }
-        if self.commit_height + 1 != self.target_height {
-            return Err("admission commitment: commit_height must be target-1".to_string());
+        // Self-commit (commit_height == target) OR legacy one-ahead (target - 1).
+        if self.commit_height != self.target_height
+            && self.commit_height + 1 != self.target_height
+        {
+            return Err("admission commitment: commit_height must be target or target-1".to_string());
         }
         if self.candidate_count > MAX_COMMITTED_CANDIDATES {
             return Err("admission commitment: candidate count over cap".to_string());

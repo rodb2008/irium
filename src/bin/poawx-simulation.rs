@@ -304,6 +304,7 @@ fn scenario_5_sybil() -> Verdict {
         let mut tp = TicketProof::new(
             NET,
             height,
+            [0u8; 32],
             ROLE_COMPUTE_CONTRIBUTOR,
             pkh,
             0,
@@ -319,6 +320,7 @@ fn scenario_5_sybil() -> Verdict {
             tp = TicketProof::new(
                 NET,
                 height,
+                [0u8; 32],
                 ROLE_COMPUTE_CONTRIBUTOR,
                 pkh,
                 0,
@@ -329,7 +331,7 @@ fn scenario_5_sybil() -> Verdict {
             );
         }
         if tp
-            .validate(NET, height, ROLE_COMPUTE_CONTRIBUTOR, &pkh, require_bits, false)
+            .validate(NET, height, &[0u8; 32], ROLE_COMPUTE_CONTRIBUTOR, &pkh, require_bits, false)
             .is_err()
         {
             rejected += 1;
@@ -339,18 +341,18 @@ fn scenario_5_sybil() -> Verdict {
     let cpkh = [0xAAu8; 20];
     let mut cn = [0u8; 32];
     let mut mined = TicketProof::new(
-        NET, height, ROLE_COMPUTE_CONTRIBUTOR, cpkh, 0, height + 100, [2u8; 33], cn, PenaltyStatus::Clean.id(),
+        NET, height, [0u8; 32], ROLE_COMPUTE_CONTRIBUTOR, cpkh, 0, height + 100, [2u8; 33], cn, PenaltyStatus::Clean.id(),
     );
     let mut tries = 0u64;
     while !meets_sybil_target(&mined.sybil_work_digest, require_bits) {
         tries += 1;
         cn[..8].copy_from_slice(&tries.to_le_bytes());
         mined = TicketProof::new(
-            NET, height, ROLE_COMPUTE_CONTRIBUTOR, cpkh, 0, height + 100, [2u8; 33], cn, PenaltyStatus::Clean.id(),
+            NET, height, [0u8; 32], ROLE_COMPUTE_CONTRIBUTOR, cpkh, 0, height + 100, [2u8; 33], cn, PenaltyStatus::Clean.id(),
         );
     }
     let control_ok = mined
-        .validate(NET, height, ROLE_COMPUTE_CONTRIBUTOR, &cpkh, require_bits, false)
+        .validate(NET, height, &[0u8; 32], ROLE_COMPUTE_CONTRIBUTOR, &cpkh, require_bits, false)
         .is_ok();
     let ok = rejected == n && control_ok;
     Verdict {
