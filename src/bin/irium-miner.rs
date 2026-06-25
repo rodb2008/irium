@@ -3248,6 +3248,18 @@ fn poawx_receipt_difficulty_bits() -> u32 {
         .unwrap_or(4)
 }
 
+/// Seconds the solo --poawx miner waits between block-production attempts.
+/// `IRIUM_POAWX_MINER_INTERVAL_SECS` (devnet/testnet only); default 2 (unchanged
+/// legacy cadence). Raising it (e.g. 30) slows block production so remote testnet
+/// nodes can stay synced via gossip. Clamped to a minimum of 1s.
+fn poawx_miner_interval_secs() -> u64 {
+    env::var("IRIUM_POAWX_MINER_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
 /// Build the `/rpc/submit_block_extended` JSON request from a built proof (public
 /// block data only; no secret key material). Mirrors the live-proof harness shape.
 fn build_poawx_submit_request(
@@ -3379,7 +3391,8 @@ fn run_poawx_solo() -> Result<(), String> {
     let secret = poawx_miner_secret()?;
     let client = rpc_client()?;
     let diff = poawx_receipt_difficulty_bits();
-    println!("[poawx] solo PoAW-X mining started (net={net}); building all-gates blocks with the miner key");
+    let interval = poawx_miner_interval_secs();
+    println!("[poawx] solo PoAW-X mining started (net={net}, interval={interval}s); building all-gates blocks with the miner key");
     loop {
         let tmpl = match fetch_block_template(&client, false) {
             Ok(t) => t,
@@ -3425,7 +3438,7 @@ fn run_poawx_solo() -> Result<(), String> {
             Ok(()) => println!("[poawx] submitted all-gates block height={height}"),
             Err(e) => eprintln!("[poawx] submit failed at height {height}: {e}"),
         }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(interval));
     }
 }
 
