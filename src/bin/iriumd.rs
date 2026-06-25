@@ -15047,6 +15047,17 @@ async fn get_block(
     Ok(Json(block_json_for(q.height, block)))
 }
 
+async fn poawx_dominance(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = guard.dominance_bytes();
+    Ok(Json(serde_json::json!({ "hex": hex::encode(bytes) })))
+}
+
 async fn get_blocks(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -19052,6 +19063,7 @@ async fn main() {
         .route("/rpc/utxo", get(get_utxo))
         .route("/rpc/getblocktemplate", get(get_block_template))
         .route("/rpc/block", get(get_block))
+        .route("/rpc/poawx_dominance", get(poawx_dominance))
         .route("/rpc/blocks", get(get_blocks))
         .route("/rpc/block_by_hash", get(get_block_by_hash))
         .route("/rpc/tx", get(get_tx))

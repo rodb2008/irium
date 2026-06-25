@@ -3346,6 +3346,29 @@ fn poawx_fetch_parent_info(client: &Client, height: u64) -> Result<PoawxParentIn
     })
 }
 
+fn poawx_fetch_dominance(
+    client: &Client,
+) -> Result<irium_node_rs::poawx_dominance::PersistentDominance, String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/rpc/poawx_dominance", base.trim_end_matches('/'));
+        let mut req = client.get(&url);
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("get dominance: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("get dominance", resp.status()));
+        }
+        let v: serde_json::Value = resp.json().map_err(|e| format!("dominance parse: {e}"))?;
+        let hexs = v
+            .get("hex")
+            .and_then(|x| x.as_str())
+            .ok_or("dominance response missing hex")?;
+        let bytes = hex::decode(hexs.trim()).map_err(|e| format!("dominance hex decode: {e}"))?;
+        irium_node_rs::poawx_dominance::PersistentDominance::from_bytes(&bytes)
+    })
+}
+
 fn poawx_post_admission(client: &Client, adm: &[u8]) -> Result<(), String> {
     with_rpc_base(|base| {
         let url = format!("{}/poawx/candidate-admission", base.trim_end_matches('/'));
@@ -3408,10 +3431,18 @@ fn run_poawx_solo() -> Result<(), String> {
             .map_err(|e| format!("bad template bits {}: {e}", tmpl.bits))?;
         let (parent_prev_hash, parent_seed_components) =
             poawx_fetch_parent_info(&client, height)?;
+        let dominance = match poawx_fetch_dominance(&client) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[poawx] dominance fetch failed: {e}; retrying");
+                thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+        };
 
-        let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block_with_parent(
+        let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block_with_parent_and_dominance(
             &secret, net, height, prev_hash, parent_prev_hash, bits, tmpl.time, diff,
-            parent_seed_components,
+            parent_seed_components, &dominance,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -3421,17 +3452,13 @@ fn run_poawx_solo() -> Result<(), String> {
             }
         };
 
-        let mut ok = true;
+        // Candidate-admission gossip is best-effort: with committed-admission
+        // (phase22a) enforced the node skips the phase21e admission-cache check, so a
+        // rejected/failed gossip post must NOT block block submission.
         for (i, adm) in proof.admissions.iter().enumerate() {
             if let Err(e) = poawx_post_admission(&client, adm) {
-                eprintln!("[poawx] admission[{i}] post failed: {e}");
-                ok = false;
-                break;
+                eprintln!("[poawx] admission[{i}] gossip post failed (non-fatal): {e}");
             }
-        }
-        if !ok {
-            thread::sleep(Duration::from_secs(3));
-            continue;
         }
         let req = build_poawx_submit_request(&proof)?;
         match poawx_submit_extended(&client, &req) {

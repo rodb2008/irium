@@ -1642,6 +1642,12 @@ impl ChainState {
         Ok(())
     }
 
+    /// Wire snapshot of the persisted dominance state, for miners to fetch the
+    /// node's authoritative view and build weight-correct multi-miner blocks.
+    pub fn dominance_bytes(&self) -> Vec<u8> {
+        self.dominance.to_bytes()
+    }
+
     /// Phase 21C: when anti-domination enforcement is on, every production
     /// receipt must carry `role_dominance_weights` whose 4 entries equal the
     /// node-recomputed fairness weights for [PRIMARY, COMPUTE, VERIFY, SUPPORT]
@@ -10208,6 +10214,200 @@ mod tests {
         ] {
             std::env::remove_var(k);
         }
+    }
+
+    #[test]
+    fn cross_miner_none_path_requires_real_dominance() {
+        // Regression for the v0.1.2 stuck-at-height-1 devnet: when miner B extends a
+        // block A mined, the standalone `None`/solo-replay path credits B for A's
+        // prior block, so B stamps a penalized dominance weight the node rejects
+        // (phase21c). Fed the node's REAL dominance snapshot (what the live miner now
+        // fetches), B builds the correct weight and the block connects. The two-miner
+        // test missed this because it only ever used the real-dominance override.
+        use crate::poawx_committed_admission::seed_components_from_block;
+        use crate::poawx_mining_harness::{
+            build_solo_poawx_block_with_parent, build_solo_poawx_block_with_parent_and_dominance,
+        };
+        let _g = chain_poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let gates = [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1"),
+            ("IRIUM_POAWX_PUZZLE_BITS", "1"),
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_WINDOW", "2016"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK", "2"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+            ("IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TICKETS_REQUIRED", "1"),
+            ("IRIUM_POAWX_TICKET_SYBIL_BITS", "1"),
+            ("IRIUM_POAWX_PENALTY_STATE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PENALTY_STATE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FRAUD_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_ADAPTIVE_MODE_ACTIVATION_HEIGHT", "1"),
+        ];
+        for (k, v) in gates {
+            std::env::set_var(k, v);
+        }
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+
+        // A mines block 1.
+        let comp0 = seed_components_from_block(st.chain.last());
+        let bits1 = st.target_for_height(1).bits;
+        let p1 = build_solo_poawx_block_with_parent(
+            &a, net, 1, genesis_hash, None, bits1, genesis.header.time + 1, 1, comp0,
+        )
+        .expect("build A block1");
+        let h1 = p1.block_hash;
+        st.connect_block(p1.block).expect("A block1 connects");
+        assert_eq!(st.tip_height(), 1);
+
+        let comp1 = seed_components_from_block(st.chain.last());
+        let bits2 = st.target_for_height(2).bits;
+        let t2 = genesis.header.time + 2;
+
+        // B via the None/solo-replay path => penalized weight => rejected.
+        let none = build_solo_poawx_block_with_parent(
+            &b, net, 2, h1, Some(genesis_hash), bits2, t2, 1, comp1,
+        )
+        .expect("build B block2 (none path)");
+        let err = st
+            .connect_block(none.block)
+            .expect_err("cross-miner None path must be rejected");
+        assert!(
+            err.contains("phase21c") || err.contains("dominance"),
+            "expected dominance rejection, got: {err}"
+        );
+        assert_eq!(st.tip_height(), 1, "rejected block does not advance the tip");
+
+        // B with the node's REAL dominance snapshot => correct weight => accepted.
+        let okb = build_solo_poawx_block_with_parent_and_dominance(
+            &b, net, 2, h1, Some(genesis_hash), bits2, t2, 1, comp1, &st.dominance,
+        )
+        .expect("build B block2 (real dominance)");
+        st.connect_block(okb.block)
+            .expect("B block2 connects with real dominance");
+        assert_eq!(st.tip_height(), 2, "cross-miner block 2 accepted with real dominance");
+
+        for (k, _) in gates {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn solo_consecutive_blocks_live_path() {
+        // REGRESSION: the live solo miner builds consecutive blocks via the
+        // `None` dominance path (dom_at replay). The two-miner test alternated
+        // identities so the height-2 producer was always fresh (weight 1000) and
+        // never exercised a miner extending its OWN prior block. Here ONE miner
+        // mines heights 1..4 through the same build path the live miner uses;
+        // every connect_block must succeed (phase21c dominance weights must match).
+        use crate::poawx_committed_admission::seed_components_from_block;
+        use crate::poawx_mining_harness::build_solo_poawx_block_with_parent;
+        let _g = chain_poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let gates = [
+            ("IRIUM_POAWX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_MODE", "active"),
+            ("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1"),
+            ("IRIUM_POAWX_PUZZLE_BITS", "1"),
+            ("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED", "1"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_WINDOW", "2016"),
+            ("IRIUM_POAWX_ANTI_DOMINATION_LOOKBACK", "2"),
+            ("IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_SET_REQUIRED", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PUZZLE_WORK_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "1"),
+            ("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TRUE_VRF_REQUIRED", "1"),
+            ("IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_TICKETS_REQUIRED", "1"),
+            ("IRIUM_POAWX_TICKET_SYBIL_BITS", "1"),
+            ("IRIUM_POAWX_PENALTY_STATE_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_PENALTY_STATE_REQUIRED", "1"),
+            ("IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT", "1"),
+            ("IRIUM_POAWX_FRAUD_PROOF_REQUIRED", "1"),
+            ("IRIUM_POAWX_ADAPTIVE_MODE_ACTIVATION_HEIGHT", "1"),
+        ];
+        for (k, v) in gates {
+            std::env::set_var(k, v);
+        }
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let genesis_hash = genesis.header.hash_for_height(0);
+        let mut st = base_chain(None);
+        let net = crate::activation::network_id_byte();
+        let secret = [0x11u8; 32];
+
+        let mut prev = genesis_hash;
+        let mut parent_prev: Option<[u8; 32]> = None;
+        for h in 1..=4u64 {
+            let parent_components = seed_components_from_block(st.chain.last());
+            let bits = st.target_for_height(h).bits;
+            let time = genesis.header.time + h as u32;
+            let proof = build_solo_poawx_block_with_parent(
+                &secret, net, h, prev, parent_prev, bits, time, 1, parent_components,
+            )
+            .unwrap_or_else(|e| panic!("build H{h}: {e}"));
+            let blk_prev = prev;
+            let blk_hash = proof.block_hash;
+            st.connect_block(proof.block.clone())
+                .unwrap_or_else(|e| panic!("connect_block H{h} failed: {e}"));
+            parent_prev = Some(blk_prev);
+            prev = blk_hash;
+        }
+        assert_eq!(st.tip_height(), 4, "solo miner extends its own chain to height 4");
+
+        for (k, _) in gates {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("IRIUM_NETWORK");
     }
 
     #[test]

@@ -407,6 +407,86 @@ impl PersistentDominance {
         )
     }
 
+    /// Deterministic wire encoding of the full dominance snapshot, so a
+    /// standalone miner can fetch the node's authoritative state and build
+    /// weight-correct blocks in a multi-miner setting. Inverse of `from_bytes`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24 + self.buckets.len() * 84);
+        out.extend_from_slice(&self.window_len.to_le_bytes());
+        out.extend_from_slice(&self.lookback.to_le_bytes());
+        out.extend_from_slice(&(self.buckets.len() as u64).to_le_bytes());
+        for ((pkh, wid), b) in self.buckets.iter() {
+            out.extend_from_slice(pkh);
+            out.extend_from_slice(&wid.to_le_bytes());
+            out.extend_from_slice(&b.primary.to_le_bytes());
+            out.extend_from_slice(&b.compute.to_le_bytes());
+            out.extend_from_slice(&b.verify.to_le_bytes());
+            out.extend_from_slice(&b.support.to_le_bytes());
+            out.extend_from_slice(&b.total.to_le_bytes());
+            out.extend_from_slice(&b.valid_role_count.to_le_bytes());
+            out.extend_from_slice(&b.last_reward_height.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reconstruct a dominance snapshot from `to_bytes`. Rejects trailing bytes.
+    pub fn from_bytes(raw: &[u8]) -> Result<Self, String> {
+        let rd = |o: usize| -> Result<u64, String> {
+            raw.get(o..o + 8)
+                .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+                .ok_or_else(|| "dominance: truncated".to_string())
+        };
+        let window_len = rd(0)?;
+        let lookback = rd(8)?;
+        let count = rd(16)? as usize;
+        let mut d = Self::new(window_len, lookback);
+        let mut off = 24usize;
+        for _ in 0..count {
+            let pkh: [u8; 20] = raw
+                .get(off..off + 20)
+                .ok_or_else(|| "dominance: truncated pkh".to_string())?
+                .try_into()
+                .unwrap();
+            off += 20;
+            let wid = rd(off)?;
+            off += 8;
+            let primary = rd(off)?;
+            off += 8;
+            let compute = rd(off)?;
+            off += 8;
+            let verify = rd(off)?;
+            off += 8;
+            let support = rd(off)?;
+            off += 8;
+            let total = rd(off)?;
+            off += 8;
+            let valid_role_count = rd(off)?;
+            off += 8;
+            let last_reward_height = rd(off)?;
+            off += 8;
+            d.buckets.insert(
+                (pkh, wid),
+                DominanceBucket {
+                    primary,
+                    compute,
+                    verify,
+                    support,
+                    total,
+                    valid_role_count,
+                    last_reward_height,
+                },
+            );
+        }
+        if off != raw.len() {
+            return Err(format!(
+                "dominance: trailing bytes ({} parsed, {} given)",
+                off,
+                raw.len()
+            ));
+        }
+        Ok(d)
+    }
+
     /// Canonical state commitment over all non-empty buckets (sorted by
     /// (pkh, window_id)). Two nodes with identical accepted chains + identical
     /// gate config produce the identical digest.
