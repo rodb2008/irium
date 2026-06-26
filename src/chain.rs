@@ -1857,6 +1857,58 @@ impl ChainState {
         }
     }
 
+    /// Phase 31: a block's proposer rank `(round, priority)` for VRF fork choice
+    /// (lower is better). Uses the best (lowest) rank among the block's proposer
+    /// assignments; a block with no proposer assignment ranks worst so it can never
+    /// win a contested height under the gate. Pure; PoW is not consulted.
+    fn block_proposer_rank(block: &Block) -> (u32, u64) {
+        let mut best: Option<(u32, u64)> = None;
+        if let Some(receipts) = &block.poawx_receipts {
+            for r in receipts {
+                if let Some(ext) = &r.phase20_ext {
+                    if let Some(pa) = &ext.proposer_assignment {
+                        let pri =
+                            crate::poawx_proposer::proposer_priority(&pa.proof.vrf_output);
+                        let cand = (pa.round, pri);
+                        best = Some(match best {
+                            Some(b) if b <= cand => b,
+                            _ => cand,
+                        });
+                    }
+                }
+            }
+        }
+        best.unwrap_or((u32::MAX, u64::MAX))
+    }
+
+    /// Phase 31 (gated): is the chain ending at `candidate_tip` strictly better than
+    /// the current main chain under VRF-rank fork choice? The candidate branch and
+    /// the current main-chain branch above their common ancestor are compared by
+    /// per-height proposer rank `(round, priority)` (lexicographic, lower better);
+    /// at the first height they differ the lower-ranked block wins. If one branch is
+    /// a proper prefix of the other the longer branch wins. PoW is NOT consulted.
+    /// Only called when `proposer_vrf_enforced` (mainnet hard-off).
+    fn proposer_rank_chain_better(&self, candidate_tip: [u8; 32]) -> Result<bool, String> {
+        let (ancestor_height, candidate_branch) = self.find_reorg_path(candidate_tip)?;
+        let tip_height = self.tip_height();
+        let start = ancestor_height as usize + 1;
+        let current_branch: Vec<&Block> = self
+            .chain
+            .get(start..=tip_height as usize)
+            .map(|s| s.iter().collect())
+            .unwrap_or_default();
+        let shared = candidate_branch.len().min(current_branch.len());
+        for i in 0..shared {
+            let cr = Self::block_proposer_rank(&candidate_branch[i]);
+            let mr = Self::block_proposer_rank(current_branch[i]);
+            if cr != mr {
+                return Ok(cr < mr);
+            }
+        }
+        // Equal ranks over the shared length => the longer branch wins.
+        Ok(candidate_branch.len() > current_branch.len())
+    }
+
     fn find_reorg_path(&self, new_tip: [u8; 32]) -> Result<(u64, Vec<Block>), String> {
         let mut cur = new_tip;
         let mut new_branch_rev: Vec<Block> = Vec::new();
@@ -2691,14 +2743,32 @@ impl ChainState {
                 return Err(e);
             }
             advanced_tip = true;
-        } else if cumulative > self.total_work {
-            if let Err(e) = self.reorg_to_tip(hash) {
-                self.block_store.remove(&hash);
-                self.heights.remove(&hash);
-                self.cumulative_work.remove(&hash);
-                return Err(e);
+        } else {
+            // Phase 31 fork choice: when the proposer VRF gate is enforced, adopt a
+            // competing branch by VRF rank `(round, priority)` instead of heaviest
+            // cumulative PoW. Gate off => byte-identical legacy heaviest-work rule.
+            let do_reorg = if crate::poawx_proposer::proposer_vrf_enforced(height) {
+                match self.proposer_rank_chain_better(hash) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.block_store.remove(&hash);
+                        self.heights.remove(&hash);
+                        self.cumulative_work.remove(&hash);
+                        return Err(e);
+                    }
+                }
+            } else {
+                cumulative > self.total_work
+            };
+            if do_reorg {
+                if let Err(e) = self.reorg_to_tip(hash) {
+                    self.block_store.remove(&hash);
+                    self.heights.remove(&hash);
+                    self.cumulative_work.remove(&hash);
+                    return Err(e);
+                }
+                advanced_tip = true;
             }
-            advanced_tip = true;
         }
 
         let mut new_hash = self.tip_hash();
