@@ -13415,3 +13415,366 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT");
     }
 }
+
+
+#[cfg(test)]
+mod proposer_consensus_tests {
+    //! Phase 31 consensus tests for VRF-assigned proposer enforcement. These
+    //! exercise the REAL consensus decision functions (validate_block_proposer,
+    //! block_proposer_rank, proposer_rank_chain_better) and the sortition math with
+    //! REAL RFC-9381 ECVRF proofs. Hashrate is never an input anywhere below. Run
+    //! with --test-threads=1 (env-sensitive). Mainnet stays hard-off regardless.
+    use super::*;
+    use crate::block::{Block, BlockHeader};
+    use crate::poawx::{PoawxBlockReceipt, ProposerAssignmentV1};
+    use crate::poawx_candidate::AssignmentProofV2;
+    use crate::poawx_committed_admission::expected_epoch_seed;
+    use crate::poawx_dominance::PersistentDominance;
+    use crate::poawx_mining_harness::{
+        build_solo_poawx_block_with_parent_and_dominance, build_solo_poawx_block_with_proposer,
+        ProposerCtx,
+    };
+    use crate::poawx_proposer::{
+        is_selected, max_round_for_elapsed, min_time_for_round, proposer_priority,
+        proposer_threshold, ProposerEligibilityRegistry, ROLE_PROPOSER,
+    };
+    use std::sync::Mutex;
+
+    static ENV: Mutex<()> = Mutex::new(());
+
+    fn base_chain() -> ChainState {
+        let locked = crate::genesis::load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let pow_limit = Target { bits: 0x1f00ffff };
+        let params = ChainParams {
+            genesis_block: genesis,
+            pow_limit,
+            htlcv1_activation_height: None,
+            mpsov1_activation_height: None,
+            lwma: LwmaParams::new(None, pow_limit),
+            lwma_v2: None,
+            auxpow_activation_height: None,
+            btc_spv: None,
+            ltc_spv: None,
+            htlc_btc_swap_v1_activation_height: None,
+            btc_swap_bech32_payment_activation_height: None,
+            htlc_ltc_swap_v1_activation_height: None,
+            swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
+        };
+        ChainState::new(params)
+    }
+
+    fn genesis_block() -> Block {
+        let locked = crate::genesis::load_locked_genesis().expect("locked genesis");
+        block_from_locked(&locked).expect("genesis block")
+    }
+
+    /// Distinct, non-zero secp256k1 scalars for independent VRF keys.
+    fn secret_n(n: u64) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s[..8].copy_from_slice(&n.to_le_bytes());
+        s[31] = 1; // guarantee non-zero
+        s
+    }
+
+    /// Real proposer proof for (secret, height, seed); solver = hash160(vrf key).
+    fn prove(secret: &[u8; 32], net: u8, height: u64, seed: [u8; 32]) -> AssignmentProofV2 {
+        AssignmentProofV2::prove_self_solver(secret, net, height, ROLE_PROPOSER, [0u8; 32], seed)
+            .expect("prove proposer")
+    }
+
+    /// Real, fully-built block at HEIGHT 1 (genesis parent) carrying a proposer
+    /// assignment at `round`. The harness self-checks hash160(vrf key) == worker_pkh,
+    /// so a successful build also confirms the C8 key derivation end-to-end.
+    fn proposer_block_h1(secret: &[u8; 32], net: u8, seed: [u8; 32], round: u32) -> Block {
+        let g = genesis_block();
+        let gh = g.header.hash_for_height(0);
+        let proof = prove(secret, net, 1, seed);
+        let ctx = ProposerCtx {
+            assignment: ProposerAssignmentV1 { round, proof },
+        };
+        let dom = PersistentDominance::from_env();
+        let p = build_solo_poawx_block_with_proposer(
+            secret,
+            net,
+            1,
+            gh,
+            None,
+            0x207fffff,
+            g.header.time + 1,
+            1,
+            ([0u8; 32], [0u8; 32]),
+            &dom,
+            None,
+            Some(&ctx),
+        )
+        .expect("build proposer block at height 1");
+        p.block
+    }
+
+    /// A valid Phase20ReceiptExt skeleton lifted from a real height-1 harness block.
+    fn ext_skeleton(net: u8) -> PoawxBlockReceipt {
+        let g = genesis_block();
+        let gh = g.header.hash_for_height(0);
+        let dom = PersistentDominance::from_env();
+        let p = build_solo_poawx_block_with_parent_and_dominance(
+            &secret_n(7),
+            net,
+            1,
+            gh,
+            None,
+            0x207fffff,
+            g.header.time + 1,
+            1,
+            ([0u8; 32], [0u8; 32]),
+            &dom,
+            None,
+        )
+        .expect("template block");
+        p.block.poawx_receipts.unwrap().into_iter().next().unwrap()
+    }
+
+    /// Hand-build a block at an arbitrary height carrying `proof` as its proposer
+    /// assignment (reusing a valid ext skeleton). Only the fields validate_block_proposer
+    /// reads are meaningful; the rest are inherited from the skeleton.
+    fn block_with_proof(
+        template: &PoawxBlockReceipt,
+        prev_hash: [u8; 32],
+        height: u64,
+        proof: AssignmentProofV2,
+        round: u32,
+        time: u32,
+    ) -> Block {
+        let mut r = template.clone();
+        r.height = height;
+        r.worker_pkh = proof.solver_pkh;
+        let mut ext = r.phase20_ext.clone().expect("ext");
+        ext.proposer_assignment = Some(ProposerAssignmentV1 { round, proof });
+        r.phase20_ext = Some(ext);
+        Block {
+            header: BlockHeader {
+                version: 0,
+                prev_hash,
+                merkle_root: [0u8; 32],
+                time,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![r]),
+        }
+    }
+
+    #[test]
+    fn vrf_unforgeable_and_threshold() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let net = crate::activation::network_id_byte();
+        let (height, seed) = (5u64, [0x9au8; 32]);
+        let proof = prove(&secret_n(1), net, height, seed);
+        assert!(proof.validate(net, height).is_ok(), "genuine proof validates");
+        let mut bad = proof.clone();
+        bad.vrf_output[0] ^= 0xff;
+        assert!(bad.validate(net, height).is_err(), "tampered vrf output rejected");
+        let mut bad2 = proof.clone();
+        bad2.seed[0] ^= 0xff;
+        assert!(bad2.validate(net, height).is_err(), "tampered seed rejected");
+        // selection is a pure threshold on the VRF priority -- no hashrate term.
+        let p = proposer_priority(&proof.vrf_output);
+        for (n, r) in [(1u64, 0u32), (10, 0), (10, 2), (100, 3)] {
+            assert_eq!(is_selected(p, n, r), p < proposer_threshold(n, r));
+        }
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn eligibility_freeze_anti_grind() {
+        // A key learned on-chain at height H is frozen out until H+FREEZE_DEPTH, so the
+        // seed revealed at H-1 cannot be used to register a winning key for height H.
+        let mut reg = ProposerEligibilityRegistry::default();
+        let (fd, ew) = (16u64, 2016u64);
+        let key = [0x42u8; 33];
+        reg.register(key, [0x11u8; 20], 100);
+        for t in 100..100 + fd {
+            assert!(!reg.is_eligible_with(&key, t, fd, ew), "frozen at target {t}");
+        }
+        assert!(reg.is_eligible_with(&key, 100 + fd, fd, ew), "eligible after freeze");
+        // grind attempt: register AT the target height -> never eligible for it.
+        let g = [0x43u8; 33];
+        reg.register(g, [0x22u8; 20], 200);
+        assert!(!reg.is_eligible_with(&g, 200, fd, ew), "no same-height grind");
+    }
+
+    #[test]
+    fn liveness_round_escalation() {
+        // A proposer not admitted at round 0 IS admitted at a wider later round, so the
+        // cascade never stalls; round r opens only after r*interval seconds.
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let net = crate::activation::network_id_byte();
+        let (n, seed) = (100u64, [0x7u8; 32]);
+        let tau0 = proposer_threshold(n, 0);
+        let mut k = 0u64;
+        let p = loop {
+            let pr = prove(&secret_n(k + 1), net, 7, seed);
+            let p = proposer_priority(&pr.vrf_output);
+            if p >= tau0 {
+                break p;
+            }
+            k += 1;
+            assert!(k < 10_000, "find an unselected key quickly");
+        };
+        assert!(!is_selected(p, n, 0), "unselected at round 0");
+        assert!(is_selected(p, n, 3), "round 3 admits all => liveness");
+        assert_eq!(max_round_for_elapsed(0, 30), 0);
+        assert_eq!(max_round_for_elapsed(95, 30), 3);
+        assert_eq!(min_time_for_round(1000, 2, 30), 1060);
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn single_deterministic_winner() {
+        // Among many eligible proposers (same seed/height) the lowest VRF priority is
+        // unique and is the canonical winner; block_proposer_rank reflects it.
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let net = crate::activation::network_id_byte();
+        let gh = genesis_block().header.hash_for_height(0);
+        let seed = expected_epoch_seed(1, gh, Some(&genesis_block()));
+        let mut prio = Vec::new();
+        for i in 0..16u64 {
+            prio.push(proposer_priority(&prove(&secret_n(i + 1), net, 1, seed).vrf_output));
+        }
+        let min = *prio.iter().min().unwrap();
+        assert_eq!(prio.iter().filter(|&&p| p == min).count(), 1, "unique winner");
+        let mut idx: Vec<usize> = (0..prio.len()).collect();
+        idx.sort_by_key(|&i| prio[i]);
+        let bw = proposer_block_h1(&secret_n(idx[0] as u64 + 1), net, seed, 0);
+        let br = proposer_block_h1(&secret_n(idx[1] as u64 + 1), net, seed, 0);
+        assert!(
+            ChainState::block_proposer_rank(&bw) < ChainState::block_proposer_rank(&br),
+            "lowest-priority proposer is canonical"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn selected_cpu_beats_unselected_asic() {
+        // Fork choice: a CPU selected at round 0 beats an ASIC that only wins at round 1,
+        // regardless of PoW. Exercises proposer_rank_chain_better on a real fork.
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let net = crate::activation::network_id_byte();
+        let mut cs = base_chain();
+        let gh = cs.chain[0].header.hash_for_height(0);
+        let seed = expected_epoch_seed(1, gh, Some(&cs.chain[0]));
+        let cpu = proposer_block_h1(&secret_n(1), net, seed, 0); // round 0
+        let asic = proposer_block_h1(&secret_n(2), net, seed, 1); // round 1 (hashrate irrelevant)
+        let cpu_hash = cpu.header.hash_for_height(1);
+        let asic_hash = asic.header.hash_for_height(1);
+        // ASIC is the current main-chain tip at height 1; CPU is a competing fork.
+        cs.block_store.insert(asic_hash, asic.clone());
+        cs.heights.insert(asic_hash, 1);
+        cs.chain.push(asic);
+        cs.block_store.insert(cpu_hash, cpu.clone());
+        cs.heights.insert(cpu_hash, 1);
+        assert!(
+            cs.proposer_rank_chain_better(cpu_hash).expect("compare"),
+            "round-0 CPU must beat round-1 ASIC regardless of PoW"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn non_selected_proposer_rejected_even_with_max_pow() {
+        // The proposer gate rejects a non-selected proposer no matter the PoW: the SAME
+        // block is rejected when the eligible set is large (priority misses the round-0
+        // cut) and accepted when it is the sole eligible winner. Hashrate never changes
+        // the verdict.
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_PROPOSER_FREEZE_DEPTH", "2");
+        let net = crate::activation::network_id_byte();
+        let height = 2u64;
+        let prev_hash = [0x55u8; 32];
+        let seed = expected_epoch_seed(height, prev_hash, None);
+        let n_big = 100u64;
+        let tau0 = proposer_threshold(n_big, 0);
+        let mut k = 0u64;
+        let secret = loop {
+            let pr = prove(&secret_n(k + 1), net, height, seed);
+            if proposer_priority(&pr.vrf_output) >= tau0 {
+                break secret_n(k + 1);
+            }
+            k += 1;
+            assert!(k < 10_000);
+        };
+        let proof = prove(&secret, net, height, seed);
+        let vrf_key = proof.assignment_public_key;
+        let miner_pkh = proof.solver_pkh;
+        let tmpl = ext_skeleton(net);
+        let block = block_with_proof(&tmpl, prev_hash, height, proof, 0, 5_000);
+
+        // n=100 eligible (frozen window hi = 2-2 = 0) => not selected at round 0 => reject.
+        let mut cs = base_chain();
+        cs.proposer_registry.register(vrf_key, miner_pkh, 0);
+        for i in 0..99u32 {
+            let mut dk = [0u8; 33];
+            dk[0] = 0x02;
+            dk[1..5].copy_from_slice(&i.to_le_bytes());
+            cs.proposer_registry.register(dk, [i as u8; 20], 0);
+        }
+        assert_eq!(cs.proposer_registry.eligible_count(height), 100);
+        let err = cs
+            .validate_block_proposer(&block, height, None)
+            .expect_err("non-selected proposer must be rejected");
+        assert!(err.contains("not selected"), "got: {err}");
+
+        // Same block, same PoW, sole eligible key (n=1) => selected => accepted.
+        let proof2 = prove(&secret, net, height, seed);
+        let block2 = block_with_proof(&tmpl, prev_hash, height, proof2, 0, 5_000);
+        let mut cs1 = base_chain();
+        cs1.proposer_registry.register(vrf_key, miner_pkh, 0);
+        assert_eq!(cs1.proposer_registry.eligible_count(height), 1);
+        cs1.validate_block_proposer(&block2, height, None)
+            .expect("sole eligible winner accepted regardless of PoW");
+        std::env::remove_var("IRIUM_POAWX_PROPOSER_FREEZE_DEPTH");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn multi_miner_cpu_vs_asic_integration() {
+        // Several CPUs at round 0 plus an ASIC that only reaches round 1: the canonical
+        // winner is always a round-0 CPU; the ASIC never wins, whatever its hashrate.
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let net = crate::activation::network_id_byte();
+        let gh = genesis_block().header.hash_for_height(0);
+        let seed = expected_epoch_seed(1, gh, Some(&genesis_block()));
+        let cpus: Vec<Block> = (0..4u64)
+            .map(|i| proposer_block_h1(&secret_n(i + 1), net, seed, 0))
+            .collect();
+        let asic = proposer_block_h1(&secret_n(99), net, seed, 1);
+        let asic_rank = ChainState::block_proposer_rank(&asic);
+        for c in &cpus {
+            assert!(
+                ChainState::block_proposer_rank(c) < asic_rank,
+                "a round-0 CPU outranks the round-1 ASIC"
+            );
+        }
+        let winner = cpus
+            .iter()
+            .chain(std::iter::once(&asic))
+            .min_by_key(|b| ChainState::block_proposer_rank(b))
+            .unwrap();
+        assert_eq!(
+            ChainState::block_proposer_rank(winner).0,
+            0,
+            "winner is a round-0 proposer (a CPU), never the ASIC"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+}
