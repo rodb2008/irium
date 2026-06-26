@@ -1622,6 +1622,19 @@ struct BlockTemplateResponse {
     poawx_proposer_freeze_height: u64,
     #[serde(default)]
     poawx_proposer_max_allowed_round: u32,
+    // Phase 31R proposer-registration fields (gated; empty/false when off).
+    #[serde(default)]
+    poawx_reg_active: bool,
+    #[serde(default)]
+    poawx_reg_anchor_height: u64,
+    #[serde(default)]
+    poawx_reg_anchor_hash: String,
+    #[serde(default)]
+    poawx_reg_required_sybil_bits: u32,
+    #[serde(default)]
+    poawx_reg_activations: Vec<String>,
+    #[serde(default)]
+    poawx_reg_announces: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -13504,6 +13517,12 @@ async fn get_block_template(
         proposer_round_interval,
         proposer_freeze_height,
         proposer_max_allowed_round,
+        reg_active,
+        reg_anchor_height,
+        reg_anchor_hash,
+        reg_required_sybil_bits,
+        reg_activations,
+        reg_announces,
     ) = {
         let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip = guard.chain.last();
@@ -13557,6 +13576,48 @@ async fn get_block_template(
         } else {
             (String::new(), 0u64, 0u64, 0u64, 0u32)
         };
+        // Phase 31R: proposer-registration template fields (the queue head the block
+        // MUST force-drain, pool announce candidates, anchor + required sybil bits),
+        // computed under the same chain lock.
+        let reg_active = irium_node_rs::poawx_proposer::proposer_registration_active(height);
+        let (
+            reg_anchor_height,
+            reg_anchor_hash,
+            reg_required_sybil_bits,
+            reg_activations,
+            reg_announces,
+        ) = if reg_active {
+            let a_hash = tip
+                .map(|b| hex::encode(b.header.hash_for_height(tip_h)))
+                .unwrap_or_else(|| "00".repeat(32));
+            let cap = irium_node_rs::poawx_proposer::PROPOSER_REG_CAP;
+            let k = cap.min(guard.proposer_reg_queue.len());
+            let acts: Vec<String> = guard
+                .proposer_reg_queue
+                .iter()
+                .take(k)
+                .map(|r| hex::encode(r.serialize()))
+                .collect();
+            let exclude: std::collections::BTreeSet<[u8; 33]> =
+                guard.proposer_reg_queue.iter().map(|r| r.vrf_pubkey).collect();
+            let anns: Vec<String> = irium_node_rs::poawx_proposer::global_proposer_reg_pool()
+                .announce_candidates(
+                    irium_node_rs::poawx_proposer::PROPOSER_ANNOUNCE_CAP,
+                    &exclude,
+                )
+                .iter()
+                .map(|r| hex::encode(r.serialize()))
+                .collect();
+            (
+                tip_h,
+                a_hash,
+                irium_node_rs::poawx_ticket::effective_sybil_bits(),
+                acts,
+                anns,
+            )
+        } else {
+            (0u64, String::new(), 0u32, Vec::new(), Vec::new())
+        };
         (
             height,
             prev_hash,
@@ -13569,6 +13630,12 @@ async fn get_block_template(
             proposer_round_interval,
             proposer_freeze_height,
             proposer_max_allowed_round,
+            reg_active,
+            reg_anchor_height,
+            reg_anchor_hash,
+            reg_required_sybil_bits,
+            reg_activations,
+            reg_announces,
         )
     };
 
@@ -13856,6 +13923,12 @@ async fn get_block_template(
         poawx_proposer_round_interval: proposer_round_interval,
         poawx_proposer_freeze_height: proposer_freeze_height,
         poawx_proposer_max_allowed_round: proposer_max_allowed_round,
+        poawx_reg_active: reg_active,
+        poawx_reg_anchor_height: reg_anchor_height,
+        poawx_reg_anchor_hash: reg_anchor_hash,
+        poawx_reg_required_sybil_bits: reg_required_sybil_bits,
+        poawx_reg_activations: reg_activations,
+        poawx_reg_announces: reg_announces,
     }))
 }
 

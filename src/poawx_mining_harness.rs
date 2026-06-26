@@ -293,6 +293,7 @@ pub fn build_devnet_all_gates_block(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -319,6 +320,7 @@ pub fn build_solo_poawx_block(
         time,
         receipt_difficulty_bits,
         ([0u8; 32], [0u8; 32]),
+        None,
         None,
         None,
         None,
@@ -351,6 +353,7 @@ pub fn build_solo_poawx_block_with_parent(
         time,
         receipt_difficulty_bits,
         parent_seed_components,
+        None,
         None,
         None,
         None,
@@ -387,6 +390,7 @@ pub fn build_solo_poawx_block_with_parent_and_dominance(
         Some(dominance),
         node_gates,
         None,
+        None,
     )
 }
 
@@ -409,6 +413,7 @@ pub fn build_solo_poawx_block_with_proposer(
     dominance: &PersistentDominance,
     node_gates: Option<&NodeGateFlags>,
     proposer_ctx: Option<&ProposerCtx>,
+    registration_section: Option<&crate::poawx::ProposerRegistrationSection>,
 ) -> Result<AllGatesProof, String> {
     build_all_gates_block_with(
         &AllGatesIdentities::solo(miner_secret)?,
@@ -423,6 +428,7 @@ pub fn build_solo_poawx_block_with_proposer(
         Some(dominance),
         node_gates,
         proposer_ctx,
+        registration_section,
     )
 }
 
@@ -461,6 +467,7 @@ fn build_all_gates_block_with(
     dominance_override: Option<&PersistentDominance>,
     node_gates: Option<&NodeGateFlags>,
     proposer_ctx: Option<&ProposerCtx>,
+    registration_section: Option<&crate::poawx::ProposerRegistrationSection>,
 ) -> Result<AllGatesProof, String> {
     guard_network(network_id)?;
     // Resolve the standard-header activation height into the process global the
@@ -760,6 +767,11 @@ fn build_all_gates_block_with(
             Some(ctx.assignment.clone())
         }
     };
+    // Phase 31R: embed the producer's proposer-registration section (queue-head
+    // activations + announces) supplied by the caller from the node template. The node
+    // re-validates it at connect_block (R3); the builder just binds it into the receipt.
+    let proposer_registrations: Option<crate::poawx::ProposerRegistrationSection> =
+        registration_section.cloned();
 
     let ext = Phase20ReceiptExt {
         role_reward: RoleReward {
@@ -787,7 +799,7 @@ fn build_all_gates_block_with(
         role_assignment_v2: Some(in_proofs),
         fraud_proofs: None,
         proposer_assignment,
-        proposer_registrations: None,
+        proposer_registrations,
     };
 
     // Worker receipt: real receipt PoW solution + signed challenge (mode-0).

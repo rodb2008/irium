@@ -13686,6 +13686,7 @@ mod proposer_consensus_tests {
             &dom,
             None,
             Some(&ctx),
+            None,
         )
         .expect("build proposer block at height 1");
         p.block

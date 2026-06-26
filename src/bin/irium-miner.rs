@@ -686,6 +686,19 @@ struct BlockTemplate {
     poawx_proposer_freeze_height: Option<u64>,
     #[serde(default)]
     poawx_proposer_max_allowed_round: Option<u32>,
+    // Phase 31R proposer-registration fields (None on older nodes).
+    #[serde(default)]
+    poawx_reg_active: Option<bool>,
+    #[serde(default)]
+    poawx_reg_anchor_height: Option<u64>,
+    #[serde(default)]
+    poawx_reg_anchor_hash: Option<String>,
+    #[serde(default)]
+    poawx_reg_required_sybil_bits: Option<u32>,
+    #[serde(default)]
+    poawx_reg_activations: Option<Vec<String>>,
+    #[serde(default)]
+    poawx_reg_announces: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -3412,6 +3425,24 @@ fn poawx_post_admission(client: &Client, adm: &[u8]) -> Result<(), String> {
     })
 }
 
+fn poawx_submit_registration(client: &Client, reg: &[u8]) -> Result<(), String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/poawx/registration", base.trim_end_matches('/'));
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(reg.to_vec());
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("post registration: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("post registration", resp.status()));
+        }
+        Ok(())
+    })
+}
+
 fn poawx_submit_extended(client: &Client, req_body: &serde_json::Value) -> Result<(), String> {
     with_rpc_base(|base| {
         let url = format!("{}/rpc/submit_block_extended", base.trim_end_matches('/'));
@@ -3441,6 +3472,7 @@ fn run_poawx_solo() -> Result<(), String> {
     let diff = poawx_receipt_difficulty_bits();
     let interval = poawx_miner_interval_secs();
     println!("[poawx] solo PoAW-X mining started (net={net}, interval={interval}s); building all-gates blocks with the miner key");
+    let mut last_reg_submit: u64 = 0;
     loop {
         let tmpl = match fetch_block_template(&client, false) {
             Ok(t) => t,
@@ -3492,6 +3524,33 @@ fn run_poawx_solo() -> Result<(), String> {
         // proposer gate as active, prove our VRF over the committee seed and only
         // build if we are selected at some cascade round the elapsed time allows;
         // otherwise wait (a later round, or accrued registrations, may admit us).
+        // Phase 31R: keep our proposer VRF key registered on-chain so we can become
+        // eligible (fixes the onboarding chicken-and-egg). Submit (throttled) to our node,
+        // which gossips it; a producer announces it, and we are eligible FREEZE_DEPTH
+        // blocks later. Harmless if already known (deduped by the pool / connect_block).
+        if tmpl.poawx_reg_active.unwrap_or(false)
+            && (last_reg_submit == 0 || height.saturating_sub(last_reg_submit) >= 20)
+        {
+            if let Some(a_hash_hex) = tmpl.poawx_reg_anchor_hash.clone() {
+                if let Ok(a_hash) = poawx_decode_hash32(&a_hash_hex) {
+                    let a_h = tmpl.poawx_reg_anchor_height.unwrap_or(0);
+                    let bits = tmpl.poawx_reg_required_sybil_bits.unwrap_or(0);
+                    match irium_node_rs::poawx::ProposerRegistrationV1::build_signed(
+                        &secret, net, a_h, &a_hash, bits,
+                    ) {
+                        Ok(reg) => match poawx_submit_registration(&client, &reg.serialize()) {
+                            Ok(()) => {
+                                println!("[poawx] submitted proposer registration (anchor={a_h})");
+                                last_reg_submit = height;
+                            }
+                            Err(e) => eprintln!("[poawx] registration submit failed: {e}"),
+                        },
+                        Err(e) => eprintln!("[poawx] registration build failed: {e}"),
+                    }
+                }
+            }
+        }
+
         let proposer_ctx = if tmpl.poawx_proposer_vrf_active.unwrap_or(false) {
             let seed = match tmpl.poawx_proposer_seed.as_deref() {
                 Some(s) => match poawx_decode_hash32(s) {
@@ -3552,9 +3611,39 @@ fn run_poawx_solo() -> Result<(), String> {
             None
         };
 
+        // Phase 31R: the producer must force-drain the node's queue head (activations)
+        // and may announce pool candidates; assemble the section from the template.
+        let registration_section = {
+            let parse = |v: &Option<Vec<String>>| -> Vec<irium_node_rs::poawx::ProposerRegistrationV1> {
+                v.as_ref()
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(|h| hex::decode(h).ok())
+                            .filter_map(|b| {
+                                irium_node_rs::poawx::ProposerRegistrationV1::deserialize(&b).ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let activations = parse(&tmpl.poawx_reg_activations);
+            let announces = parse(&tmpl.poawx_reg_announces);
+            if tmpl.poawx_reg_active.unwrap_or(false)
+                && (!activations.is_empty() || !announces.is_empty())
+            {
+                Some(irium_node_rs::poawx::ProposerRegistrationSection {
+                    announces,
+                    activations,
+                })
+            } else {
+                None
+            }
+        };
+
         let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block_with_proposer(
             &secret, net, height, prev_hash, parent_prev_hash, bits, tmpl.time, diff,
             parent_seed_components, &dominance, node_gates.as_ref(), proposer_ctx.as_ref(),
+            registration_section.as_ref(),
         ) {
             Ok(p) => p,
             Err(e) => {
