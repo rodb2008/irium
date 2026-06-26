@@ -295,6 +295,10 @@ pub struct ChainState {
     /// `connect_block` + reverted in `disconnect_tip_block` (gated on
     /// `proposer_vrf_active`; mainnet hard-off => empty/no-op).
     pub proposer_registry: crate::poawx_proposer::ProposerEligibilityRegistry,
+    /// Phase 31R: reorg-safe FIFO queue of announced-but-not-yet-activated proposer
+    /// registrations. Producers force-drain the head into the eligibility registry
+    /// (gated on `proposer_registration_active`; mainnet hard-off => stays empty).
+    pub proposer_reg_queue: std::collections::VecDeque<crate::poawx::ProposerRegistrationV1>,
     /// Phase 26+: persistent, reorg-safe penalty/slashing state driven by
     /// accepted fraud proofs. Applied in `connect_block` and reverted in
     /// `disconnect_tip_block` (both gated + mainnet hard-off); deterministically
@@ -393,6 +397,7 @@ impl ChainState {
             reorg_orphaned_blocks: Vec::new(),
             dominance: crate::poawx_dominance::PersistentDominance::from_env(),
             proposer_registry: crate::poawx_proposer::ProposerEligibilityRegistry::from_env(),
+            proposer_reg_queue: std::collections::VecDeque::new(),
             penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
             adaptive_mode: crate::poawx_adaptive::AdaptiveMode::Normal,
             reorg_signal: 0,
@@ -939,6 +944,7 @@ impl ChainState {
         self.best_tip = hash;
         self.apply_block_dominance(expected_height);
         self.apply_block_proposer_registry(expected_height);
+        self.apply_block_proposer_registrations(expected_height);
         self.apply_block_fraud_slashing(expected_height);
         self.update_adaptive_mode(expected_height);
         // Finality-checkpoint watermark: when finality is enforced, an accepted
@@ -1039,6 +1045,7 @@ impl ChainState {
             .map(|b| b.header.hash_for_height(new_tip_height))
             .unwrap_or([0u8; 32]);
         self.revert_block_dominance(&tip_block, tip_height);
+        self.revert_block_proposer_registrations(&tip_block, tip_height);
         self.revert_block_proposer_registry(&tip_block, tip_height);
         self.revert_block_fraud_slashing(&tip_block, tip_height);
         // Gap 10: node-local reorg pressure feeds the adaptive Defense trigger.
@@ -1790,14 +1797,22 @@ impl ChainState {
     /// Phase 31: the `(vrf_pubkey, pkh)` pairs a block registers for proposer
     /// eligibility. Source: the V2 assignment proofs in each receipt (the proposer
     /// section adds the proposer's own key once it lands). Pure.
-    fn proposer_keys_from_block(block: &Block) -> Vec<([u8; 33], [u8; 20])> {
+    fn proposer_keys_from_block(
+        block: &Block,
+        registration_active: bool,
+    ) -> Vec<([u8; 33], [u8; 20])> {
         let mut out = Vec::new();
         if let Some(receipts) = &block.poawx_receipts {
             for r in receipts {
                 if let Some(ext) = &r.phase20_ext {
-                    if let Some(proofs) = &ext.role_assignment_v2 {
-                        for p in proofs.iter() {
-                            out.push((p.assignment_public_key, p.solver_pkh));
+                    // Part B: once the registration gate is active, eligibility is fed by
+                    // the proposer key (+ activated registrations), NOT the sub-role
+                    // assignment keys, so `eligible_count` reflects real proposers only.
+                    if !registration_active {
+                        if let Some(proofs) = &ext.role_assignment_v2 {
+                            for p in proofs.iter() {
+                                out.push((p.assignment_public_key, p.solver_pkh));
+                            }
                         }
                     }
                     if let Some(pa) = &ext.proposer_assignment {
@@ -1809,17 +1824,59 @@ impl ChainState {
         out
     }
 
+    /// Phase 31R: the block's proposer-registration section (first receipt carrying one).
+    /// connect_block rejects a block with more than one section under the gate (R3).
+    fn proposer_reg_section_from_block(
+        block: &Block,
+    ) -> Option<crate::poawx::ProposerRegistrationSection> {
+        let receipts = block.poawx_receipts.as_ref()?;
+        for r in receipts {
+            if let Some(ext) = &r.phase20_ext {
+                if let Some(sec) = &ext.proposer_registrations {
+                    return Some(sec.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Apply the tip block's proposer-key registrations (gated; mainnet hard-off).
     fn apply_block_proposer_registry(&mut self, height: u64) {
         if !crate::poawx_proposer::proposer_vrf_active(height) {
             return;
         }
+        let reg_active = crate::poawx_proposer::proposer_registration_active(height);
         let keys = match self.chain.last() {
-            Some(b) => Self::proposer_keys_from_block(b),
+            Some(b) => Self::proposer_keys_from_block(b, reg_active),
             None => return,
         };
         for (pubkey, pkh) in keys {
             self.proposer_registry.register(pubkey, pkh, height);
+        }
+    }
+
+    /// Phase 31R: drain the FIFO queue head (activations) into the eligibility registry
+    /// and enqueue the block's announces. Gated; mainnet hard-off. The activations were
+    /// verified == the deterministic queue head in connect_block (R3 forced-drain), so
+    /// popping `activations.len()` from the front matches exactly.
+    fn apply_block_proposer_registrations(&mut self, height: u64) {
+        if !crate::poawx_proposer::proposer_registration_active(height) {
+            return;
+        }
+        let section = match self
+            .chain
+            .last()
+            .and_then(Self::proposer_reg_section_from_block)
+        {
+            Some(s) => s,
+            None => return,
+        };
+        for reg in &section.activations {
+            self.proposer_reg_queue.pop_front();
+            self.proposer_registry.register(reg.vrf_pubkey, reg.pkh(), height);
+        }
+        for reg in &section.announces {
+            self.proposer_reg_queue.push_back(reg.clone());
         }
     }
 
@@ -1828,8 +1885,31 @@ impl ChainState {
         if !crate::poawx_proposer::proposer_vrf_active(height) {
             return;
         }
-        for (pubkey, _pkh) in Self::proposer_keys_from_block(block) {
+        let reg_active = crate::poawx_proposer::proposer_registration_active(height);
+        for (pubkey, _pkh) in Self::proposer_keys_from_block(block, reg_active) {
             self.proposer_registry.unregister(&pubkey, height);
+        }
+    }
+
+    /// Exact inverse of `apply_block_proposer_registrations` for a disconnected tip:
+    /// drop this block's announces from the tail, then un-register the activated keys and
+    /// restore them to the FRONT in their original order.
+    fn revert_block_proposer_registrations(&mut self, block: &Block, height: u64) {
+        if !crate::poawx_proposer::proposer_registration_active(height) {
+            return;
+        }
+        let section = match Self::proposer_reg_section_from_block(block) {
+            Some(s) => s,
+            None => return,
+        };
+        for _ in &section.announces {
+            self.proposer_reg_queue.pop_back();
+        }
+        for reg in &section.activations {
+            self.proposer_registry.unregister(&reg.vrf_pubkey, height);
+        }
+        for reg in section.activations.iter().rev() {
+            self.proposer_reg_queue.push_front(reg.clone());
         }
     }
 
@@ -2629,6 +2709,7 @@ impl ChainState {
             reorg_orphaned_blocks: Vec::new(),
             dominance: crate::poawx_dominance::PersistentDominance::from_env(),
             proposer_registry: crate::poawx_proposer::ProposerEligibilityRegistry::from_env(),
+            proposer_reg_queue: std::collections::VecDeque::new(),
             penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
             adaptive_mode: crate::poawx_adaptive::AdaptiveMode::Normal,
             reorg_signal: 0,
@@ -13428,7 +13509,10 @@ mod proposer_consensus_tests {
     //! with --test-threads=1 (env-sensitive). Mainnet stays hard-off regardless.
     use super::*;
     use crate::block::{Block, BlockHeader};
-    use crate::poawx::{PoawxBlockReceipt, ProposerAssignmentV1};
+    use crate::poawx::{
+        PoawxBlockReceipt, ProposerAssignmentV1, ProposerRegistrationSection,
+        ProposerRegistrationV1,
+    };
     use crate::poawx_candidate::AssignmentProofV2;
     use crate::poawx_committed_admission::expected_epoch_seed;
     use crate::poawx_dominance::PersistentDominance;
@@ -13778,5 +13862,108 @@ mod proposer_consensus_tests {
             "winner is a round-0 proposer (a CPU), never the ASIC"
         );
         std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    fn set_reg_env() {
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_PROPOSER_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_PROPOSER_VRF_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_PROPOSER_REGISTRATION_ACTIVATION_HEIGHT", "1");
+    }
+    fn clear_reg_env() {
+        for k in [
+            "IRIUM_NETWORK",
+            "IRIUM_POAWX_PROPOSER_VRF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PROPOSER_VRF_REQUIRED",
+            "IRIUM_POAWX_PROPOSER_REGISTRATION_ACTIVATION_HEIGHT",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    fn block_with_registrations(
+        template: &PoawxBlockReceipt,
+        prev_hash: [u8; 32],
+        height: u64,
+        announces: Vec<ProposerRegistrationV1>,
+        activations: Vec<ProposerRegistrationV1>,
+    ) -> Block {
+        let mut r = template.clone();
+        r.height = height;
+        let mut ext = r.phase20_ext.clone().expect("ext");
+        ext.proposer_registrations = Some(ProposerRegistrationSection {
+            announces,
+            activations,
+        });
+        r.phase20_ext = Some(ext);
+        Block {
+            header: BlockHeader {
+                version: 0,
+                prev_hash,
+                merkle_root: [0u8; 32],
+                time: 1_000,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![r]),
+        }
+    }
+
+    #[test]
+    fn registration_queue_apply_revert_symmetry() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_reg_env();
+        let net = crate::activation::network_id_byte();
+        let mut cs = base_chain();
+        let anchor = cs.chain[0].header.hash_for_height(0);
+        let tmpl = ext_skeleton(net);
+        let ra = ProposerRegistrationV1::build_signed(&[0xA1u8; 32], net, 0, &anchor, 8).unwrap();
+        let rb = ProposerRegistrationV1::build_signed(&[0xB2u8; 32], net, 0, &anchor, 8).unwrap();
+
+        // height 1: announce ra + rb (queue empty => 0 activations).
+        let b1 = block_with_registrations(&tmpl, anchor, 1, vec![ra.clone(), rb.clone()], vec![]);
+        cs.chain.push(b1.clone());
+        cs.apply_block_proposer_registrations(1);
+        assert_eq!(cs.proposer_reg_queue.len(), 2);
+        assert!(!cs.proposer_registry.is_eligible(&ra.vrf_pubkey, 1000)); // queued, not active
+
+        // height 2: force-drain head (ra) => activated + registered.
+        let b2 = block_with_registrations(&tmpl, anchor, 2, vec![], vec![ra.clone()]);
+        cs.chain.push(b2.clone());
+        cs.apply_block_proposer_registrations(2);
+        assert_eq!(cs.proposer_reg_queue.len(), 1);
+        assert_eq!(cs.proposer_reg_queue.front().unwrap().vrf_pubkey, rb.vrf_pubkey);
+        assert!(cs.proposer_registry.is_eligible(&ra.vrf_pubkey, 1000)); // eligible past freeze
+
+        // revert height 2 == exact inverse.
+        cs.revert_block_proposer_registrations(&b2, 2);
+        cs.chain.pop();
+        assert_eq!(cs.proposer_reg_queue.len(), 2);
+        assert_eq!(cs.proposer_reg_queue.front().unwrap().vrf_pubkey, ra.vrf_pubkey);
+        assert!(!cs.proposer_registry.is_eligible(&ra.vrf_pubkey, 1000));
+
+        // revert height 1 => empty.
+        cs.revert_block_proposer_registrations(&b1, 1);
+        cs.chain.pop();
+        assert_eq!(cs.proposer_reg_queue.len(), 0);
+        clear_reg_env();
+    }
+
+    #[test]
+    fn part_b_eligible_count_proposer_only() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_reg_env();
+        let net = crate::activation::network_id_byte();
+        let gh = genesis_block().header.hash_for_height(0);
+        let seed = expected_epoch_seed(1, gh, Some(&genesis_block()));
+        // real all-gates block: 3 sub-role assignment keys + 1 proposer key.
+        let bwp = proposer_block_h1(&secret_n(1), net, seed, 0);
+        // legacy (registration inactive): sub-role (3) + proposer (1) = 4.
+        assert_eq!(ChainState::proposer_keys_from_block(&bwp, false).len(), 4);
+        // Part B (registration active): proposer key only = 1.
+        assert_eq!(ChainState::proposer_keys_from_block(&bwp, true).len(), 1);
+        clear_reg_env();
     }
 }
