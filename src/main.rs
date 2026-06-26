@@ -48,6 +48,7 @@ mod poawx_finality;
 mod poawx_gossip;
 mod poawx_mining_harness;
 mod poawx_penalty;
+mod poawx_proposer;
 mod poawx_puzzle;
 mod poawx_ticket;
 mod protocol;

@@ -12,6 +12,7 @@
 //! `bin/iriumd.rs` / `bin/irium-miner.rs`.
 
 use crate::activation::network_id_byte;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The PRIMARY proposer role id for the proposer VRF (distinct from the
 /// compute/verify/support sub-roles 1/2/3). The block's `worker_pkh` IS the
@@ -130,6 +131,119 @@ pub fn proposer_vrf_enforced(height: u64) -> bool {
     proposer_vrf_active(height) && proposer_vrf_required()
 }
 
+pub fn proposer_expiry_window() -> u64 {
+    std::env::var("IRIUM_POAWX_PROPOSER_EXPIRY_WINDOW")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2016)
+        .max(1)
+}
+
+/// Reorg-safe registry of eligible proposer VRF keys. A key is eligible for height
+/// `H` only via on-chain registrations FROZEN at `H - FREEZE_DEPTH`, so the seed
+/// `S_H` (revealed at H-1) cannot be used to register a winning key after the fact.
+/// Registrations apply on `connect_block` and revert on `disconnect_tip_block`
+/// (exact inverse), so the frozen view is deterministic on any fork. Mainnet-off:
+/// only populated when `proposer_vrf_active(height)`.
+#[derive(Debug, Clone, Default)]
+pub struct ProposerEligibilityRegistry {
+    keys: BTreeMap<[u8; 33], ProposerKeyRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProposerKeyRecord {
+    pkh: [u8; 20],
+    heights: BTreeSet<u64>,
+}
+
+impl ProposerEligibilityRegistry {
+    pub fn from_env() -> Self {
+        Self::default()
+    }
+
+    /// Record that `vrf_pubkey` (owned by `pkh`) appeared on-chain at `height`.
+    pub fn register(&mut self, vrf_pubkey: [u8; 33], pkh: [u8; 20], height: u64) {
+        let rec = self.keys.entry(vrf_pubkey).or_default();
+        rec.pkh = pkh;
+        rec.heights.insert(height);
+    }
+
+    /// Exact inverse of `register` for the same `(vrf_pubkey, height)`.
+    pub fn unregister(&mut self, vrf_pubkey: &[u8; 33], height: u64) {
+        if let Some(rec) = self.keys.get_mut(vrf_pubkey) {
+            rec.heights.remove(&height);
+            if rec.heights.is_empty() {
+                self.keys.remove(vrf_pubkey);
+            }
+        }
+    }
+
+    /// Inclusive frozen registration window `[lo, hi]` for target `H` with the given
+    /// freeze depth `fd` and expiry window `ew`. `None` if there is not yet `fd`
+    /// history (bootstrap => no eligibility => the sortition threshold is permissive).
+    fn frozen_window_with(fd: u64, ew: u64, target_height: u64) -> Option<(u64, u64)> {
+        if target_height < fd {
+            return None;
+        }
+        let hi = target_height - fd;
+        let lo = hi.saturating_sub(ew.saturating_sub(1));
+        Some((lo, hi))
+    }
+
+    fn record_in_window(rec: &ProposerKeyRecord, lo: u64, hi: u64) -> bool {
+        rec.heights.range(lo..=hi).next().is_some()
+    }
+
+    pub fn eligible_count_with(&self, target_height: u64, fd: u64, ew: u64) -> u64 {
+        match Self::frozen_window_with(fd, ew, target_height) {
+            None => 0,
+            Some((lo, hi)) => self
+                .keys
+                .values()
+                .filter(|r| Self::record_in_window(r, lo, hi))
+                .count() as u64,
+        }
+    }
+
+    pub fn is_eligible_with(
+        &self,
+        vrf_pubkey: &[u8; 33],
+        target_height: u64,
+        fd: u64,
+        ew: u64,
+    ) -> bool {
+        match Self::frozen_window_with(fd, ew, target_height) {
+            None => false,
+            Some((lo, hi)) => self
+                .keys
+                .get(vrf_pubkey)
+                .map_or(false, |r| Self::record_in_window(r, lo, hi)),
+        }
+    }
+
+    /// Eligible count at `H` using env-configured freeze depth + expiry window.
+    pub fn eligible_count(&self, target_height: u64) -> u64 {
+        self.eligible_count_with(target_height, proposer_freeze_depth(), proposer_expiry_window())
+    }
+
+    pub fn is_eligible(&self, vrf_pubkey: &[u8; 33], target_height: u64) -> bool {
+        self.is_eligible_with(
+            vrf_pubkey,
+            target_height,
+            proposer_freeze_depth(),
+            proposer_expiry_window(),
+        )
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +329,41 @@ mod tests {
         let mut out = [0u8; 32];
         out[0..8].copy_from_slice(&7u64.to_le_bytes());
         assert_eq!(proposer_priority(&out), 7);
+    }
+
+    #[test]
+    fn registry_freeze_and_expiry() {
+        let mut reg = ProposerEligibilityRegistry::default();
+        let k1 = [0x11u8; 33];
+        let k2 = [0x22u8; 33];
+        let (fd, ew) = (16u64, 100u64);
+        reg.register(k1, [0x01u8; 20], 10);
+        reg.register(k2, [0x02u8; 20], 12);
+        // not enough history => no eligibility (bootstrap permissive).
+        assert_eq!(reg.eligible_count_with(10, fd, ew), 0);
+        // k1 (h=10) eligible at H=26 (window hi = 26-16 = 10); k2 (h=12) not yet.
+        assert!(reg.is_eligible_with(&k1, 26, fd, ew));
+        assert!(!reg.is_eligible_with(&k2, 26, fd, ew));
+        assert_eq!(reg.eligible_count_with(26, fd, ew), 1);
+        // at H=28 (hi=12) both are in the frozen window.
+        assert_eq!(reg.eligible_count_with(28, fd, ew), 2);
+        // expiry: at H=126 (window [11,110]) k1(10) drops out, k2(12) remains.
+        assert!(!reg.is_eligible_with(&k1, 126, fd, ew));
+        assert!(reg.is_eligible_with(&k2, 126, fd, ew));
+    }
+
+    #[test]
+    fn registry_register_unregister_symmetry() {
+        let mut reg = ProposerEligibilityRegistry::default();
+        let k = [0x33u8; 33];
+        let (fd, ew) = (4u64, 100u64);
+        reg.register(k, [0x03u8; 20], 20);
+        reg.register(k, [0x03u8; 20], 21);
+        assert_eq!(reg.len(), 1);
+        assert!(reg.is_eligible_with(&k, 24, fd, ew)); // hi=20, has 20
+        reg.unregister(&k, 20);
+        reg.unregister(&k, 21);
+        assert_eq!(reg.len(), 0); // exact inverse => fully removed
+        assert!(!reg.is_eligible_with(&k, 24, fd, ew));
     }
 }

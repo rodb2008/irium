@@ -291,6 +291,10 @@ pub struct ChainState {
     /// (both gated + mainnet hard-off); deterministically rebuilt by chain
     /// replay on restart / rebuild-style reorg.
     pub dominance: crate::poawx_dominance::PersistentDominance,
+    /// Phase 31: reorg-safe VRF-proposer eligibility registry. Populated in
+    /// `connect_block` + reverted in `disconnect_tip_block` (gated on
+    /// `proposer_vrf_active`; mainnet hard-off => empty/no-op).
+    pub proposer_registry: crate::poawx_proposer::ProposerEligibilityRegistry,
     /// Phase 26+: persistent, reorg-safe penalty/slashing state driven by
     /// accepted fraud proofs. Applied in `connect_block` and reverted in
     /// `disconnect_tip_block` (both gated + mainnet hard-off); deterministically
@@ -388,6 +392,7 @@ impl ChainState {
             claimed_ltc_outpoints: HashSet::new(),
             reorg_orphaned_blocks: Vec::new(),
             dominance: crate::poawx_dominance::PersistentDominance::from_env(),
+            proposer_registry: crate::poawx_proposer::ProposerEligibilityRegistry::from_env(),
             penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
             adaptive_mode: crate::poawx_adaptive::AdaptiveMode::Normal,
             reorg_signal: 0,
@@ -930,6 +935,7 @@ impl ChainState {
         self.undo_logs.insert(hash, undo);
         self.best_tip = hash;
         self.apply_block_dominance(expected_height);
+        self.apply_block_proposer_registry(expected_height);
         self.apply_block_fraud_slashing(expected_height);
         self.update_adaptive_mode(expected_height);
         // Finality-checkpoint watermark: when finality is enforced, an accepted
@@ -1030,6 +1036,7 @@ impl ChainState {
             .map(|b| b.header.hash_for_height(new_tip_height))
             .unwrap_or([0u8; 32]);
         self.revert_block_dominance(&tip_block, tip_height);
+        self.revert_block_proposer_registry(&tip_block, tip_height);
         self.revert_block_fraud_slashing(&tip_block, tip_height);
         // Gap 10: node-local reorg pressure feeds the adaptive Defense trigger.
         self.reorg_signal = self.reorg_signal.saturating_add(1);
@@ -1696,6 +1703,49 @@ impl ChainState {
     /// Apply the accepted tip block's reward events to the dominance state.
     /// No-op unless `anti_domination_active(height)` (mainnet hard-off, default
     /// off, so existing behavior is unchanged when the gate is off).
+    /// Phase 31: the `(vrf_pubkey, pkh)` pairs a block registers for proposer
+    /// eligibility. Source: the V2 assignment proofs in each receipt (the proposer
+    /// section adds the proposer's own key once it lands). Pure.
+    fn proposer_keys_from_block(block: &Block) -> Vec<([u8; 33], [u8; 20])> {
+        let mut out = Vec::new();
+        if let Some(receipts) = &block.poawx_receipts {
+            for r in receipts {
+                if let Some(ext) = &r.phase20_ext {
+                    if let Some(proofs) = &ext.role_assignment_v2 {
+                        for p in proofs.iter() {
+                            out.push((p.assignment_public_key, p.solver_pkh));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Apply the tip block's proposer-key registrations (gated; mainnet hard-off).
+    fn apply_block_proposer_registry(&mut self, height: u64) {
+        if !crate::poawx_proposer::proposer_vrf_active(height) {
+            return;
+        }
+        let keys = match self.chain.last() {
+            Some(b) => Self::proposer_keys_from_block(b),
+            None => return,
+        };
+        for (pubkey, pkh) in keys {
+            self.proposer_registry.register(pubkey, pkh, height);
+        }
+    }
+
+    /// Exact inverse of `apply_block_proposer_registry` for a disconnected tip.
+    fn revert_block_proposer_registry(&mut self, block: &Block, height: u64) {
+        if !crate::poawx_proposer::proposer_vrf_active(height) {
+            return;
+        }
+        for (pubkey, _pkh) in Self::proposer_keys_from_block(block) {
+            self.proposer_registry.unregister(&pubkey, height);
+        }
+    }
+
     fn apply_block_dominance(&mut self, height: u64) {
         if !crate::poawx_dominance::anti_domination_active(height) {
             return;
@@ -2439,6 +2489,7 @@ impl ChainState {
             claimed_ltc_outpoints: self.claimed_ltc_outpoints.clone(),
             reorg_orphaned_blocks: Vec::new(),
             dominance: crate::poawx_dominance::PersistentDominance::from_env(),
+            proposer_registry: crate::poawx_proposer::ProposerEligibilityRegistry::from_env(),
             penalty: crate::poawx_penalty::PersistentPenalty::from_env(),
             adaptive_mode: crate::poawx_adaptive::AdaptiveMode::Normal,
             reorg_signal: 0,
