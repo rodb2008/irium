@@ -914,6 +914,9 @@ impl ChainState {
         if crate::poawx_proposer::proposer_vrf_enforced(expected_height) {
             self.validate_block_proposer(&block, expected_height, previous)?;
         }
+        if crate::poawx_proposer::proposer_registration_active(expected_height) {
+            self.validate_block_proposer_registrations(&block, expected_height)?;
+        }
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1152,6 +1155,94 @@ impl ChainState {
     /// non-assigned proposer is rejected regardless of PoW. Every VRF input is pinned
     /// (canonical ticket digest, solver = hash160(vrf key) = block worker, seed = the
     /// committee epoch seed) so a miner cannot grind a favorable priority.
+    /// Phase 31R: validate the block's proposer-registration section (gated). Two parts:
+    /// (a) ANNOUNCES are self-valid (sybil PoW + self-signature) and bound to a recent
+    ///     CANONICAL anchor block, within the announce cap, and not already queued; and
+    /// (b) FORCED-DRAIN: the ACTIVATIONS must be exactly the deterministic on-chain queue
+    ///     head `[0 .. min(REG_CAP, queue.len())]`, in order. A producer therefore cannot
+    ///     skip, reorder, under-drain, or starve a queued registration. The queue is
+    ///     consensus state (identical on every node), so this validity rule is
+    ///     deterministic. At most one section per block. Mainnet hard-off via the gate.
+    fn validate_block_proposer_registrations(
+        &self,
+        block: &Block,
+        height: u64,
+    ) -> Result<(), String> {
+        let net = crate::activation::network_id_byte();
+        // at most one section per block.
+        let mut section: Option<&crate::poawx::ProposerRegistrationSection> = None;
+        if let Some(receipts) = &block.poawx_receipts {
+            for r in receipts {
+                if let Some(ext) = &r.phase20_ext {
+                    if let Some(sec) = &ext.proposer_registrations {
+                        if section.is_some() {
+                            return Err(
+                                "proposer registration: multiple sections in block".to_string()
+                            );
+                        }
+                        section = Some(sec);
+                    }
+                }
+            }
+        }
+        // (b) forced-drain: activations == queue head up to cap, ALWAYS (even with no
+        // section, an empty activations list must match an empty queue head).
+        let cap = crate::poawx_proposer::PROPOSER_REG_CAP;
+        let k = cap.min(self.proposer_reg_queue.len());
+        let empty: Vec<crate::poawx::ProposerRegistrationV1> = Vec::new();
+        let acts = section.map(|s| &s.activations).unwrap_or(&empty);
+        if acts.len() != k {
+            return Err(format!(
+                "proposer registration: must force-drain {} queue-head entries, got {}",
+                k,
+                acts.len()
+            ));
+        }
+        for (i, a) in acts.iter().enumerate() {
+            if self.proposer_reg_queue[i] != *a {
+                return Err(format!(
+                    "proposer registration: activation[{}] does not match the queue head",
+                    i
+                ));
+            }
+        }
+        // (a) announces.
+        if let Some(sec) = section {
+            let announce_cap = crate::poawx_proposer::PROPOSER_ANNOUNCE_CAP;
+            if sec.announces.len() > announce_cap {
+                return Err("proposer registration: announces over cap".to_string());
+            }
+            let required_bits = crate::poawx_ticket::effective_sybil_bits();
+            let window = crate::poawx_proposer::PROPOSER_REG_ANCHOR_WINDOW;
+            // dedup against the full pre-block queue (and within this block's announces).
+            let mut seen: std::collections::HashSet<[u8; 33]> =
+                self.proposer_reg_queue.iter().map(|r| r.vrf_pubkey).collect();
+            for a in &sec.announces {
+                // recent: anchor strictly in the past and within the window.
+                if a.anchor_height >= height {
+                    return Err("proposer registration: anchor not in the past".to_string());
+                }
+                if height > window && a.anchor_height < height - window {
+                    return Err("proposer registration: anchor older than window".to_string());
+                }
+                // canonical: the anchor hash must be this chain's block at that height.
+                let anchor_block = self.chain.get(a.anchor_height as usize).ok_or_else(|| {
+                    "proposer registration: unknown anchor height".to_string()
+                })?;
+                let anchor_hash = anchor_block.header.hash_for_height(a.anchor_height);
+                // self-validity: sybil PoW + self-signature, bound to that anchor.
+                a.validate(net, &anchor_hash, required_bits)?;
+                // no duplicates / already-queued keys.
+                if !seen.insert(a.vrf_pubkey) {
+                    return Err(
+                        "proposer registration: duplicate or already-queued key".to_string()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_block_proposer(
         &self,
         block: &Block,
@@ -13964,6 +14055,105 @@ mod proposer_consensus_tests {
         assert_eq!(ChainState::proposer_keys_from_block(&bwp, false).len(), 4);
         // Part B (registration active): proposer key only = 1.
         assert_eq!(ChainState::proposer_keys_from_block(&bwp, true).len(), 1);
+        clear_reg_env();
+    }
+
+    fn bare_block(template: &PoawxBlockReceipt, prev_hash: [u8; 32], height: u64) -> Block {
+        let mut r = template.clone();
+        r.height = height;
+        Block {
+            header: BlockHeader {
+                version: 0,
+                prev_hash,
+                merkle_root: [0u8; 32],
+                time: 1_000,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![r]),
+        }
+    }
+
+    #[test]
+    fn registration_validation_forced_drain_and_announces() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_reg_env(); // no sybil env => effective_sybil_bits() == 0
+        let net = crate::activation::network_id_byte();
+        let mut cs = base_chain();
+        let gh = cs.chain[0].header.hash_for_height(0);
+        let tmpl = ext_skeleton(net);
+        let ra = ProposerRegistrationV1::build_signed(&[0xA1u8; 32], net, 0, &gh, 0).unwrap();
+        let rb = ProposerRegistrationV1::build_signed(&[0xB2u8; 32], net, 0, &gh, 0).unwrap();
+        // enqueue ra at height 1; queue head = [ra], k = 1.
+        let b1 = block_with_registrations(&tmpl, gh, 1, vec![ra.clone()], vec![]);
+        cs.chain.push(b1);
+        cs.apply_block_proposer_registrations(1);
+        assert_eq!(cs.proposer_reg_queue.len(), 1);
+
+        // (1) no section while queue non-empty => forced-drain reject.
+        let none_block = bare_block(&tmpl, gh, 2);
+        let e = cs
+            .validate_block_proposer_registrations(&none_block, 2)
+            .unwrap_err();
+        assert!(e.contains("force-drain"), "got: {e}");
+        // (2) wrong activation => reject.
+        let wrong = block_with_registrations(&tmpl, gh, 2, vec![], vec![rb.clone()]);
+        assert!(cs.validate_block_proposer_registrations(&wrong, 2).is_err());
+        // (3) correct activation, no announces => ok.
+        let okb = block_with_registrations(&tmpl, gh, 2, vec![], vec![ra.clone()]);
+        assert!(cs.validate_block_proposer_registrations(&okb, 2).is_ok());
+        // (4) correct activation + a valid new announce => ok.
+        let okb2 = block_with_registrations(&tmpl, gh, 2, vec![rb.clone()], vec![ra.clone()]);
+        assert!(cs.validate_block_proposer_registrations(&okb2, 2).is_ok());
+        // (5) announce bound to a non-canonical anchor hash => reject.
+        let bad_anchor =
+            ProposerRegistrationV1::build_signed(&[0xC3u8; 32], net, 0, &[0u8; 32], 0).unwrap();
+        let badc = block_with_registrations(&tmpl, gh, 2, vec![bad_anchor], vec![ra.clone()]);
+        assert!(cs.validate_block_proposer_registrations(&badc, 2).is_err());
+        // (6) tampered announce signature => reject.
+        let mut tampered = rb.clone();
+        tampered.signature[0] ^= 0xff;
+        let badt = block_with_registrations(&tmpl, gh, 2, vec![tampered], vec![ra.clone()]);
+        assert!(cs.validate_block_proposer_registrations(&badt, 2).is_err());
+        // (7) re-announce an already-queued key => dedup reject.
+        let dup = block_with_registrations(&tmpl, gh, 2, vec![ra.clone()], vec![ra.clone()]);
+        assert!(cs.validate_block_proposer_registrations(&dup, 2).is_err());
+        // (8) two registration sections in one block => reject.
+        let mut r1 = tmpl.clone();
+        r1.height = 2;
+        let mut e1 = r1.phase20_ext.clone().unwrap();
+        e1.proposer_registrations = Some(ProposerRegistrationSection {
+            announces: vec![],
+            activations: vec![ra.clone()],
+        });
+        r1.phase20_ext = Some(e1);
+        let mut r2 = tmpl.clone();
+        r2.height = 2;
+        let mut e2 = r2.phase20_ext.clone().unwrap();
+        e2.proposer_registrations = Some(ProposerRegistrationSection {
+            announces: vec![],
+            activations: vec![],
+        });
+        r2.phase20_ext = Some(e2);
+        let multi = Block {
+            header: BlockHeader {
+                version: 0,
+                prev_hash: gh,
+                merkle_root: [0u8; 32],
+                time: 1_000,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![r1, r2]),
+        };
+        let e = cs
+            .validate_block_proposer_registrations(&multi, 2)
+            .unwrap_err();
+        assert!(e.contains("multiple sections"), "got: {e}");
         clear_reg_env();
     }
 }
