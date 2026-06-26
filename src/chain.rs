@@ -8415,6 +8415,7 @@ mod tests {
             role_assignment_v2: None,
             fraud_proofs: None,
             proposer_assignment: None,
+            proposer_registrations: None,
         }
     }
 
@@ -12913,6 +12914,7 @@ mod tests {
                 role_assignment_v2: None,
                 fraud_proofs: None,
                 proposer_assignment: None,
+                proposer_registrations: None,
             }
         };
         let build = |h: u64, prev: &[u8; 32], ext: &crate::poawx::Phase20ReceiptExt| -> Block {

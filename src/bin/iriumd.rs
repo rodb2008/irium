@@ -29000,6 +29000,7 @@ mod tests {
             role_assignment_v2: None,
             fraud_proofs: None,
             proposer_assignment: None,
+            proposer_registrations: None,
         };
         let pubk = "02".to_string() + &"cd".repeat(32);
         let r = PoawxPendingReceipt {
@@ -30281,6 +30282,7 @@ mod tests {
             role_assignment_v2: None,
             fraud_proofs: None,
             proposer_assignment: None,
+            proposer_registrations: None,
         };
         let mut r = make_test_block_receipt_c(90, b'A', 7);
         r.phase20_ext = Some(ext.clone());
