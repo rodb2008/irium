@@ -821,6 +821,23 @@ impl ProposerRegistrationV1 {
         me.signature.copy_from_slice(&sig.to_bytes());
         Ok(me)
     }
+
+    /// Verify only the self-signature over the signing digest (cheap; no anchor/sybil
+    /// binding). Used for light gossip-ingest filtering; connect_block does the full
+    /// anchor-bound validation.
+    pub fn signature_ok(&self, network_id: u8) -> bool {
+        use k256::ecdsa::signature::hazmat::PrehashVerifier;
+        use k256::ecdsa::{Signature, VerifyingKey};
+        let vk = match VerifyingKey::from_sec1_bytes(&self.vrf_pubkey) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let sig = match Signature::from_slice(&self.signature) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        vk.verify_prehash(&self.signing_digest(network_id), &sig).is_ok()
+    }
 }
 
 /// Phase 31R: 4-byte trailing-section magic for proposer registrations.

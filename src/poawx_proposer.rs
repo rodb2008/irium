@@ -13,6 +13,7 @@
 
 use crate::activation::network_id_byte;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, OnceLock};
 
 /// The PRIMARY proposer role id for the proposer VRF (distinct from the
 /// compute/verify/support sub-roles 1/2/3). The block's `worker_pkh` IS the
@@ -306,6 +307,105 @@ impl ProposerEligibilityRegistry {
     }
 }
 
+/// Max pending gossiped registrations a node will hold.
+pub const PROPOSER_REG_POOL_MAX: usize = 1024;
+
+/// Whether proposer-registration gossip is enabled (non-mainnet only).
+pub fn proposer_registration_gossip_enabled() -> bool {
+    crate::activation::network_id_byte() != 0
+}
+
+/// Node-local pool of gossiped proposer registrations awaiting on-chain announcement.
+/// Gossip ingest is LIGHT (claimed sybil bits + self-signature + dedup); the full
+/// anchor-bound validation runs at block inclusion (connect_block). Mainnet hard-off.
+#[derive(Default)]
+pub struct NodeProposerRegistrationPool {
+    pending: Mutex<BTreeMap<[u8; 33], crate::poawx::ProposerRegistrationV1>>,
+}
+
+impl NodeProposerRegistrationPool {
+    pub fn ingest_bytes(&self, bytes: &[u8]) -> crate::poawx_gossip::GossipOutcome {
+        use crate::poawx_gossip::GossipOutcome;
+        if !proposer_registration_gossip_enabled() {
+            return GossipOutcome::Rejected("registration gossip disabled".to_string());
+        }
+        if bytes.len() != crate::poawx::PROPOSER_REGISTRATION_V1_WIRE {
+            return GossipOutcome::Rejected("registration: bad length".to_string());
+        }
+        let reg = match crate::poawx::ProposerRegistrationV1::deserialize(bytes) {
+            Ok(r) => r,
+            Err(e) => return GossipOutcome::Rejected(e),
+        };
+        let net = crate::activation::network_id_byte();
+        if !crate::poawx_ticket::meets_sybil_target(
+            &reg.sybil_digest,
+            crate::poawx_ticket::effective_sybil_bits(),
+        ) {
+            return GossipOutcome::Rejected("registration: insufficient sybil work".to_string());
+        }
+        if !reg.signature_ok(net) {
+            return GossipOutcome::Rejected("registration: bad signature".to_string());
+        }
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.contains_key(&reg.vrf_pubkey) {
+            return GossipOutcome::Duplicate;
+        }
+        if pending.len() >= PROPOSER_REG_POOL_MAX {
+            return GossipOutcome::Rejected("registration: pool full".to_string());
+        }
+        pending.insert(reg.vrf_pubkey, reg);
+        GossipOutcome::AcceptedNew
+    }
+
+    /// Local submit (RPC path): store + return the wire bytes to gossip.
+    pub fn submit(&self, reg: crate::poawx::ProposerRegistrationV1) -> Vec<u8> {
+        let bytes = reg.serialize();
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.insert(reg.vrf_pubkey, reg);
+        bytes
+    }
+
+    /// Up to `max` pending registrations whose key is NOT in `exclude` (already queued or
+    /// on-chain), as announce candidates for the next block.
+    pub fn announce_candidates(
+        &self,
+        max: usize,
+        exclude: &BTreeSet<[u8; 33]>,
+    ) -> Vec<crate::poawx::ProposerRegistrationV1> {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending
+            .values()
+            .filter(|r| !exclude.contains(&r.vrf_pubkey))
+            .take(max)
+            .cloned()
+            .collect()
+    }
+
+    pub fn forget(&self, keys: &[[u8; 33]]) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for k in keys {
+            pending.remove(k);
+        }
+    }
+
+    pub fn contains(&self, key: &[u8; 33]) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+static GLOBAL_PROPOSER_REG_POOL: OnceLock<NodeProposerRegistrationPool> = OnceLock::new();
+
+pub fn global_proposer_reg_pool() -> &'static NodeProposerRegistrationPool {
+    GLOBAL_PROPOSER_REG_POOL.get_or_init(NodeProposerRegistrationPool::default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +500,33 @@ mod tests {
         assert!(proposer_registration_gate(true, Some(50), 50)); // active at height
         assert!(proposer_registration_gate(true, Some(50), 999)); // active after
         assert!(!proposer_registration_gate(true, Some(50), 49)); // before activation
+    }
+
+    #[test]
+    fn pool_ingest_dedup_and_filter() {
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let net = crate::activation::network_id_byte();
+        let pool = NodeProposerRegistrationPool::default();
+        let reg =
+            crate::poawx::ProposerRegistrationV1::build_signed(&[0x7u8; 32], net, 0, &[0x9u8; 32], 0)
+                .unwrap();
+        let bytes = reg.serialize();
+        assert!(matches!(
+            pool.ingest_bytes(&bytes),
+            crate::poawx_gossip::GossipOutcome::AcceptedNew
+        ));
+        assert!(matches!(
+            pool.ingest_bytes(&bytes),
+            crate::poawx_gossip::GossipOutcome::Duplicate
+        ));
+        let mut bad = reg.clone();
+        bad.signature[0] ^= 0xff;
+        assert!(matches!(
+            pool.ingest_bytes(&bad.serialize()),
+            crate::poawx_gossip::GossipOutcome::Rejected(_)
+        ));
+        assert_eq!(pool.len(), 1);
+        std::env::remove_var("IRIUM_NETWORK");
     }
 
     #[test]

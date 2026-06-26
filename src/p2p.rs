@@ -4100,6 +4100,14 @@ impl P2PNode {
         let _ = broadcast_raw(&self.peers, &serialized).await;
     }
 
+    pub async fn broadcast_proposer_registration(&self, reg_bytes: &[u8]) {
+        let payload = crate::protocol::PoawxProposerRegistrationPayload {
+            reg_bytes: reg_bytes.to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
     /// Phase 1A+1B: drain accumulated incoming offer JSON strings. Called
     /// by iriumd offer-watcher, which writes each JSON to
     /// ~/.irium/offers/<id>.json so /offers/feed serves it locally.
@@ -6546,6 +6554,25 @@ impl P2PNode {
                             }
                         }
                     }
+                    MessageType::PoawxProposerRegistration => {
+                        if crate::poawx_proposer::proposer_registration_gossip_enabled() {
+                            if let Ok(p) =
+                                crate::protocol::PoawxProposerRegistrationPayload::from_message(&msg)
+                            {
+                                if crate::poawx_proposer::global_proposer_reg_pool()
+                                    .ingest_bytes(&p.reg_bytes)
+                                    .should_rebroadcast()
+                                {
+                                    let bytes = crate::protocol::PoawxProposerRegistrationPayload {
+                                        reg_bytes: p.reg_bytes,
+                                    }
+                                    .to_message()
+                                    .serialize();
+                                    let _ = broadcast_raw(&peers_vec, &bytes).await;
+                                }
+                            }
+                        }
+                    }
                     MessageType::DisputeRaisedNotification => {
                         if let Ok(p) =
                             crate::protocol::DisputeRaisedNotificationPayload::from_message(&msg)
@@ -8969,6 +8996,25 @@ async fn handle_incoming_with_sybil(
                         {
                             let bytes = crate::protocol::PoawxFinalityVotePayload {
                                 vote_bytes: p.vote_bytes,
+                            }
+                            .to_message()
+                            .serialize();
+                            let _ = broadcast_raw(&peers, &bytes).await;
+                        }
+                    }
+                }
+            }
+            MessageType::PoawxProposerRegistration => {
+                if crate::poawx_proposer::proposer_registration_gossip_enabled() {
+                    if let Ok(p) =
+                        crate::protocol::PoawxProposerRegistrationPayload::from_message(&msg)
+                    {
+                        if crate::poawx_proposer::global_proposer_reg_pool()
+                            .ingest_bytes(&p.reg_bytes)
+                            .should_rebroadcast()
+                        {
+                            let bytes = crate::protocol::PoawxProposerRegistrationPayload {
+                                reg_bytes: p.reg_bytes,
                             }
                             .to_message()
                             .serialize();

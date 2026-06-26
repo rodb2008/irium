@@ -106,6 +106,10 @@ pub enum MessageType {
     /// `FinalityVoteV1` wire bytes (opaque here; the node finality-vote cache
     /// validates the member signature + stores). Drop-safe forward-compat.
     PoawxFinalityVote = 29,
+    /// Gossip: PoAW-X proposer key registration (Phase 31R). Payload: canonical
+    /// `ProposerRegistrationV1` wire bytes (opaque; the node pool light-validates +
+    /// stores; full anchor-bound validation at block inclusion). Drop-safe.
+    PoawxProposerRegistration = 30,
     Disconnect = 99,
 }
 
@@ -145,6 +149,7 @@ impl TryFrom<u8> for MessageType {
             27 => PoawxRoleReveal,
             28 => PoawxCandidateAdmission,
             29 => PoawxFinalityVote,
+            30 => PoawxProposerRegistration,
             99 => Disconnect,
             other => return Err(format!("Unknown message type: {}", other)),
         };
@@ -914,6 +919,30 @@ impl PoawxCandidateAdmissionPayload {
         }
         Ok(PoawxCandidateAdmissionPayload {
             admission_bytes: msg.payload.clone(),
+        })
+    }
+}
+
+/// Wire payload for `MessageType::PoawxProposerRegistration` (Phase 31R). Opaque bytes
+/// (same pattern as the admission/vote payloads); the node pool light-validates + stores.
+pub struct PoawxProposerRegistrationPayload {
+    pub reg_bytes: Vec<u8>,
+}
+
+impl PoawxProposerRegistrationPayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::PoawxProposerRegistration,
+            payload: self.reg_bytes.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::PoawxProposerRegistration {
+            return Err("Not a poawx proposer registration".to_string());
+        }
+        Ok(PoawxProposerRegistrationPayload {
+            reg_bytes: msg.payload.clone(),
         })
     }
 }

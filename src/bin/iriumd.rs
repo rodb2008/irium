@@ -14378,6 +14378,40 @@ fn finality_vote_bridge_guard(addr: &SocketAddr) -> Result<(), StatusCode> {
     Ok(())
 }
 
+fn proposer_registration_bridge_guard(addr: &SocketAddr) -> Result<(), StatusCode> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !irium_node_rs::poawx_proposer::proposer_registration_gossip_enabled() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+/// POST /poawx/registration : a local miner submits a ProposerRegistrationV1 (wire
+/// bytes). The node light-validates, pools it, and gossips it so a producer can announce
+/// it on-chain. Loopback-only; mainnet hard-off.
+async fn poawx_post_registration(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, StatusCode> {
+    proposer_registration_bridge_guard(&addr)?;
+    let pool = irium_node_rs::poawx_proposer::global_proposer_reg_pool();
+    match pool.ingest_bytes(body.as_ref()) {
+        irium_node_rs::poawx_gossip::GossipOutcome::AcceptedNew => {
+            if let Some(ref p2p) = state.p2p {
+                p2p.broadcast_proposer_registration(body.as_ref()).await;
+            }
+            Ok(Json(json!({"status":"accepted"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Duplicate => {
+            Ok(Json(json!({"status":"duplicate"})))
+        }
+        irium_node_rs::poawx_gossip::GossipOutcome::Rejected(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn poawx_role_gossip_precommit_post(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -19231,6 +19265,7 @@ async fn main() {
         // Phase 21I: loopback-only finality-vote bridge (testnet/devnet, mainnet
         // hard-off, disabled unless the finality gossip gate is configured).
         .route("/poawx/finality-vote", post(poawx_finality_vote_post))
+        .route("/poawx/registration", post(poawx_post_registration))
         .route("/poawx/finality-votes", get(poawx_finality_votes_get))
         .route("/rpc/submit_tx", post(submit_tx))
         // Fix D: pending-tx introspection + per-address pending-spent
