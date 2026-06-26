@@ -906,6 +906,9 @@ impl ChainState {
         if crate::poawx_challenge::fraud_proof_enforced(expected_height) {
             self.validate_block_fraud_proofs(&block, expected_height)?;
         }
+        if crate::poawx_proposer::proposer_vrf_enforced(expected_height) {
+            self.validate_block_proposer(&block, expected_height, previous)?;
+        }
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1136,6 +1139,87 @@ impl ChainState {
     /// persisted state). Read-only: fails closed; the actual slash is applied in
     /// `apply_block_fraud_slashing` after the block is accepted. Mainnet hard-off
     /// (the caller gates on `fraud_proof_enforced`).
+    /// Phase 31: VRF-assigned proposer enforcement (gated; mainnet hard-off). Only a
+    /// proposer whose committee-seeded VRF priority is admitted at its claimed cascade
+    /// round may produce a valid block at this height. Hashrate is irrelevant: a
+    /// non-assigned proposer is rejected regardless of PoW. Every VRF input is pinned
+    /// (canonical ticket digest, solver = hash160(vrf key) = block worker, seed = the
+    /// committee epoch seed) so a miner cannot grind a favorable priority.
+    fn validate_block_proposer(
+        &self,
+        block: &Block,
+        height: u64,
+        previous: Option<&Block>,
+    ) -> Result<(), String> {
+        let net = crate::activation::network_id_byte();
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let seed = crate::poawx_committed_admission::expected_epoch_seed(
+            height,
+            block.header.prev_hash,
+            previous,
+        );
+        let parent_time = previous.map(|b| b.header.time).unwrap_or(0);
+        let n = self.proposer_registry.eligible_count(height);
+        let round_interval = crate::poawx_proposer::proposer_round_interval_secs();
+        for r in receipts {
+            let ext = r.phase20_ext.as_ref().ok_or_else(|| {
+                format!("proposer: receipt missing extension at height {}", height)
+            })?;
+            let pa = ext.proposer_assignment.as_ref().ok_or_else(|| {
+                format!("proposer: missing proposer assignment at height {}", height)
+            })?;
+            // ECVRF proof valid + bound to (net, height, role, solver, ticket, seed, key).
+            pa.proof.validate(net, height)?;
+            if pa.proof.role_id != crate::poawx_proposer::ROLE_PROPOSER {
+                return Err("proposer: assignment proof wrong role".to_string());
+            }
+            if pa.proof.seed != seed {
+                return Err("proposer: assignment proof wrong seed".to_string());
+            }
+            // anti-grind: no VRF input is free.
+            if pa.proof.ticket_digest != [0u8; 32] {
+                return Err("proposer: non-canonical ticket digest".to_string());
+            }
+            if pa.proof.solver_pkh != hash160(&pa.proof.assignment_public_key) {
+                return Err("proposer: solver pkh not derived from vrf key".to_string());
+            }
+            if pa.proof.solver_pkh != r.worker_pkh {
+                return Err("proposer: proposer is not the block worker".to_string());
+            }
+            // eligibility against the frozen registry; permissive while the registry is
+            // empty (bootstrap) since the threshold then admits everyone.
+            if n > 0
+                && !self
+                    .proposer_registry
+                    .is_eligible(&pa.proof.assignment_public_key, height)
+            {
+                return Err("proposer: vrf key not eligible (not frozen-registered)".to_string());
+            }
+            // VRF sortition: priority must cross the cascade threshold for its round.
+            let priority = crate::poawx_proposer::proposer_priority(&pa.proof.vrf_output);
+            let tau = crate::poawx_proposer::proposer_threshold(n, pa.round);
+            if priority >= tau {
+                return Err(format!(
+                    "proposer: not selected at round {} (priority {} >= threshold {})",
+                    pa.round, priority, tau
+                ));
+            }
+            // round timing: round r cannot be claimed before parent_time + r*interval.
+            let min_t =
+                crate::poawx_proposer::min_time_for_round(parent_time, pa.round, round_interval);
+            if block.header.time < min_t {
+                return Err(format!(
+                    "proposer: round {} too early (time {} < required {})",
+                    pa.round, block.header.time, min_t
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_block_fraud_proofs(&self, block: &Block, height: u64) -> Result<(), String> {
         let net = crate::activation::network_id_byte();
         let receipts = match &block.poawx_receipts {
@@ -1715,6 +1799,9 @@ impl ChainState {
                         for p in proofs.iter() {
                             out.push((p.assignment_public_key, p.solver_pkh));
                         }
+                    }
+                    if let Some(pa) = &ext.proposer_assignment {
+                        out.push((pa.proof.assignment_public_key, pa.proof.solver_pkh));
                     }
                 }
             }
