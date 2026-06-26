@@ -14157,4 +14157,32 @@ mod proposer_consensus_tests {
         assert!(e.contains("multiple sections"), "got: {e}");
         clear_reg_env();
     }
+
+    #[test]
+    fn registration_inert_when_gate_off() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // (a) mainnet (network_id == 0) is hard-off even with everything set.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        std::env::set_var("IRIUM_POAWX_PROPOSER_VRF_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_PROPOSER_VRF_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_PROPOSER_REGISTRATION_ACTIVATION_HEIGHT", "1");
+        assert!(!crate::poawx_proposer::proposer_registration_active(1000));
+        // (b) devnet VRF on but registration activation UNSET => registration inert;
+        // a block carrying a PRG1 section does not touch the queue/registry.
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::remove_var("IRIUM_POAWX_PROPOSER_REGISTRATION_ACTIVATION_HEIGHT");
+        let net = crate::activation::network_id_byte();
+        assert!(!crate::poawx_proposer::proposer_registration_active(1000));
+        let mut cs = base_chain();
+        let anchor = cs.chain[0].header.hash_for_height(0);
+        let tmpl = ext_skeleton(net);
+        let ra = ProposerRegistrationV1::build_signed(&[0xA1u8; 32], net, 0, &anchor, 0).unwrap();
+        let b1 = block_with_registrations(&tmpl, anchor, 1, vec![ra.clone()], vec![]);
+        cs.chain.push(b1.clone());
+        cs.apply_block_proposer_registrations(1);
+        assert_eq!(cs.proposer_reg_queue.len(), 0, "gate off => apply is a no-op");
+        cs.revert_block_proposer_registrations(&b1, 1);
+        assert_eq!(cs.proposer_reg_queue.len(), 0);
+        clear_reg_env();
+    }
 }
