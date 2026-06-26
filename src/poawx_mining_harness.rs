@@ -292,6 +292,7 @@ pub fn build_devnet_all_gates_block(
         ([0u8; 32], [0u8; 32]),
         None,
         None,
+        None,
     )
 }
 
@@ -318,6 +319,7 @@ pub fn build_solo_poawx_block(
         time,
         receipt_difficulty_bits,
         ([0u8; 32], [0u8; 32]),
+        None,
         None,
         None,
     )
@@ -349,6 +351,7 @@ pub fn build_solo_poawx_block_with_parent(
         time,
         receipt_difficulty_bits,
         parent_seed_components,
+        None,
         None,
         None,
     )
@@ -383,6 +386,43 @@ pub fn build_solo_poawx_block_with_parent_and_dominance(
         parent_seed_components,
         Some(dominance),
         node_gates,
+        None,
+    )
+}
+
+/// Like [`build_solo_poawx_block_with_parent_and_dominance`] but also embeds the
+/// miner's PRIVATE proposer-VRF assignment (`proposer_ctx`). The caller runs its own
+/// sortition and supplies the assignment only when selected; the builder verifies it
+/// belongs to the worker and binds it into the receipt. `None` => no proposer
+/// assignment (identical to the non-proposer builder). Mainnet-hard-off.
+#[allow(clippy::too_many_arguments)]
+pub fn build_solo_poawx_block_with_proposer(
+    miner_secret: &[u8; 32],
+    network_id: u8,
+    height: u64,
+    prev_hash: [u8; 32],
+    parent_prev_hash: Option<[u8; 32]>,
+    bits: u32,
+    time: u32,
+    receipt_difficulty_bits: u32,
+    parent_seed_components: ([u8; 32], [u8; 32]),
+    dominance: &PersistentDominance,
+    node_gates: Option<&NodeGateFlags>,
+    proposer_ctx: Option<&ProposerCtx>,
+) -> Result<AllGatesProof, String> {
+    build_all_gates_block_with(
+        &AllGatesIdentities::solo(miner_secret)?,
+        network_id,
+        height,
+        prev_hash,
+        parent_prev_hash,
+        bits,
+        time,
+        receipt_difficulty_bits,
+        parent_seed_components,
+        Some(dominance),
+        node_gates,
+        proposer_ctx,
     )
 }
 
@@ -399,6 +439,14 @@ pub struct NodeGateFlags {
     pub effective_sybil_bits: u32,
 }
 
+/// Phase 31: the miner's already-built proposer-VRF assignment, threaded into the
+/// block builder. The miner runs its private sortition (it owns the secret) and
+/// supplies this only when selected at some allowed cascade round; the builder
+/// verifies it belongs to the worker and binds it into the receipt. Mainnet-off.
+pub struct ProposerCtx {
+    pub assignment: crate::poawx::ProposerAssignmentV1,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_all_gates_block_with(
     ids: &AllGatesIdentities,
@@ -412,6 +460,7 @@ fn build_all_gates_block_with(
     parent_seed_components: ([u8; 32], [u8; 32]),
     dominance_override: Option<&PersistentDominance>,
     node_gates: Option<&NodeGateFlags>,
+    proposer_ctx: Option<&ProposerCtx>,
 ) -> Result<AllGatesProof, String> {
     guard_network(network_id)?;
     // Resolve the standard-header activation height into the process global the
@@ -696,6 +745,22 @@ fn build_all_gates_block_with(
         None
     };
 
+    // Phase 31: embed the miner's private proposer-VRF assignment when supplied.
+    // The builder only verifies the assignment belongs to THIS block's worker; the
+    // sortition decision (selected at which round) is the caller's. Gate-off => None
+    // => byte-identical to the pre-Phase-31 receipt.
+    let proposer_assignment: Option<crate::poawx::ProposerAssignmentV1> = match proposer_ctx {
+        None => None,
+        Some(ctx) => {
+            if hash160(&ctx.assignment.proof.assignment_public_key) != worker_pkh {
+                return Err(
+                    "proposer: assignment vrf key does not match worker identity".to_string(),
+                );
+            }
+            Some(ctx.assignment.clone())
+        }
+    };
+
     let ext = Phase20ReceiptExt {
         role_reward: RoleReward {
             compute_contributor_pkh: compute_solver,
@@ -721,7 +786,7 @@ fn build_all_gates_block_with(
         committed_admission: Some(commitment),
         role_assignment_v2: Some(in_proofs),
         fraud_proofs: None,
-        proposer_assignment: None,
+        proposer_assignment,
     };
 
     // Worker receipt: real receipt PoW solution + signed challenge (mode-0).

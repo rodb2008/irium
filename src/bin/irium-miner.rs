@@ -3488,9 +3488,73 @@ fn run_poawx_solo() -> Result<(), String> {
             _ => None,
         };
 
-        let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block_with_parent_and_dominance(
+        // Phase 31: private proposer-VRF sortition. When the node advertises the
+        // proposer gate as active, prove our VRF over the committee seed and only
+        // build if we are selected at some cascade round the elapsed time allows;
+        // otherwise wait (a later round, or accrued registrations, may admit us).
+        let proposer_ctx = if tmpl.poawx_proposer_vrf_active.unwrap_or(false) {
+            let seed = match tmpl.poawx_proposer_seed.as_deref() {
+                Some(s) => match poawx_decode_hash32(s) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[poawx] bad proposer seed: {e}; retrying");
+                        thread::sleep(Duration::from_secs(3));
+                        continue;
+                    }
+                },
+                None => {
+                    eprintln!("[poawx] proposer active but template carried no seed; retrying");
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+            };
+            let eligible = tmpl.poawx_proposer_eligible_count.unwrap_or(0);
+            let max_round = tmpl.poawx_proposer_max_allowed_round.unwrap_or(0);
+            let proof = match irium_node_rs::poawx_candidate::AssignmentProofV2::prove_self_solver(
+                &secret,
+                net,
+                height,
+                irium_node_rs::poawx_proposer::ROLE_PROPOSER,
+                [0u8; 32],
+                seed,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[poawx] proposer proof failed: {e}; retrying");
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+            };
+            let priority = irium_node_rs::poawx_proposer::proposer_priority(&proof.vrf_output);
+            let round = (0..=max_round)
+                .find(|r| irium_node_rs::poawx_proposer::is_selected(priority, eligible, *r));
+            match round {
+                Some(r) => {
+                    println!(
+                        "[poawx] proposer SELECTED height={height} round={r} priority={priority} eligible={eligible}"
+                    );
+                    Some(irium_node_rs::poawx_mining_harness::ProposerCtx {
+                        assignment: irium_node_rs::poawx::ProposerAssignmentV1 {
+                            round: r,
+                            proof,
+                        },
+                    })
+                }
+                None => {
+                    println!(
+                        "[poawx] not proposer this slot height={height} (priority={priority} eligible={eligible} max_round={max_round}); waiting"
+                    );
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block_with_proposer(
             &secret, net, height, prev_hash, parent_prev_hash, bits, tmpl.time, diff,
-            parent_seed_components, &dominance, node_gates.as_ref(),
+            parent_seed_components, &dominance, node_gates.as_ref(), proposer_ctx.as_ref(),
         ) {
             Ok(p) => p,
             Err(e) => {

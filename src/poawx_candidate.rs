@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 use sha2::{Digest, Sha256};
+use ripemd::Ripemd160;
 
 use crate::activation::network_id_byte;
 use crate::poawx_penalty::PenaltyStatus;
@@ -714,6 +715,37 @@ impl AssignmentProofV2 {
         };
         me.digest = me.compute_digest();
         Ok(me)
+    }
+
+    /// Phase 31: prove an assignment whose `solver_pkh` is `hash160(the VRF public
+    /// key)` itself -- the proposer IS the block worker. The solver is derived from
+    /// the SAME secp256kfun public key carried in the proof, so the C4 invariant
+    /// `solver_pkh == hash160(assignment_public_key)` holds by construction with no
+    /// external key-encoding assumption.
+    pub fn prove_self_solver(
+        secret: &[u8; 32],
+        network_id: u8,
+        target_height: u64,
+        role_id: u8,
+        ticket_digest: [u8; 32],
+        seed: [u8; 32],
+    ) -> Result<Self, String> {
+        let sk = secp256kfun::Scalar::from_bytes(*secret)
+            .and_then(|s| s.non_zero())
+            .ok_or_else(|| "assignment v2: invalid/zero secret key".to_string())?;
+        let kp = KeyPair::new(sk);
+        let pk_bytes: [u8; 33] = kp.public_key().to_bytes();
+        let mut solver_pkh = [0u8; 20];
+        solver_pkh.copy_from_slice(&Ripemd160::digest(Sha256::digest(pk_bytes)));
+        Self::prove(
+            secret,
+            network_id,
+            target_height,
+            role_id,
+            solver_pkh,
+            ticket_digest,
+            seed,
+        )
     }
 
     pub fn score(&self) -> u64 {
