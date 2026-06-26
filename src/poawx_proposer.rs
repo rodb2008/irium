@@ -163,6 +163,36 @@ pub fn proposer_vrf_enforced(height: u64) -> bool {
     proposer_vrf_active(height) && proposer_vrf_required()
 }
 
+// ââ proposer registration / onboarding (gated) ââââââââââââââââââ
+/// Max registrations force-drained (activated) from the FIFO queue head per block.
+pub const PROPOSER_REG_CAP: usize = 8;
+/// Max new registrations a producer may announce (enqueue) per block.
+pub const PROPOSER_ANNOUNCE_CAP: usize = 8;
+/// A registration's sybil anchor must be within the last this-many blocks of the
+/// including height (bounds offline precomputation of the sybil work).
+pub const PROPOSER_REG_ANCHOR_WINDOW: u64 = 64;
+
+pub fn proposer_registration_activation_height() -> Option<u64> {
+    std::env::var("IRIUM_POAWX_PROPOSER_REGISTRATION_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Pure gate (param-driven for race-free tests). Registration is active only where the
+/// proposer VRF is active (so `network_id == 0` mainnet is hard-off) AND at/after the
+/// registration activation height.
+pub fn proposer_registration_gate(vrf_active: bool, activation: Option<u64>, height: u64) -> bool {
+    vrf_active && matches!(activation, Some(h) if height >= h)
+}
+
+pub fn proposer_registration_active(height: u64) -> bool {
+    proposer_registration_gate(
+        proposer_vrf_active(height),
+        proposer_registration_activation_height(),
+        height,
+    )
+}
+
 pub fn proposer_expiry_window() -> u64 {
     std::env::var("IRIUM_POAWX_PROPOSER_EXPIRY_WINDOW")
         .ok()
@@ -361,6 +391,15 @@ mod tests {
         let mut out = [0u8; 32];
         out[0..8].copy_from_slice(&7u64.to_le_bytes());
         assert_eq!(proposer_priority(&out), 7);
+    }
+
+    #[test]
+    fn registration_gate_pure() {
+        assert!(!proposer_registration_gate(false, Some(1), 100)); // vrf off => off
+        assert!(!proposer_registration_gate(true, None, 100)); // no activation => off
+        assert!(proposer_registration_gate(true, Some(50), 50)); // active at height
+        assert!(proposer_registration_gate(true, Some(50), 999)); // active after
+        assert!(!proposer_registration_gate(true, Some(50), 49)); // before activation
     }
 
     #[test]

@@ -653,6 +653,176 @@ impl ProposerAssignmentV1 {
     }
 }
 
+/// Phase 31R: wire size of a `ProposerRegistrationV1`:
+/// vrf_pubkey(33) + anchor_height(8) + sybil_nonce(32) + sybil_digest(32) + signature(64).
+pub const PROPOSER_REGISTRATION_V1_WIRE: usize = 33 + 8 + 32 + 32 + 64;
+/// Domain separator for the registration self-signature.
+pub const PROPOSER_REG_SIGN_DOMAIN: &[u8] = b"IRIUM_POAWX_PROPOSER_REG_V1";
+
+/// HASH160 of a compressed secp256k1 public key.
+fn reg_hash160(pk: &[u8; 33]) -> [u8; 20] {
+    let rip = ripemd::Ripemd160::digest(Sha256::digest(pk));
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&rip);
+    out
+}
+
+/// Phase 31R: an on-chain proposer-VRF key registration. Lets a miner register its
+/// proposer key WITHOUT first winning a block (fixes the eligibility chicken-and-egg),
+/// paying a one-time sybil PoW cost bound to a recent anchor block + the key itself.
+/// `pkh = hash160(vrf_pubkey)` is derived. Carried in the `PRG1` block section and,
+/// once activated off the FIFO queue, registered into the eligibility registry at the
+/// activation height (eligible `FREEZE_DEPTH` blocks later). Mainnet hard-off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposerRegistrationV1 {
+    pub vrf_pubkey: [u8; 33],
+    pub anchor_height: u64,
+    pub sybil_nonce: [u8; 32],
+    pub sybil_digest: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl ProposerRegistrationV1 {
+    pub fn pkh(&self) -> [u8; 20] {
+        reg_hash160(&self.vrf_pubkey)
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PROPOSER_REGISTRATION_V1_WIRE);
+        out.extend_from_slice(&self.vrf_pubkey);
+        out.extend_from_slice(&self.anchor_height.to_le_bytes());
+        out.extend_from_slice(&self.sybil_nonce);
+        out.extend_from_slice(&self.sybil_digest);
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() != PROPOSER_REGISTRATION_V1_WIRE {
+            return Err(format!(
+                "proposer registration: bad wire len {} (want {})",
+                raw.len(),
+                PROPOSER_REGISTRATION_V1_WIRE
+            ));
+        }
+        let mut vrf_pubkey = [0u8; 33];
+        vrf_pubkey.copy_from_slice(&raw[0..33]);
+        let anchor_height = u64::from_le_bytes(raw[33..41].try_into().expect("len 8"));
+        let mut sybil_nonce = [0u8; 32];
+        sybil_nonce.copy_from_slice(&raw[41..73]);
+        let mut sybil_digest = [0u8; 32];
+        sybil_digest.copy_from_slice(&raw[73..105]);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&raw[105..169]);
+        Ok(Self {
+            vrf_pubkey,
+            anchor_height,
+            sybil_nonce,
+            sybil_digest,
+            signature,
+        })
+    }
+
+    /// Domain-separated digest the self-signature covers (binds every field).
+    pub fn signing_digest(&self, network_id: u8) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(PROPOSER_REG_SIGN_DOMAIN);
+        h.update([network_id]);
+        h.update(self.vrf_pubkey);
+        h.update(self.anchor_height.to_le_bytes());
+        h.update(self.sybil_nonce);
+        h.update(self.sybil_digest);
+        h.finalize().into()
+    }
+
+    /// Pure self-validation given the resolved `anchor_hash` (chain[anchor_height])
+    /// and the required sybil bits. Does NOT check anchor recency/canonicity — the
+    /// connect_block gate does that. Mainnet hard-off is enforced by the caller.
+    pub fn validate(
+        &self,
+        network_id: u8,
+        anchor_hash: &[u8; 32],
+        required_bits: u32,
+    ) -> Result<(), String> {
+        let pkh = self.pkh();
+        let expect = crate::poawx_ticket::compute_sybil_digest(
+            network_id,
+            anchor_hash,
+            &pkh,
+            self.anchor_height,
+            &self.vrf_pubkey,
+            &self.sybil_nonce,
+        );
+        if self.sybil_digest != expect {
+            return Err("registration: sybil_digest mismatch".to_string());
+        }
+        if !crate::poawx_ticket::meets_sybil_target(&self.sybil_digest, required_bits) {
+            return Err("registration: insufficient sybil work".to_string());
+        }
+        use k256::ecdsa::signature::hazmat::PrehashVerifier;
+        use k256::ecdsa::{Signature, VerifyingKey};
+        let vk = VerifyingKey::from_sec1_bytes(&self.vrf_pubkey)
+            .map_err(|_| "registration: invalid vrf_pubkey".to_string())?;
+        let sig = Signature::from_slice(&self.signature)
+            .map_err(|_| "registration: malformed signature".to_string())?;
+        vk.verify_prehash(&self.signing_digest(network_id), &sig)
+            .map_err(|_| "registration: signature verification failed".to_string())?;
+        Ok(())
+    }
+
+    /// Build + grind + self-sign a registration for `secret` against a recent anchor.
+    /// Used by the miner and tests. Derives `vrf_pubkey` from `secret` (k256), grinds
+    /// `sybil_nonce` until the digest meets `required_bits`, then signs.
+    pub fn build_signed(
+        secret: &[u8; 32],
+        network_id: u8,
+        anchor_height: u64,
+        anchor_hash: &[u8; 32],
+        required_bits: u32,
+    ) -> Result<Self, String> {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let sk = k256::ecdsa::SigningKey::from_slice(secret)
+            .map_err(|_| "registration: invalid secret".to_string())?;
+        let vk = sk.verifying_key();
+        let pt = vk.to_encoded_point(true);
+        let mut vrf_pubkey = [0u8; 33];
+        vrf_pubkey.copy_from_slice(pt.as_bytes());
+        let pkh = reg_hash160(&vrf_pubkey);
+        let mut nonce = [0u8; 32];
+        let mut counter: u64 = 0;
+        let sybil_digest = loop {
+            nonce[..8].copy_from_slice(&counter.to_le_bytes());
+            let d = crate::poawx_ticket::compute_sybil_digest(
+                network_id,
+                anchor_hash,
+                &pkh,
+                anchor_height,
+                &vrf_pubkey,
+                &nonce,
+            );
+            if crate::poawx_ticket::meets_sybil_target(&d, required_bits) {
+                break d;
+            }
+            counter += 1;
+            if counter > 200_000_000 {
+                return Err("registration: sybil grind exceeded budget".to_string());
+            }
+        };
+        let mut me = Self {
+            vrf_pubkey,
+            anchor_height,
+            sybil_nonce: nonce,
+            sybil_digest,
+            signature: [0u8; 64],
+        };
+        let sig: k256::ecdsa::Signature = sk
+            .sign_prehash(&me.signing_digest(network_id))
+            .map_err(|_| "registration: signing failed".to_string())?;
+        me.signature.copy_from_slice(&sig.to_bytes());
+        Ok(me)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Phase20ReceiptExt {
     pub role_reward: RoleReward,
@@ -2096,6 +2266,31 @@ mod tests {
             role_precommit_leaf_for_claim(&nocommit, 1, 100).is_err(),
             "missing commitment"
         );
+    }
+
+    #[test]
+    fn proposer_registration_build_validate_roundtrip() {
+        let net = 2u8;
+        let anchor_hash = [0x5a_u8; 32];
+        let secret = [0x33u8; 32];
+        let bits = 8u32;
+        let reg =
+            ProposerRegistrationV1::build_signed(&secret, net, 123, &anchor_hash, bits).unwrap();
+        // wire roundtrip
+        let w = reg.serialize();
+        assert_eq!(w.len(), PROPOSER_REGISTRATION_V1_WIRE);
+        assert_eq!(ProposerRegistrationV1::deserialize(&w).unwrap(), reg);
+        // self-validation passes against the same anchor + bits.
+        assert!(reg.validate(net, &anchor_hash, bits).is_ok());
+        // tamper signature -> fail.
+        let mut bad = reg.clone();
+        bad.signature[0] ^= 0xff;
+        assert!(bad.validate(net, &anchor_hash, bits).is_err());
+        // wrong anchor hash -> sybil digest mismatch.
+        assert!(reg.validate(net, &[0u8; 32], bits).is_err());
+        // higher required bits than ground -> insufficient work (probabilistic but the
+        // grind targeted exactly `bits`, so requiring bits+20 is overwhelmingly short).
+        assert!(reg.validate(net, &anchor_hash, bits + 20).is_err());
     }
 
     #[test]
