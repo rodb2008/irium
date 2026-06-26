@@ -673,6 +673,19 @@ struct BlockTemplate {
     poawx_puzzle_anchor_bits: Option<u32>,
     #[serde(default)]
     poawx_effective_sybil_bits: Option<u32>,
+    // Phase 31 proposer-VRF fields (None on older nodes => proposer mining off).
+    #[serde(default)]
+    poawx_proposer_vrf_active: Option<bool>,
+    #[serde(default)]
+    poawx_proposer_seed: Option<String>,
+    #[serde(default)]
+    poawx_proposer_eligible_count: Option<u64>,
+    #[serde(default)]
+    poawx_proposer_round_interval: Option<u64>,
+    #[serde(default)]
+    poawx_proposer_freeze_height: Option<u64>,
+    #[serde(default)]
+    poawx_proposer_max_allowed_round: Option<u32>,
 }
 
 #[derive(Deserialize)]

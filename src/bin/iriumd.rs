@@ -1608,6 +1608,20 @@ struct BlockTemplateResponse {
     poawx_puzzle_anchor_bits: u32,
     #[serde(default)]
     poawx_effective_sybil_bits: u32,
+    // Phase 31 proposer-VRF fields for `height` (gated; mainnet-hard-off => active
+    // false + zero/empty). The miner runs its private sortition from these.
+    #[serde(default)]
+    poawx_proposer_vrf_active: bool,
+    #[serde(default)]
+    poawx_proposer_seed: String,
+    #[serde(default)]
+    poawx_proposer_eligible_count: u64,
+    #[serde(default)]
+    poawx_proposer_round_interval: u64,
+    #[serde(default)]
+    poawx_proposer_freeze_height: u64,
+    #[serde(default)]
+    poawx_proposer_max_allowed_round: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -13478,7 +13492,19 @@ async fn get_block_template(
         }
     }
 
-    let (height, prev_hash, bits, target, time) = {
+    let (
+        height,
+        prev_hash,
+        bits,
+        target,
+        time,
+        proposer_vrf_active,
+        proposer_seed,
+        proposer_eligible_count,
+        proposer_round_interval,
+        proposer_freeze_height,
+        proposer_max_allowed_round,
+    ) = {
         let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip = guard.chain.last();
         let tip_h = guard.tip_height();
@@ -13496,7 +13522,54 @@ async fn get_block_template(
         } else {
             now.max(prev_time.saturating_add(1))
         };
-        (height, prev_hash, bits, target_hex(bits), time)
+        // Phase 31: proposer-VRF template fields, computed atomically under the
+        // chain lock. Gated: when inactive the miner sees active=false and builds
+        // exactly as before (no proposer assignment).
+        let proposer_vrf_active = irium_node_rs::poawx_proposer::proposer_vrf_active(height);
+        let (
+            proposer_seed,
+            proposer_eligible_count,
+            proposer_round_interval,
+            proposer_freeze_height,
+            proposer_max_allowed_round,
+        ) = if proposer_vrf_active {
+            let parent_hash_bytes = tip
+                .map(|b| b.header.hash_for_height(tip_h))
+                .unwrap_or([0u8; 32]);
+            let seed = irium_node_rs::poawx_committed_admission::expected_epoch_seed(
+                height,
+                parent_hash_bytes,
+                tip,
+            );
+            let round_interval =
+                irium_node_rs::poawx_proposer::proposer_round_interval_secs();
+            let elapsed = (time as u64).saturating_sub(prev_time as u64);
+            let max_round =
+                irium_node_rs::poawx_proposer::max_round_for_elapsed(elapsed, round_interval);
+            let freeze_depth = irium_node_rs::poawx_proposer::proposer_freeze_depth();
+            (
+                hex::encode(seed),
+                guard.proposer_registry.eligible_count(height),
+                round_interval,
+                height.saturating_sub(freeze_depth),
+                max_round,
+            )
+        } else {
+            (String::new(), 0u64, 0u64, 0u64, 0u32)
+        };
+        (
+            height,
+            prev_hash,
+            bits,
+            target_hex(bits),
+            time,
+            proposer_vrf_active,
+            proposer_seed,
+            proposer_eligible_count,
+            proposer_round_interval,
+            proposer_freeze_height,
+            proposer_max_allowed_round,
+        )
     };
 
     let mut mempool_entries = state
@@ -13777,6 +13850,12 @@ async fn get_block_template(
         poawx_penalty_state_active: irium_node_rs::poawx_penalty::penalty_state_active(height),
         poawx_puzzle_anchor_bits: irium_node_rs::poawx_puzzle::default_profile().anchor_bits as u32,
         poawx_effective_sybil_bits: irium_node_rs::poawx_ticket::effective_sybil_bits(),
+        poawx_proposer_vrf_active: proposer_vrf_active,
+        poawx_proposer_seed: proposer_seed,
+        poawx_proposer_eligible_count: proposer_eligible_count,
+        poawx_proposer_round_interval: proposer_round_interval,
+        poawx_proposer_freeze_height: proposer_freeze_height,
+        poawx_proposer_max_allowed_round: proposer_max_allowed_round,
     }))
 }
 
