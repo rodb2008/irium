@@ -721,6 +721,7 @@ fn build_all_gates_block_with(
         committed_admission: Some(commitment),
         role_assignment_v2: Some(in_proofs),
         fraud_proofs: None,
+        proposer_assignment: None,
     };
 
     // Worker receipt: real receipt PoW solution + signed challenge (mode-0).

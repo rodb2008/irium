@@ -616,6 +616,43 @@ pub fn role_precommit_leaf_for_claim(
 // Phase 20 exts remain byte-identical too.
 pub const PHASE20_EXT_VERSION: u8 = 1;
 
+/// Phase 31: 4-byte trailing-section magic for the proposer VRF assignment.
+pub const PROPOSER_SECTION_MAGIC: &[u8; 4] = b"PRP1";
+/// Wire size of a `ProposerAssignmentV1`: round(4) + AssignmentProofV2(273).
+pub const PROPOSER_ASSIGNMENT_V1_WIRE: usize = 4 + ASSIGNMENT_PROOF_V2_WIRE;
+
+/// Phase 31: the block's VRF-proposer assignment — the proposer's ECVRF proof
+/// (role = ROLE_PROPOSER, bound to the epoch seed) plus the cascade `round` it
+/// claims. The block's `worker_pkh` IS the proposer (`proof.solver_pkh == worker_pkh`,
+/// enforced in connect_block under the gate). Mainnet hard-off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposerAssignmentV1 {
+    pub round: u32,
+    pub proof: AssignmentProofV2,
+}
+
+impl ProposerAssignmentV1 {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PROPOSER_ASSIGNMENT_V1_WIRE);
+        out.extend_from_slice(&self.round.to_le_bytes());
+        out.extend_from_slice(&self.proof.serialize());
+        out
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() != PROPOSER_ASSIGNMENT_V1_WIRE {
+            return Err(format!(
+                "proposer assignment: bad wire len {} (want {})",
+                raw.len(),
+                PROPOSER_ASSIGNMENT_V1_WIRE
+            ));
+        }
+        let round = u32::from_le_bytes(raw[0..4].try_into().expect("len 4"));
+        let proof = AssignmentProofV2::deserialize(&raw[4..4 + ASSIGNMENT_PROOF_V2_WIRE])?;
+        Ok(Self { round, proof })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Phase20ReceiptExt {
     pub role_reward: RoleReward,
@@ -672,6 +709,9 @@ pub struct Phase20ReceiptExt {
     /// enforced; reverted on disconnect. OPTIONAL even under the gate (a block
     /// with no fraud to report omits the section).
     pub fraud_proofs: Option<Vec<FraudProofV1>>,
+    /// Phase 31: optional VRF-proposer assignment (trailing PRP1 section; None =>
+    /// byte-identical to pre-Phase-31). Validated in connect_block under the gate.
+    pub proposer_assignment: Option<ProposerAssignmentV1>,
 }
 
 impl Phase20ReceiptExt {
@@ -709,6 +749,7 @@ impl Phase20ReceiptExt {
                     || self.committed_admission.is_some()
                     || self.role_assignment_v2.is_some()
                     || self.fraud_proofs.is_some()
+                    || self.proposer_assignment.is_some()
                 {
                     out.push(0);
                 }
@@ -774,6 +815,12 @@ impl Phase20ReceiptExt {
             for fp in proofs.iter() {
                 out.extend_from_slice(&fp.serialize());
             }
+        }
+        // Phase 31 trailing PRP1 proposer-assignment section (present-only): magic +
+        // round(4) + V2 proof. Absent => byte-identical to pre-Phase-31 exts.
+        if let Some(pa) = &self.proposer_assignment {
+            out.extend_from_slice(PROPOSER_SECTION_MAGIC);
+            out.extend_from_slice(&pa.serialize());
         }
         out
     }
@@ -844,6 +891,7 @@ impl Phase20ReceiptExt {
         let mut committed_admission: Option<AdmissionCommitmentV1> = None;
         let mut role_assignment_v2: Option<[AssignmentProofV2; 3]> = None;
         let mut fraud_proofs: Option<Vec<FraudProofV1>> = None;
+        let mut proposer_assignment: Option<ProposerAssignmentV1> = None;
         while off < raw.len() {
             need(off, 4, "trailing section magic")?;
             let magic = &raw[off..off + 4];
@@ -954,6 +1002,16 @@ impl Phase20ReceiptExt {
                     off += FRAUD_PROOF_V1_WIRE;
                 }
                 fraud_proofs = Some(fps);
+            } else if magic == PROPOSER_SECTION_MAGIC {
+                if proposer_assignment.is_some() {
+                    return Err("phase20 ext: duplicate proposer section".to_string());
+                }
+                off += 4;
+                need(off, PROPOSER_ASSIGNMENT_V1_WIRE, "proposer assignment")?;
+                proposer_assignment = Some(ProposerAssignmentV1::deserialize(
+                    &raw[off..off + PROPOSER_ASSIGNMENT_V1_WIRE],
+                )?);
+                off += PROPOSER_ASSIGNMENT_V1_WIRE;
             } else {
                 return Err("phase20 ext: unknown trailing section magic".to_string());
             }
@@ -974,6 +1032,7 @@ impl Phase20ReceiptExt {
             committed_admission,
             role_assignment_v2,
             fraud_proofs,
+            proposer_assignment,
         })
     }
 
@@ -1944,6 +2003,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let bytes = ext.serialize();
         let ext2 = Phase20ReceiptExt::deserialize(&bytes).expect("deserialize");
@@ -2039,6 +2099,58 @@ mod tests {
     }
 
     #[test]
+    fn proposer_assignment_section_roundtrip() {
+        let prev = [0x44u8; 32];
+        let proof = crate::poawx_candidate::AssignmentProofV2::prove(
+            &[0x11u8; 32],
+            1,
+            100,
+            crate::poawx_proposer::ROLE_PROPOSER,
+            [0x22u8; 20],
+            [0x33u8; 32],
+            [0x55u8; 32],
+        )
+        .expect("v2 prove");
+        let pa = ProposerAssignmentV1 { round: 3, proof };
+        // section wire roundtrip
+        let sb = pa.serialize();
+        assert_eq!(sb.len(), PROPOSER_ASSIGNMENT_V1_WIRE);
+        assert_eq!(ProposerAssignmentV1::deserialize(&sb).unwrap(), pa);
+        // full-ext roundtrip: absent => byte-identical (no PRP1), present => +section.
+        let mut ext = Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+            candidate_set: None,
+            role_puzzle_proofs: None,
+            finality_proof: None,
+            committed_admission: None,
+            role_assignment_v2: None,
+            fraud_proofs: None,
+            proposer_assignment: None,
+        };
+        let absent = ext.serialize();
+        assert!(!absent.windows(4).any(|w| w == PROPOSER_SECTION_MAGIC));
+        assert_eq!(Phase20ReceiptExt::deserialize(&absent).unwrap(), ext);
+        ext.proposer_assignment = Some(pa.clone());
+        let present = ext.serialize();
+        assert_eq!(present.len(), absent.len() + 1 + 4 + PROPOSER_ASSIGNMENT_V1_WIRE);
+        let back = Phase20ReceiptExt::deserialize(&present).unwrap();
+        assert_eq!(back.proposer_assignment, Some(pa));
+        assert_eq!(back, ext);
+    }
+
+    #[test]
     fn phase20_ext_precommit_root_roundtrip_and_digest() {
         let prev = [0x44u8; 32];
         let base = || Phase20ReceiptExt {
@@ -2061,6 +2173,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let none = base();
         let mut some = base();
@@ -2105,6 +2218,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let proofs = [
             TicketProof::new(
@@ -2228,6 +2342,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: Some(proofs),
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let good = ext.serialize();
         assert_eq!(Phase20ReceiptExt::deserialize(&good).unwrap(), ext);
@@ -2274,6 +2389,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let seed = [0x55u8; 32];
         let mk = |secret: u8, role: u8, solver: [u8; 20]| {
@@ -2363,6 +2479,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let seed = [0x55u8; 32];
         let mut cs = CandidateSet::new(1, 61, seed);
@@ -2444,6 +2561,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let sk = k256::ecdsa::SigningKey::from_slice(&[0x21u8; 32]).unwrap();
         let mut fp = FinalityProofV1::new(1, 60, prev, [0u8; 32], 0, 1, 1);
@@ -2521,6 +2639,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let sol = |m: u8, n: u64, t: u8| PuzzleSolutionV1 {
             mode: m,
@@ -2589,6 +2708,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let mut cs = CandidateSet::new(1, 60, prev);
         cs.push(RoleCandidate::build(
@@ -2663,6 +2783,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         let weights = [1000u64, 800, 900, 950];
         // (1) absent => no DOM1 magic, byte-identical, round-trips.
@@ -2767,6 +2888,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
         // no-ext v3 element == v2 element + a single 0 flag byte (present-only).
         let r = make_test_receipt(9);
@@ -2810,6 +2932,7 @@ mod tests {
             committed_admission: None,
             role_assignment_v2: None,
             fraud_proofs: None,
+            proposer_assignment: None,
         };
 
         // Base mode-0 receipt with a production extension attached.
