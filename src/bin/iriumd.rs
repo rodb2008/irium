@@ -14721,14 +14721,21 @@ async fn submit_block_extended(
             return Err(StatusCode::BAD_REQUEST);
         }
     }
-    let difficulty = poawx_puzzle_difficulty_bits();
-    if !req.poawx_receipts.is_empty() && difficulty < POAWX_MIN_ACTIVE_DIFFICULTY_BITS {
+    let configured_difficulty = poawx_puzzle_difficulty_bits();
+    if !req.poawx_receipts.is_empty() && configured_difficulty < POAWX_MIN_ACTIVE_DIFFICULTY_BITS {
         eprintln!(
             "[submit_block_extended] puzzle difficulty {} bits below minimum {}; failing closed",
-            difficulty, POAWX_MIN_ACTIVE_DIFFICULTY_BITS
+            configured_difficulty, POAWX_MIN_ACTIVE_DIFFICULTY_BITS
         );
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    // Phase 31: when the proposer VRF gate is enforced, PoW is demoted to a trivial
+    // anti-spam floor; cap the effective puzzle difficulty so hashrate gives no edge.
+    // connect_block applies the identical cap, so the two paths always agree.
+    let difficulty = irium_node_rs::poawx_proposer::effective_puzzle_difficulty_bits(
+        configured_difficulty,
+        req.height,
+    );
     // Phase 20: after production activation, the receipt extension is required and
     // is bound into the receipts root. connect_block is the authoritative validator;
     // this is an early, clear rejection for a missing extension on the submit path.
@@ -14934,6 +14941,28 @@ async fn submit_block_extended(
             poawx_receipts: receipts,
         }
     };
+    // Phase 31: fail-fast reject a block whose receipts carry no proposer VRF
+    // assignment when the gate is enforced. connect_block (validate_block_proposer)
+    // is the authoritative validator; this returns a clear early 400 for legacy
+    // (non-assigned) miners instead of a generic connect failure.
+    if irium_node_rs::poawx_proposer::proposer_vrf_enforced(req.height) {
+        if let Some(receipts) = &block.poawx_receipts {
+            for r in receipts {
+                let assigned = r
+                    .phase20_ext
+                    .as_ref()
+                    .map(|e| e.proposer_assignment.is_some())
+                    .unwrap_or(false);
+                if !assigned {
+                    eprintln!(
+                        "[submit_block_extended] reject: proposer VRF enforced but receipt has no proposer assignment height={}",
+                        req.height
+                    );
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            }
+        }
+    }
     let (new_height, new_tip_hash) = {
         let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         if req.height != chain.height {

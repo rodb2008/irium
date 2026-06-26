@@ -97,6 +97,38 @@ pub fn proposer_round_interval_secs() -> u64 {
         .max(1)
 }
 
+/// Default anti-spam PoW floor (leading-zero bits) when the proposer VRF gate is
+/// enforced. PoW is then only a trivial spam deterrent, not a selection signal.
+pub const DEFAULT_PROPOSER_ANTI_SPAM_BITS: u32 = 8;
+
+pub fn proposer_anti_spam_bits() -> u32 {
+    std::env::var("IRIUM_POAWX_PROPOSER_ANTISPAM_BITS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_PROPOSER_ANTI_SPAM_BITS)
+}
+
+/// Pure cap: when `enforced`, the effective puzzle difficulty is capped at the
+/// anti-spam `floor` (never raised), so hashrate cannot be cranked up to matter;
+/// otherwise the configured value passes through verbatim.
+pub fn cap_difficulty_if_enforced(configured: u32, enforced: bool, floor: u32) -> u32 {
+    if enforced {
+        configured.min(floor)
+    } else {
+        configured
+    }
+}
+
+/// Effective puzzle difficulty at `height`: capped at the anti-spam floor when the
+/// proposer VRF gate is enforced (mainnet hard-off => configured value verbatim).
+pub fn effective_puzzle_difficulty_bits(configured: u32, height: u64) -> u32 {
+    cap_difficulty_if_enforced(
+        configured,
+        proposer_vrf_enforced(height),
+        proposer_anti_spam_bits(),
+    )
+}
+
 // ── activation gate (mainnet hard-off) ───────────────────────────────────────
 
 pub fn proposer_vrf_activation_height() -> Option<u64> {
@@ -329,6 +361,16 @@ mod tests {
         let mut out = [0u8; 32];
         out[0..8].copy_from_slice(&7u64.to_le_bytes());
         assert_eq!(proposer_priority(&out), 7);
+    }
+
+    #[test]
+    fn anti_spam_cap_math() {
+        // gate off => configured value passes through verbatim.
+        assert_eq!(cap_difficulty_if_enforced(20, false, 8), 20);
+        // enforced => capped downward at the floor.
+        assert_eq!(cap_difficulty_if_enforced(20, true, 8), 8);
+        // enforced never raises a low configured value.
+        assert_eq!(cap_difficulty_if_enforced(4, true, 8), 4);
     }
 
     #[test]

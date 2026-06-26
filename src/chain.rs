@@ -3610,7 +3610,12 @@ fn validate_poawx_block_receipts(
         h.finalize().into()
     };
 
-    let difficulty = poawx_block_difficulty_bits();
+    // Phase 31: PoW is demoted to a trivial anti-spam floor when the proposer
+    // VRF gate is enforced (mainnet hard-off => configured value verbatim).
+    let difficulty = crate::poawx_proposer::effective_puzzle_difficulty_bits(
+        poawx_block_difficulty_bits(),
+        height,
+    );
 
     for (i, r) in receipts.iter().enumerate() {
         // (1) Commitment nonce must match the deterministic expected value.
