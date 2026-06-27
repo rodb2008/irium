@@ -2092,8 +2092,16 @@ impl ChainState {
                 return Ok(cr < mr);
             }
         }
-        // Equal ranks over the shared length => the longer branch wins.
-        Ok(candidate_branch.len() > current_branch.len())
+        // Tie: equal ranks over the shared prefix. Fix 3 (gated): never reward length
+        // (the longest-chain lever a pre-mined / long-range attacker pulls). Pick by the
+        // lowest tip hash instead -- deterministic, so every node converges on the same
+        // fork, and length is removed from the decision entirely. Gate off => legacy
+        // longest-branch tiebreak (byte-identical).
+        if crate::poawx_proposer::fork_choice_hardening_active(self.tip_height()) {
+            Ok(candidate_tip < self.tip_hash())
+        } else {
+            Ok(candidate_branch.len() > current_branch.len())
+        }
     }
 
     fn find_reorg_path(&self, new_tip: [u8; 32]) -> Result<(u64, Vec<Block>), String> {
@@ -14264,6 +14272,48 @@ mod proposer_consensus_tests {
             "deep reorg must be capped even with a longer chain; got: {err}"
         );
         std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
+        std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn equal_rank_longer_chain_no_length_reorg() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT", "1");
+        let mut cs = base_chain();
+        // Current main chain: 5 minimal blocks (no proposer assignment => rank (MAX,MAX)).
+        let mut prev = cs.chain[0].header.hash_for_height(0);
+        for h in 1..=5u64 {
+            let b = minimal_block(prev, 1000 + h as u32);
+            let hh = b.header.hash_for_height(h);
+            cs.block_store.insert(hh, b.clone());
+            cs.heights.insert(hh, h);
+            cs.chain.push(b);
+            prev = hh;
+        }
+        cs.height = cs.chain.len() as u64; // tip 5
+        let current_tip = cs.tip_hash();
+        // Candidate fork off height 2, LONGER (heights 3..=9 = 7 blocks), all minimal so
+        // every shared-height rank ties with the current chain.
+        let mut p = cs.chain[2].header.hash_for_height(2);
+        let mut cand_tip = [0u8; 32];
+        for h in 3..=9u64 {
+            let b = minimal_block(p, 5000 + h as u32);
+            let hh = b.header.hash_for_height(h);
+            cs.block_store.insert(hh, b);
+            cs.heights.insert(hh, h);
+            p = hh;
+            cand_tip = hh;
+        }
+        // The candidate is strictly longer; under the OLD rule it would always win.
+        // Under Fix 3 the decision is purely the tip-hash, NOT length.
+        let result = cs.proposer_rank_chain_better(cand_tip).unwrap();
+        assert_eq!(
+            result,
+            cand_tip < current_tip,
+            "equal-rank tiebreak must be lowest tip-hash, never length"
+        );
         std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_NETWORK");
     }
