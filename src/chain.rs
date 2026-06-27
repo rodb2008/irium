@@ -954,9 +954,21 @@ impl ChainState {
         // block's validated finality proof finalizes the PARENT (height H-1).
         // Gated => stays 0 / no-op when finality is off.
         if crate::poawx_finality::finality_committee_enforced(expected_height) {
-            self.finalized_height = self
-                .finalized_height
-                .max(expected_height.saturating_sub(1));
+            // Fix 2 (gated): genuine distributed-committee finality. `finalized_height`
+            // advances only when the proof is a real 2/3 quorum of distinct REGISTERED
+            // committee keys (committee >= MIN). Gate off => legacy unconditional advance
+            // (byte-identical). Block validity is unchanged — solo blocks still validate,
+            // they just do not finalize, so the depth cap (Fix 1) is their protection.
+            let genuine = if crate::poawx_proposer::fork_choice_hardening_active(expected_height) {
+                self.block_finality_has_genuine_quorum(expected_height)
+            } else {
+                true
+            };
+            if genuine {
+                self.finalized_height = self
+                    .finalized_height
+                    .max(expected_height.saturating_sub(1));
+            }
         }
         self.prune_caches();
 
@@ -1108,6 +1120,51 @@ impl ChainState {
     /// finality 10% reward therefore stands only with a valid finality proof.
     /// Fails closed. The Phase 21F FinalityWorkPlaceholder puzzle alone is NOT
     /// sufficient when finality is required (the full committee proof is required).
+    /// Phase 31 Fix 2: the finality proof carried by the tip block (first receipt that
+    /// has one).
+    fn block_finality_proof(block: &Block) -> Option<&crate::poawx_finality::FinalityProofV1> {
+        block.poawx_receipts.as_ref()?.iter().find_map(|r| {
+            r.phase20_ext
+                .as_ref()
+                .and_then(|e| e.finality_proof.as_ref())
+        })
+    }
+
+    /// Phase 31 Fix 2 (gated): whether the just-connected tip block's finality proof is a
+    /// GENUINE distributed quorum: at least `ceil(num/den * committee_size)` votes from
+    /// DISTINCT, on-chain-REGISTERED keys (Commit votes only), with the committee itself at
+    /// least `min_finality_committee()` distinct registered keys. This prevents a single
+    /// identity playing all roles from self-finalizing — so two divergent solo forks can
+    /// never both advance `finalized_height`. Vote signatures are already verified by
+    /// `validate_block_finality` earlier in connect_block; this only adds the
+    /// distinctness + registration + committee-size requirement.
+    fn block_finality_has_genuine_quorum(&self, height: u64) -> bool {
+        let block = match self.chain.last() {
+            Some(b) => b,
+            None => return false,
+        };
+        let proof = match Self::block_finality_proof(block) {
+            Some(p) => p,
+            None => return false,
+        };
+        let committee_height = height.saturating_sub(1);
+        let committee_size = self.proposer_registry.eligible_count(committee_height);
+        if committee_size < crate::poawx_proposer::min_finality_committee() {
+            return false;
+        }
+        let mut voters: std::collections::BTreeSet<[u8; 33]> = std::collections::BTreeSet::new();
+        for v in &proof.votes {
+            // vote_type 1 == Commit (the only phase that counts toward finalization).
+            if v.vote_type == 1 && self.proposer_registry.is_registered(&v.member_pubkey) {
+                voters.insert(v.member_pubkey);
+            }
+        }
+        let num = (proof.threshold_num.max(1)) as u64;
+        let den = (proof.threshold_den.max(1)) as u64;
+        let need = (committee_size * num + den - 1) / den; // ceil(committee_size * num/den)
+        (voters.len() as u64) >= need
+    }
+
     fn validate_block_finality(&self, block: &Block, height: u64) -> Result<(), String> {
         use crate::poawx::ROLE_SUPPORT_CONTRIBUTOR;
         use crate::poawx_finality::finality_threshold;
@@ -14314,6 +14371,112 @@ mod proposer_consensus_tests {
             cand_tip < current_tip,
             "equal-rank tiebreak must be lowest tip-hash, never length"
         );
+        std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn solo_fork_cannot_self_finalize() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_PROPOSER_FREEZE_DEPTH", "2");
+        use crate::poawx_finality::{FinalityProofV1, FinalityVoteV1};
+        let key = |n: u8| {
+            let mut a = [0u8; 33];
+            a[0] = n;
+            a[1] = 0xAB;
+            a
+        };
+        let vote = |n: u8, vt: u8| FinalityVoteV1 {
+            version: 1,
+            network_id: 2,
+            target_height: 29,
+            block_hash: [0u8; 32],
+            parent_hash: [0u8; 32],
+            committee_epoch: 0,
+            member_pkh: [0u8; 20],
+            member_pubkey: key(n),
+            ticket_digest: [0u8; 32],
+            vote_type: vt,
+            signature: [0u8; 64],
+        };
+        // Build a tip block whose finality proof carries `votes`, with `registered` keys
+        // registered on-chain at height 5; the committee is read at height 29 (committee
+        // height = target - 1 = 29). MIN_FINALITY_COMMITTEE on devnet = 4.
+        let check = |registered: &[u8], votes: Vec<FinalityVoteV1>| -> bool {
+            let mut cs = base_chain();
+            for &n in registered {
+                cs.proposer_registry.register(key(n), [0u8; 20], 5);
+            }
+            let proof = FinalityProofV1 {
+                version: 1,
+                network_id: 2,
+                target_height: 29,
+                block_hash: [0u8; 32],
+                parent_hash: [0u8; 32],
+                committee_epoch: 0,
+                threshold_num: 2,
+                threshold_den: 3,
+                votes,
+            };
+            let mut receipt = ext_skeleton(2);
+            let mut ext = receipt.phase20_ext.clone().expect("ext");
+            ext.finality_proof = Some(proof);
+            receipt.phase20_ext = Some(ext);
+            let parent = cs.chain[0].header.hash_for_height(0);
+            let tip = Block {
+                header: BlockHeader {
+                    version: 0,
+                    prev_hash: parent,
+                    merkle_root: [0u8; 32],
+                    time: 7000,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![receipt]),
+            };
+            cs.chain.push(tip);
+            cs.height = cs.chain.len() as u64;
+            cs.block_finality_has_genuine_quorum(30)
+        };
+        // A single registered identity (committee size 1 < 4) cannot finalize...
+        assert!(!check(&[1], vec![vote(1, 1)]), "solo miner must not self-finalize");
+        // ...and neither can a second, divergent solo fork keyed differently. With both
+        // forks unable to advance finalized_height, they can never both finalize.
+        assert!(
+            !check(&[2], vec![vote(2, 1)]),
+            "second divergent solo fork must not self-finalize either"
+        );
+        // A genuine committee of 4 registered keys with 3 distinct Commit votes
+        // (3 >= ceil(4 * 2/3) = 3) DOES finalize -- proves the gate is not just always-off.
+        assert!(
+            check(&[1, 2, 3, 4], vec![vote(1, 1), vote(2, 1), vote(3, 1)]),
+            "a real 2/3 quorum of distinct registered keys must finalize"
+        );
+        // Below the 2/3 threshold (only 2 distinct voters) does not finalize.
+        assert!(
+            !check(&[1, 2, 3, 4], vec![vote(1, 1), vote(2, 1)]),
+            "below the 2/3 threshold must not finalize"
+        );
+        // A duplicated voter is counted once (distinctness), so it cannot fake a quorum.
+        assert!(
+            !check(&[1, 2, 3, 4], vec![vote(1, 1), vote(1, 1), vote(2, 1)]),
+            "duplicate voter must not be counted twice"
+        );
+        // An unregistered voter does not count even if it casts a Commit vote.
+        assert!(
+            !check(&[1, 2, 3, 4], vec![vote(1, 1), vote(2, 1), vote(9, 1)]),
+            "unregistered voter must not count toward quorum"
+        );
+        // Non-Commit votes (Precommit = 0) never count toward finalization.
+        assert!(
+            !check(&[1, 2, 3, 4], vec![vote(1, 0), vote(2, 0), vote(3, 0)]),
+            "non-commit votes must not finalize"
+        );
+        std::env::remove_var("IRIUM_POAWX_PROPOSER_FREEZE_DEPTH");
         std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_NETWORK");
     }
