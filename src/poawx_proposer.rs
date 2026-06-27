@@ -321,6 +321,72 @@ impl ProposerEligibilityRegistry {
 }
 
 /// Max pending gossiped registrations a node will hold.
+// ââ fork-choice hardening (Fix 1-4): bounded reorgs, honest finality, no-length tiebreak ââ
+// One activation gate covers the whole bundle (depth cap + tip-hash tiebreak + genuine
+// finality + header-sync floor). network_id == 0 (mainnet) hard-off; off until the
+// activation height is set, so existing chains are byte-identical until coordinated activation.
+pub const DEFAULT_MAX_REORG_DEPTH_MAINNET: u64 = 1000;
+pub const DEFAULT_MAX_REORG_DEPTH_DEVNET: u64 = 100;
+/// Hard floor: a configured cap can never drop below this (keeps normal shallow reorgs
+/// working; an operator cannot cripple reorg recovery by setting it too low).
+pub const MAX_REORG_DEPTH_HARD_FLOOR: u64 = 10;
+pub const DEFAULT_MIN_FINALITY_COMMITTEE_MAINNET: u64 = 16;
+pub const DEFAULT_MIN_FINALITY_COMMITTEE_DEVNET: u64 = 4;
+
+pub fn fork_choice_hardening_activation_height() -> Option<u64> {
+    std::env::var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Pure gate (param-driven for race-free tests). Mainnet (`network_id == 0`) hard-off.
+pub fn fork_choice_hardening_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
+    if network_id == 0 {
+        return false;
+    }
+    matches!(activation, Some(h) if height >= h)
+}
+
+pub fn fork_choice_hardening_active(height: u64) -> bool {
+    fork_choice_hardening_gate(
+        network_id_byte(),
+        fork_choice_hardening_activation_height(),
+        height,
+    )
+}
+
+/// Max blocks a single reorg may disconnect (Fix 1). Finality-independent backstop:
+/// the effective reorg floor is `max(finalized_height, tip - max_reorg_depth())`.
+/// Network default + env override, floored at `MAX_REORG_DEPTH_HARD_FLOOR`.
+pub fn max_reorg_depth() -> u64 {
+    let default = if network_id_byte() == 0 {
+        DEFAULT_MAX_REORG_DEPTH_MAINNET
+    } else {
+        DEFAULT_MAX_REORG_DEPTH_DEVNET
+    };
+    std::env::var("IRIUM_POAWX_MAX_REORG_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+        .max(MAX_REORG_DEPTH_HARD_FLOOR)
+}
+
+/// Minimum distinct registered committee keys required before genuine finality can
+/// advance `finalized_height` (Fix 2). Below this, finality does not advance and the
+/// depth cap is the protection.
+pub fn min_finality_committee() -> u64 {
+    let default = if network_id_byte() == 0 {
+        DEFAULT_MIN_FINALITY_COMMITTEE_MAINNET
+    } else {
+        DEFAULT_MIN_FINALITY_COMMITTEE_DEVNET
+    };
+    std::env::var("IRIUM_POAWX_MIN_FINALITY_COMMITTEE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
 pub const PROPOSER_REG_POOL_MAX: usize = 1024;
 
 /// Whether proposer-registration gossip is enabled (non-mainnet only).
@@ -514,6 +580,24 @@ mod tests {
         let mut out = [0u8; 32];
         out[0..8].copy_from_slice(&7u64.to_le_bytes());
         assert_eq!(proposer_priority(&out), 7);
+    }
+
+    #[test]
+    fn fork_choice_hardening_gate_and_depth_floor() {
+        assert!(!fork_choice_hardening_gate(0, Some(1), 100)); // mainnet hard-off
+        assert!(fork_choice_hardening_gate(2, Some(50), 50));
+        assert!(fork_choice_hardening_gate(2, Some(50), 999));
+        assert!(!fork_choice_hardening_gate(2, Some(50), 49));
+        assert!(!fork_choice_hardening_gate(2, None, 100)); // unset => off
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_MAX_REORG_DEPTH", "2");
+        assert_eq!(max_reorg_depth(), MAX_REORG_DEPTH_HARD_FLOOR); // 2 floored to 10
+        std::env::set_var("IRIUM_POAWX_MAX_REORG_DEPTH", "250");
+        assert_eq!(max_reorg_depth(), 250);
+        std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
+        assert_eq!(max_reorg_depth(), DEFAULT_MAX_REORG_DEPTH_DEVNET);
+        assert_eq!(min_finality_committee(), DEFAULT_MIN_FINALITY_COMMITTEE_DEVNET);
+        std::env::remove_var("IRIUM_NETWORK");
     }
 
     #[test]

@@ -2122,6 +2122,21 @@ impl ChainState {
         if ancestor_height >= current_tip_height {
             return Ok(());
         }
+        // Fix 1: hard max-reorg-depth cap (gated; mainnet hard-off). A finality-
+        // INDEPENDENT bound so no peer can pull us onto a chain forking deeper than N,
+        // even when the finality watermark is not advancing (small/partitioned network).
+        // A reorg deeper than N fails closed; recovery from a legitimate deeper split is
+        // out-of-band via the operator anchor system + resync.
+        if crate::poawx_proposer::fork_choice_hardening_active(current_tip_height) {
+            let depth = current_tip_height - ancestor_height;
+            let cap = crate::poawx_proposer::max_reorg_depth();
+            if depth > cap {
+                return Err(format!(
+                    "reorg rejected: depth {} exceeds max-reorg-depth cap {} (hardening backstop)",
+                    depth, cap
+                ));
+            }
+        }
         // Finality-checkpoint protection: refuse a reorg whose fork point is at or
         // below the deepest finalized height (it would disconnect a finalized
         // block), regardless of cumulative work. Self-gating: `finalized_height`
@@ -14200,5 +14215,56 @@ mod proposer_consensus_tests {
         cs.revert_block_proposer_registrations(&b1, 1);
         assert_eq!(cs.proposer_reg_queue.len(), 0);
         clear_reg_env();
+    }
+
+    fn minimal_block(prev_hash: [u8; 32], time: u32) -> Block {
+        Block {
+            header: BlockHeader {
+                version: 0,
+                prev_hash,
+                merkle_root: [0u8; 32],
+                time,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: None,
+        }
+    }
+
+    #[test]
+    fn reorg_deeper_than_cap_rejected() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MAX_REORG_DEPTH", "10"); // == hard floor
+        let mut cs = base_chain();
+        // Build a 12-block main chain of minimal blocks on top of genesis.
+        let mut prev = cs.chain[0].header.hash_for_height(0);
+        for h in 1..=12u64 {
+            let b = minimal_block(prev, 1000 + h as u32);
+            let hh = b.header.hash_for_height(h);
+            cs.block_store.insert(hh, b.clone());
+            cs.heights.insert(hh, h);
+            cs.chain.push(b);
+            prev = hh;
+        }
+        cs.height = cs.chain.len() as u64; // 13 => tip_height 12 (push bypasses connect_block)
+        assert_eq!(cs.tip_height(), 12);
+        // Fork off height 1 => ancestor 1 => reorg depth 12 - 1 = 11 > cap 10 => rejected.
+        let b1h = cs.chain[1].header.hash_for_height(1);
+        let f = minimal_block(b1h, 9999);
+        let fh = f.header.hash_for_height(2);
+        cs.block_store.insert(fh, f);
+        cs.heights.insert(fh, 2);
+        let err = cs.reorg_to_tip(fh).unwrap_err();
+        assert!(
+            err.contains("max-reorg-depth"),
+            "deep reorg must be capped even with a longer chain; got: {err}"
+        );
+        std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
+        std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
     }
 }
