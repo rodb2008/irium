@@ -2329,12 +2329,68 @@ impl ChainState {
                 .last()
                 .map(|b| b.header.hash_for_height(tip_height)),
         );
+        // Fix 4 (gated): never select a header chain we could never adopt. The adoptable
+        // floor is max(finalized_height, tip - max_reorg_depth): a header whose fork-ancestor
+        // is below it would be rejected by reorg_to_tip (Fix 1 depth cap / finality guard),
+        // so chasing it only wastes sync on an un-adoptable tip. Gate off => legacy
+        // pure-highest-work selection (byte-identical).
+        let hardening = crate::poawx_proposer::fork_choice_hardening_active(tip_height);
+        let floor = if hardening {
+            self.finalized_height
+                .max(tip_height.saturating_sub(crate::poawx_proposer::max_reorg_depth()))
+        } else {
+            0
+        };
         for hw in self.headers.values() {
             if hw.work > best.0 {
+                if hardening {
+                    let cand = hw.header.hash_for_height(hw.height);
+                    match self.header_fork_ancestor_height(cand, floor) {
+                        Some(anc) if anc >= floor => {}
+                        _ => continue, // forks below the floor => un-adoptable, skip it
+                    }
+                }
                 best = (hw.work.clone(), Some(hw.header.hash_for_height(hw.height)));
             }
         }
         best.1.unwrap_or([0u8; 32])
+    }
+
+    /// Fix 4: height at which the header chain ending in `tip` rejoins our ACTIVE chain
+    /// (its fork-ancestor). Returns None if it descends below `floor` before rejoining
+    /// (i.e. it forks deeper than we could ever adopt) or the parent links break. Walks
+    /// parent links through the header tree / block store; height strictly decreases each
+    /// step so it always terminates (plus a hard guard against pathological inputs).
+    fn header_fork_ancestor_height(&self, tip: [u8; 32], floor: u64) -> Option<u64> {
+        let mut cur = tip;
+        let mut guard = 0u64;
+        loop {
+            guard += 1;
+            if guard > 100_000 {
+                return None;
+            }
+            let h = self
+                .heights
+                .get(&cur)
+                .copied()
+                .or_else(|| self.headers.get(&cur).map(|hw| hw.height))?;
+            if (h as usize) < self.chain.len()
+                && self.chain[h as usize].header.hash_for_height(h) == cur
+            {
+                return Some(h); // rejoined the active chain
+            }
+            if h <= floor {
+                return None; // off-chain at/below the floor => never rejoins above it
+            }
+            let prev = if let Some(hw) = self.headers.get(&cur) {
+                hw.header.prev_hash
+            } else if let Some(b) = self.block_store.get(&cur) {
+                b.header.prev_hash
+            } else {
+                return None;
+            };
+            cur = prev;
+        }
     }
 
     /// Best-work header entry if it beats the current chain tip.
@@ -14477,6 +14533,76 @@ mod proposer_consensus_tests {
             "non-commit votes must not finalize"
         );
         std::env::remove_var("IRIUM_POAWX_PROPOSER_FREEZE_DEPTH");
+        std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn header_sync_skips_unadoptable_deep_chain() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MAX_REORG_DEPTH", "10"); // floor = tip(30) - 10 = 20
+        // Build an active 30-block chain, then a higher-work competing header chain that
+        // forks at `fork_at`. best_header_hash must select it ONLY when its fork-ancestor
+        // is at/above the adoptable floor.
+        let run = |fork_at: u64| -> ([u8; 32], [u8; 32], [u8; 32]) {
+            let mut cs = base_chain();
+            let mut prev = cs.chain[0].header.hash_for_height(0);
+            for h in 1..=30u64 {
+                let b = minimal_block(prev, 100 + h as u32);
+                let hh = b.header.hash_for_height(h);
+                cs.block_store.insert(hh, b.clone());
+                cs.heights.insert(hh, h);
+                cs.chain.push(b);
+                prev = hh;
+            }
+            cs.height = cs.chain.len() as u64; // tip height 30
+            cs.total_work = BigUint::from(50u32);
+            let our_tip = cs.chain.last().unwrap().header.hash_for_height(30);
+            // Competing branch: heights fork_at+1 ..= 40, strictly higher work than ours.
+            let mut bp = cs.chain[fork_at as usize].header.hash_for_height(fork_at);
+            let mut branch_tip = [0u8; 32];
+            for h in (fork_at + 1)..=40u64 {
+                let hdr = BlockHeader {
+                    version: 0,
+                    prev_hash: bp,
+                    merkle_root: [0u8; 32],
+                    time: 7000 + h as u32,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                };
+                let hh = hdr.hash_for_height(h);
+                cs.headers.insert(
+                    hh,
+                    HeaderWork {
+                        header: hdr,
+                        height: h,
+                        work: BigUint::from(1000u32 + h as u32),
+                    },
+                );
+                bp = hh;
+                branch_tip = hh;
+            }
+            let best = cs.best_header_hash();
+            (our_tip, branch_tip, best)
+        };
+        // Forks at height 5, far below the floor (20): un-adoptable. Even with much higher
+        // work, header sync must NOT chase it -- it stays on our own tip.
+        let (our_tip, deep_tip, best) = run(5);
+        assert_eq!(
+            best, our_tip,
+            "header sync must not chase a chain forking below the reorg floor"
+        );
+        assert_ne!(best, deep_tip, "the un-adoptable deep tip must never be selected");
+        // Forks at height 25 (>= floor 20): adoptable, so a higher-work chain is still
+        // selected normally -- the gate only filters un-adoptable chains.
+        let (_our2, ok_tip, best2) = run(25);
+        assert_eq!(
+            best2, ok_tip,
+            "an adoptable higher-work chain must still be selected"
+        );
+        std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
         std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_NETWORK");
     }
