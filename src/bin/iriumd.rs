@@ -13600,12 +13600,20 @@ async fn get_block_template(
                 .collect();
             let exclude: std::collections::BTreeSet<[u8; 33]> =
                 guard.proposer_reg_queue.iter().map(|r| r.vrf_pubkey).collect();
+            // Only offer registrations whose anchor is still within the recent window
+            // (so the produced block validates) and whose key is not already on-chain.
+            let window = irium_node_rs::poawx_proposer::PROPOSER_REG_ANCHOR_WINDOW;
             let anns: Vec<String> = irium_node_rs::poawx_proposer::global_proposer_reg_pool()
-                .announce_candidates(
-                    irium_node_rs::poawx_proposer::PROPOSER_ANNOUNCE_CAP,
-                    &exclude,
-                )
-                .iter()
+                .announce_candidates(64, &exclude)
+                .into_iter()
+                .filter(|r| {
+                    irium_node_rs::poawx_proposer::registration_anchor_valid(
+                        r.anchor_height,
+                        height,
+                        window,
+                    ) && !guard.proposer_registry.is_registered(&r.vrf_pubkey)
+                })
+                .take(irium_node_rs::poawx_proposer::PROPOSER_ANNOUNCE_CAP)
                 .map(|r| hex::encode(r.serialize()))
                 .collect();
             (

@@ -1219,11 +1219,14 @@ impl ChainState {
                 self.proposer_reg_queue.iter().map(|r| r.vrf_pubkey).collect();
             for a in &sec.announces {
                 // recent: anchor strictly in the past and within the window.
-                if a.anchor_height >= height {
-                    return Err("proposer registration: anchor not in the past".to_string());
-                }
-                if height > window && a.anchor_height < height - window {
-                    return Err("proposer registration: anchor older than window".to_string());
+                if !crate::poawx_proposer::registration_anchor_valid(
+                    a.anchor_height,
+                    height,
+                    window,
+                ) {
+                    return Err(
+                        "proposer registration: anchor outside the recent window".to_string()
+                    );
                 }
                 // canonical: the anchor hash must be this chain's block at that height.
                 let anchor_block = self.chain.get(a.anchor_height as usize).ok_or_else(|| {
@@ -1941,8 +1944,14 @@ impl ChainState {
             Some(b) => Self::proposer_keys_from_block(b, reg_active),
             None => return,
         };
+        let mut registered: Vec<[u8; 33]> = Vec::new();
         for (pubkey, pkh) in keys {
             self.proposer_registry.register(pubkey, pkh, height);
+            registered.push(pubkey);
+        }
+        // Prune the node-local gossip pool for any key that just landed on-chain.
+        if reg_active && !registered.is_empty() {
+            crate::poawx_proposer::global_proposer_reg_pool().forget(&registered);
         }
     }
 
@@ -1962,12 +1971,19 @@ impl ChainState {
             Some(s) => s,
             None => return,
         };
+        let mut activated: Vec<[u8; 33]> = Vec::new();
         for reg in &section.activations {
             self.proposer_reg_queue.pop_front();
             self.proposer_registry.register(reg.vrf_pubkey, reg.pkh(), height);
+            activated.push(reg.vrf_pubkey);
         }
         for reg in &section.announces {
             self.proposer_reg_queue.push_back(reg.clone());
+        }
+        // Prune the node-local gossip pool: an activated key is on-chain now, so its
+        // pending registration is done (prevents it lingering and going anchor-stale).
+        if !activated.is_empty() {
+            crate::poawx_proposer::global_proposer_reg_pool().forget(&activated);
         }
     }
 

@@ -173,6 +173,14 @@ pub const PROPOSER_ANNOUNCE_CAP: usize = 8;
 /// including height (bounds offline precomputation of the sybil work).
 pub const PROPOSER_REG_ANCHOR_WINDOW: u64 = 64;
 
+/// Whether a registration `anchor_height` is acceptable for inclusion in a block at
+/// `height`: strictly in the past and within `window` of it. Used IDENTICALLY by the
+/// block builder (to filter announce candidates) and the validator (connect_block) so
+/// they never diverge -- a stale anchor must never be offered AND is always rejected.
+pub fn registration_anchor_valid(anchor_height: u64, height: u64, window: u64) -> bool {
+    anchor_height < height && !(height > window && anchor_height < height - window)
+}
+
 pub fn proposer_registration_activation_height() -> Option<u64> {
     std::env::var("IRIUM_POAWX_PROPOSER_REGISTRATION_ACTIVATION_HEIGHT")
         .ok()
@@ -298,6 +306,11 @@ impl ProposerEligibilityRegistry {
         )
     }
 
+    /// Whether this VRF key has ANY on-chain registration (regardless of freeze).
+    pub fn is_registered(&self, vrf_pubkey: &[u8; 33]) -> bool {
+        self.keys.contains_key(vrf_pubkey)
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -347,8 +360,18 @@ impl NodeProposerRegistrationPool {
             return GossipOutcome::Rejected("registration: bad signature".to_string());
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if pending.contains_key(&reg.vrf_pubkey) {
-            return GossipOutcome::Duplicate;
+        match pending.get(&reg.vrf_pubkey) {
+            // already have an equal-or-fresher anchor for this key: ignore.
+            Some(existing) if reg.anchor_height <= existing.anchor_height => {
+                return GossipOutcome::Duplicate;
+            }
+            // a fresher anchor for a known key: refresh + rebroadcast so the network
+            // converges on the newest (non-stale) registration for the key.
+            Some(_) => {
+                pending.insert(reg.vrf_pubkey, reg);
+                return GossipOutcome::AcceptedNew;
+            }
+            None => {}
         }
         if pending.len() >= PROPOSER_REG_POOL_MAX {
             return GossipOutcome::Rejected("registration: pool full".to_string());
@@ -500,6 +523,58 @@ mod tests {
         assert!(proposer_registration_gate(true, Some(50), 50)); // active at height
         assert!(proposer_registration_gate(true, Some(50), 999)); // active after
         assert!(!proposer_registration_gate(true, Some(50), 49)); // before activation
+    }
+
+    #[test]
+    fn registration_anchor_window_math() {
+        // in the past + within window.
+        assert!(registration_anchor_valid(60, 66, 64));
+        assert!(registration_anchor_valid(65, 66, 64));
+        // genesis anchor goes stale once height passes anchor + window.
+        assert!(!registration_anchor_valid(0, 66, 64)); // 0 < 66-64=2 => stale
+        assert!(registration_anchor_valid(0, 64, 64)); // height==window => no lower bound
+        assert!(!registration_anchor_valid(0, 65, 64)); // 0 < 1 => stale
+        // not in the past.
+        assert!(!registration_anchor_valid(66, 66, 64));
+        assert!(!registration_anchor_valid(67, 66, 64));
+    }
+
+    #[test]
+    fn registry_is_registered_tracks_keys() {
+        let mut reg = ProposerEligibilityRegistry::default();
+        let k = [0x9u8; 33];
+        assert!(!reg.is_registered(&k));
+        reg.register(k, [0x1u8; 20], 5);
+        assert!(reg.is_registered(&k));
+        reg.unregister(&k, 5);
+        assert!(!reg.is_registered(&k));
+    }
+
+    #[test]
+    fn pool_refreshes_to_fresher_anchor() {
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let net = crate::activation::network_id_byte();
+        let pool = NodeProposerRegistrationPool::default();
+        let r0 = crate::poawx::ProposerRegistrationV1::build_signed(&[0x7u8; 32], net, 0, &[0x9u8; 32], 0)
+            .unwrap();
+        let r5 = crate::poawx::ProposerRegistrationV1::build_signed(&[0x7u8; 32], net, 5, &[0x9u8; 32], 0)
+            .unwrap();
+        assert!(matches!(
+            pool.ingest_bytes(&r0.serialize()),
+            crate::poawx_gossip::GossipOutcome::AcceptedNew
+        ));
+        // fresher anchor (5 > 0) => refresh + rebroadcast.
+        assert!(matches!(
+            pool.ingest_bytes(&r5.serialize()),
+            crate::poawx_gossip::GossipOutcome::AcceptedNew
+        ));
+        // older/equal anchor => duplicate (no downgrade).
+        assert!(matches!(
+            pool.ingest_bytes(&r0.serialize()),
+            crate::poawx_gossip::GossipOutcome::Duplicate
+        ));
+        assert_eq!(pool.len(), 1);
+        std::env::remove_var("IRIUM_NETWORK");
     }
 
     #[test]
