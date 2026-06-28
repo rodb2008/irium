@@ -5612,6 +5612,14 @@ impl P2PNode {
                                     let mut state = peer_state.lock().await;
                                     state.height = Some(peer_height);
                                     state.last_bad_headers = None;
+                                    // Phase 31 sibling-fork recovery (gated): keep the peer tip fresh so an
+                                    // equal-height competing fork is seen as a tip mismatch and fetched at
+                                    // shallow depth (before it can exceed the reorg cap). Mainnet hard-off.
+                                    if let Some(__lh) = last_header_hash {
+                                        if crate::poawx_proposer::fork_choice_hardening_active(local_height) {
+                                            state.tip = Some(__lh);
+                                        }
+                                    }
                                 }
                                 clear_header_reject_streak(addr.ip()).await;
                                 let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
@@ -6172,6 +6180,21 @@ impl P2PNode {
                                                 &multiaddr,
                                                 new_height.saturating_sub(1),
                                             );
+                                        }
+                                        // Phase 31 sibling-fork recovery (gated): record the peer's
+                                        // just-delivered tip from gossip so an equal-height competing
+                                        // fork is detected as a tip mismatch on the next sync tick and
+                                        // fetched at shallow depth. Mainnet hard-off (no refresh when off).
+                                        {
+                                            let local_h = chain_for_sync
+                                                .as_ref()
+                                                .and_then(|c| c.lock().ok().map(|g| g.tip_height()))
+                                                .unwrap_or(0);
+                                            if crate::poawx_proposer::fork_choice_hardening_active(local_h)
+                                                && block_height >= local_h
+                                            {
+                                                peer_state.lock().await.tip = Some(bhash);
+                                            }
                                         }
                                         maybe_request_sync(
                                             &writer,
@@ -8183,6 +8206,14 @@ async fn handle_incoming_with_sybil(
                                 let mut state = peer_state2.lock().await;
                                 state.height = Some(peer_height);
                                 state.last_bad_headers = None;
+                                // Phase 31 sibling-fork recovery (gated): keep the peer tip fresh so an
+                                // equal-height competing fork is seen as a tip mismatch and fetched at
+                                // shallow depth (before it can exceed the reorg cap). Mainnet hard-off.
+                                if let Some(__lh) = last_header_hash {
+                                    if crate::poawx_proposer::fork_choice_hardening_active(local_height) {
+                                        state.tip = Some(__lh);
+                                    }
+                                }
                             }
                             clear_header_reject_streak(addr2.ip()).await;
                             let multiaddr = format!("/ip4/{}/tcp/{}", addr2.ip(), addr2.port());

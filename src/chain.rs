@@ -3084,6 +3084,22 @@ impl ChainState {
             } else {
                 cumulative > self.total_work
             };
+            // Phase 31 observability (gated): make equal-height sibling fork-choice
+            // decisions visible instead of a silent "side chain" outcome.
+            if crate::poawx_proposer::fork_choice_hardening_active(self.tip_height())
+                && height == self.tip_height()
+            {
+                eprintln!(
+                    "[fork-choice] sibling at height {} hash {}: {}",
+                    height,
+                    hex::encode(hash),
+                    if do_reorg {
+                        "adopting (better by proposer rank / lowest tip hash)"
+                    } else {
+                        "keeping current tip (sibling not better)"
+                    }
+                );
+            }
             if do_reorg {
                 if let Err(e) = self.reorg_to_tip(hash) {
                     self.block_store.remove(&hash);
@@ -14605,5 +14621,146 @@ mod proposer_consensus_tests {
         std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
         std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    // ---- Phase 31 sibling fork-choice determinism ----
+    // These prove the CHAIN layer already resolves equal-height competing blocks
+    // deterministically (proposer rank, then lowest tip hash). The devnet split was a
+    // p2p DELIVERY gap (a node never received the competing sibling while the fork was
+    // shallow), not a fork-choice bug -- these tests lock that invariant in.
+    fn set_sib_env() {
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT", "1");
+    }
+    fn clear_sib_env() {
+        std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+    // A node whose tip is `tip_block` (height 1, child of genesis) that ALSO holds the
+    // competing sibling `other` in its block store -- i.e. it has received both siblings.
+    fn node_with_tip_and_sibling(tip_block: &Block, other: &Block) -> ChainState {
+        let mut cs = base_chain();
+        let th = tip_block.header.hash_for_height(1);
+        let oh = other.header.hash_for_height(1);
+        cs.block_store.insert(th, tip_block.clone());
+        cs.heights.insert(th, 1);
+        cs.chain.push(tip_block.clone());
+        cs.block_store.insert(oh, other.clone());
+        cs.heights.insert(oh, 1);
+        cs.height = cs.chain.len() as u64;
+        cs
+    }
+
+    #[test]
+    fn sibling_tiebreak_deterministic() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_sib_env();
+        let gh = base_chain().chain[0].header.hash_for_height(0);
+        // Two equal-rank siblings (minimal => rank (MAX,MAX)); distinct times => distinct hashes.
+        let a = minimal_block(gh, 1001);
+        let b = minimal_block(gh, 2002);
+        let ah = a.header.hash_for_height(1);
+        let bh = b.header.hash_for_height(1);
+        let winner = if ah < bh { ah } else { bh }; // deterministic: lowest tip hash
+        // Node1 accepted `a` first, then receives `b`.
+        let n1 = node_with_tip_and_sibling(&a, &b);
+        let n1_tip = if n1.proposer_rank_chain_better(bh).unwrap() { bh } else { ah };
+        // Node2 accepted `b` first, then receives `a`.
+        let n2 = node_with_tip_and_sibling(&b, &a);
+        let n2_tip = if n2.proposer_rank_chain_better(ah).unwrap() { ah } else { bh };
+        assert_eq!(n1_tip, n2_tip, "both nodes converge on the same sibling regardless of arrival order");
+        assert_eq!(n1_tip, winner, "the deterministic winner is the lowest tip hash");
+        clear_sib_env();
+    }
+
+    #[test]
+    fn sibling_better_rank_wins_both_orders() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_sib_env();
+        let gh = base_chain().chain[0].header.hash_for_height(0);
+        // `a` carries a proposer assignment (rank (0, pri) -- better); `b` is minimal (MAX,MAX).
+        let a = proposer_block_h1(&secret_n(1), 2, [7u8; 32], 0);
+        let b = minimal_block(gh, 4242);
+        let ah = a.header.hash_for_height(1);
+        let bh = b.header.hash_for_height(1);
+        assert_ne!(ah, bh);
+        // Node1 tip=a receives b -> keep a (a has the better rank).
+        let n1 = node_with_tip_and_sibling(&a, &b);
+        assert!(!n1.proposer_rank_chain_better(bh).unwrap(), "worse-rank sibling must not win");
+        // Node2 tip=b receives a -> switch to a, regardless of arrival order.
+        let n2 = node_with_tip_and_sibling(&b, &a);
+        assert!(n2.proposer_rank_chain_better(ah).unwrap(), "better-rank sibling must win");
+        clear_sib_env();
+    }
+
+    #[test]
+    fn depth2_fork_converges() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_sib_env();
+        let gh = base_chain().chain[0].header.hash_for_height(0);
+        // Two 2-block forks off genesis, all minimal (equal rank everywhere) => lowest tip hash wins.
+        let a1 = minimal_block(gh, 100); let a1h = a1.header.hash_for_height(1);
+        let a2 = minimal_block(a1h, 101); let a2h = a2.header.hash_for_height(2);
+        let b1 = minimal_block(gh, 200); let b1h = b1.header.hash_for_height(1);
+        let b2 = minimal_block(b1h, 201); let b2h = b2.header.hash_for_height(2);
+        let winner = if a2h < b2h { a2h } else { b2h };
+        let build = |chain_blocks: &[(Block, u64)], store: &[(Block, u64)]| -> ChainState {
+            let mut cs = base_chain();
+            for (blk, h) in chain_blocks {
+                let hh = blk.header.hash_for_height(*h);
+                cs.block_store.insert(hh, blk.clone());
+                cs.heights.insert(hh, *h);
+                cs.chain.push(blk.clone());
+            }
+            for (blk, h) in store {
+                let hh = blk.header.hash_for_height(*h);
+                cs.block_store.insert(hh, blk.clone());
+                cs.heights.insert(hh, *h);
+            }
+            cs.height = cs.chain.len() as u64;
+            cs
+        };
+        let n1 = build(&[(a1.clone(), 1), (a2.clone(), 2)], &[(b1.clone(), 1), (b2.clone(), 2)]);
+        let n1_tip = if n1.proposer_rank_chain_better(b2h).unwrap() { b2h } else { a2h };
+        let n2 = build(&[(b1.clone(), 1), (b2.clone(), 2)], &[(a1.clone(), 1), (a2.clone(), 2)]);
+        let n2_tip = if n2.proposer_rank_chain_better(a2h).unwrap() { a2h } else { b2h };
+        assert_eq!(n1_tip, n2_tip, "depth-2 forks converge regardless of arrival order");
+        assert_eq!(n1_tip, winner, "winner is the lowest tip hash on a full rank tie");
+        clear_sib_env();
+    }
+
+    #[test]
+    fn sibling_reorg_within_cap() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        set_sib_env();
+        std::env::set_var("IRIUM_POAWX_MAX_REORG_DEPTH", "10");
+        let mut cs = base_chain();
+        let mut prev = cs.chain[0].header.hash_for_height(0);
+        let mut h4 = prev;
+        for h in 1..=5u64 {
+            let b = minimal_block(prev, 1000 + h as u32);
+            let hh = b.header.hash_for_height(h);
+            cs.block_store.insert(hh, b.clone());
+            cs.heights.insert(hh, h);
+            cs.chain.push(b);
+            if h == 4 { h4 = hh; }
+            prev = hh;
+        }
+        cs.height = cs.chain.len() as u64; // tip height 5
+        // Sibling of the height-5 tip: a child of the height-4 block.
+        let sib = minimal_block(h4, 9999);
+        let sh = sib.header.hash_for_height(5);
+        cs.block_store.insert(sh, sib);
+        cs.heights.insert(sh, 5);
+        let (anc, branch) = cs.find_reorg_path(sh).unwrap();
+        let depth = cs.tip_height() - anc;
+        assert_eq!(depth, 1, "a sibling of the tip is a depth-1 reorg");
+        assert_eq!(branch.len(), 1);
+        assert!(
+            depth <= crate::poawx_proposer::max_reorg_depth(),
+            "a depth-1 sibling reorg is always within the max-reorg-depth cap"
+        );
+        std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
+        clear_sib_env();
     }
 }
