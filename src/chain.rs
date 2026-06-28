@@ -329,6 +329,18 @@ pub struct HeaderWork {
     pub work: BigUint,
 }
 
+/// GAP B: classification of an orphan block's parent for adoptability-aware recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrphanClass {
+    /// Parent connects to our active chain within the reorg cap; fetch the competing branch
+    /// bodies via GetBlocks starting at `anchor` (a connected ancestor), `count` blocks.
+    Adoptable { anchor: [u8; 32], count: u32 },
+    /// The parent header is not known yet -> request headers (legitimate catch-up).
+    NeedHeaders,
+    /// Parent links only via a fork below the adoptable floor (foreign/stale chain).
+    Foreign,
+}
+
 fn swap4_bytes_each_word(input: [u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for i in 0..8 {
@@ -2430,6 +2442,94 @@ impl ChainState {
             }
         }
         best
+    }
+
+    /// Fix GAP A: best-work header that is ALSO adoptable -- its fork-ancestor is at/above the
+    /// adoptable floor max(finalized_height, tip - max_reorg_depth). Mirrors the filter in
+    /// best_header_hash so the getblocks chase never targets a chain we could never adopt
+    /// (e.g. a foreign/stale chain forking below the reorg cap, which would otherwise hijack
+    /// sync). Returns None if no adoptable header beats our tip.
+    pub fn best_adoptable_header_if_better(&self) -> Option<HeaderWork> {
+        let tip_height = self.height.saturating_sub(1);
+        let floor = self
+            .finalized_height
+            .max(tip_height.saturating_sub(crate::poawx_proposer::max_reorg_depth()));
+        let mut best: Option<HeaderWork> = None;
+        for hw in self.headers.values() {
+            if hw.work <= self.total_work {
+                continue;
+            }
+            if best.as_ref().map(|b| b.work >= hw.work).unwrap_or(false) {
+                continue;
+            }
+            let cand = hw.header.hash_for_height(hw.height);
+            match self.header_fork_ancestor_height(cand, floor) {
+                Some(anc) if anc >= floor => {}
+                _ => continue,
+            }
+            best = Some(hw.clone());
+        }
+        best
+    }
+
+    /// Fix GAP B1: classify an orphan block's parent for adoptability-aware recovery.
+    pub fn orphan_branch_class(&self, prev_hash: [u8; 32]) -> OrphanClass {
+        let tip_height = self.height.saturating_sub(1);
+        let floor = self
+            .finalized_height
+            .max(tip_height.saturating_sub(crate::poawx_proposer::max_reorg_depth()));
+        let prev_height = match self
+            .heights
+            .get(&prev_hash)
+            .copied()
+            .or_else(|| self.headers.get(&prev_hash).map(|hw| hw.height))
+        {
+            Some(h) => h,
+            None => return OrphanClass::NeedHeaders,
+        };
+        match self.header_fork_ancestor_height(prev_hash, floor) {
+            Some(anc) if anc >= floor => {
+                let anchor = self
+                    .chain
+                    .get(anc as usize)
+                    .map(|b| b.header.hash_for_height(anc))
+                    .unwrap_or([0u8; 32]);
+                let count = prev_height.saturating_sub(anc) as u32;
+                OrphanClass::Adoptable {
+                    anchor,
+                    count: count.max(1),
+                }
+            }
+            _ => OrphanClass::Foreign,
+        }
+    }
+
+    /// Fix GAP B2: remove only orphans whose parent links via a fork below the adoptable floor
+    /// (foreign/stale flood); keep connected/shallow honest-sibling orphans so legitimate
+    /// sibling resolution survives a concurrent orphan storm. Returns the number removed.
+    pub fn prune_unadoptable_orphans(&mut self) -> usize {
+        let tip_height = self.height.saturating_sub(1);
+        let floor = self
+            .finalized_height
+            .max(tip_height.saturating_sub(crate::poawx_proposer::max_reorg_depth()));
+        let remove: Vec<[u8; 32]> = self
+            .orphan_pool
+            .keys()
+            .copied()
+            .filter(|parent| {
+                !matches!(
+                    self.header_fork_ancestor_height(*parent, floor),
+                    Some(anc) if anc >= floor
+                )
+            })
+            .collect();
+        let mut removed = 0usize;
+        for k in remove {
+            if let Some(v) = self.orphan_pool.remove(&k) {
+                removed += v.len();
+            }
+        }
+        removed
     }
 
     /// Check if a header connects to current tip.
@@ -14837,6 +14937,165 @@ mod proposer_consensus_tests {
         );
         std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
         std::env::remove_var("IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    // ---- GAP A/B: adoptability-aware sync (reject foreign chains, keep honest orphans) ----
+    // Fixture: a 30-block active chain (work 50), a FOREIGN higher-work header chain forking
+    // at h5 (below the reorg floor 20 -> un-adoptable), and a SHALLOW header branch forking at
+    // h28 (>= floor -> adoptable). Returns (cs, foreign_tip, shallow_tip, foreign_mid@h10,
+    // shallow_first@h29). Simulates the live "external old chain" pressure deterministically.
+    fn gap_fixture() -> (ChainState, [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+        let mut cs = base_chain();
+        let mut prev = cs.chain[0].header.hash_for_height(0);
+        for h in 1..=30u64 {
+            let b = minimal_block(prev, 100 + h as u32);
+            let hh = b.header.hash_for_height(h);
+            cs.block_store.insert(hh, b.clone());
+            cs.heights.insert(hh, h);
+            cs.chain.push(b);
+            prev = hh;
+        }
+        cs.height = cs.chain.len() as u64; // tip height 30
+        cs.total_work = BigUint::from(50u32);
+        // foreign deep chain forking at h5, very high work.
+        let mut fp = cs.chain[5].header.hash_for_height(5);
+        let mut foreign_tip = [0u8; 32];
+        let mut foreign_mid = [0u8; 32];
+        for h in 6..=45u64 {
+            let hdr = BlockHeader {
+                version: 0,
+                prev_hash: fp,
+                merkle_root: [0u8; 32],
+                time: 7000 + h as u32,
+                bits: 0x207fffff,
+                nonce: 0,
+            };
+            let hh = hdr.hash_for_height(h);
+            cs.headers.insert(
+                hh,
+                HeaderWork { header: hdr, height: h, work: BigUint::from(5000u32 + h as u32) },
+            );
+            if h == 10 {
+                foreign_mid = hh;
+            }
+            fp = hh;
+            foreign_tip = hh;
+        }
+        // shallow branch forking at h28, lower work than foreign but above ours.
+        let mut sp = cs.chain[28].header.hash_for_height(28);
+        let mut shallow_tip = [0u8; 32];
+        let mut shallow_first = [0u8; 32];
+        for h in 29..=32u64 {
+            let hdr = BlockHeader {
+                version: 0,
+                prev_hash: sp,
+                merkle_root: [1u8; 32],
+                time: 9000 + h as u32,
+                bits: 0x207fffff,
+                nonce: 0,
+            };
+            let hh = hdr.hash_for_height(h);
+            cs.headers.insert(
+                hh,
+                HeaderWork { header: hdr, height: h, work: BigUint::from(100u32 + h as u32) },
+            );
+            if h == 29 {
+                shallow_first = hh;
+            }
+            sp = hh;
+            shallow_tip = hh;
+        }
+        (cs, foreign_tip, shallow_tip, foreign_mid, shallow_first)
+    }
+
+    #[test]
+    fn gap_a_best_adoptable_excludes_foreign_deep_chain() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_MAX_REORG_DEPTH", "10"); // floor = 30 - 10 = 20
+        let (cs, foreign_tip, shallow_tip, _, _) = gap_fixture();
+        // pre-fix: unfiltered selection chases the foreign deep chain (the hijack).
+        let unfiltered = cs.best_header_if_better().expect("unfiltered some");
+        assert_eq!(
+            unfiltered.header.hash_for_height(unfiltered.height),
+            foreign_tip,
+            "best_header_if_better selects the foreign deep chain (the bug)"
+        );
+        // GAP A: adoptable selection refuses the foreign chain, returns the shallow branch.
+        let adoptable = cs.best_adoptable_header_if_better().expect("adoptable some");
+        let at = adoptable.header.hash_for_height(adoptable.height);
+        assert_eq!(at, shallow_tip, "adoptable selects the shallow branch");
+        assert_ne!(at, foreign_tip, "the foreign deep chain must never be selected");
+        std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn gap_a_best_adoptable_none_when_only_foreign() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_MAX_REORG_DEPTH", "10");
+        let (mut cs, _ft, shallow_tip, _, shallow_first) = gap_fixture();
+        // drop the shallow branch headers so ONLY the foreign deep chain remains.
+        cs.headers.remove(&shallow_first);
+        for h in 30..=32u64 {
+            // remove any shallow header at these heights by rebuilding -- simplest: clear all
+            // headers whose merkle_root marks the shallow branch ([1u8;32]).
+            let _ = h;
+        }
+        cs.headers.retain(|_, hw| hw.header.merkle_root != [1u8; 32]);
+        let _ = shallow_tip;
+        assert!(
+            cs.best_header_if_better().is_some(),
+            "unfiltered still sees the foreign chain"
+        );
+        assert!(
+            cs.best_adoptable_header_if_better().is_none(),
+            "no adoptable header beats us -> the foreign chain cannot hijack sync"
+        );
+        std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn gap_b2_prune_keeps_honest_orphans() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_MAX_REORG_DEPTH", "10");
+        let (mut cs, _ft, _st, foreign_mid, shallow_first) = gap_fixture();
+        cs.orphan_pool.insert(shallow_first, vec![minimal_block([9u8; 32], 1)]);
+        cs.orphan_pool.insert(foreign_mid, vec![minimal_block([8u8; 32], 2)]);
+        let removed = cs.prune_unadoptable_orphans();
+        assert_eq!(removed, 1, "exactly the foreign orphan is removed");
+        assert!(
+            cs.orphan_pool.contains_key(&shallow_first),
+            "honest shallow-sibling orphan is preserved"
+        );
+        assert!(
+            !cs.orphan_pool.contains_key(&foreign_mid),
+            "foreign deep orphan is dropped"
+        );
+        std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn gap_b1_orphan_branch_class_routing() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_MAX_REORG_DEPTH", "10");
+        let (cs, _ft, _st, foreign_mid, shallow_first) = gap_fixture();
+        // shallow sibling parent -> Adoptable (fetch its body via GetBlocks).
+        match cs.orphan_branch_class(shallow_first) {
+            OrphanClass::Adoptable { count, .. } => assert!(count >= 1, "fetches >=1 body"),
+            other => panic!("expected Adoptable, got {other:?}"),
+        }
+        // foreign deep parent -> Foreign (do not chase).
+        assert_eq!(cs.orphan_branch_class(foreign_mid), OrphanClass::Foreign);
+        // unknown parent -> NeedHeaders (legit catch-up).
+        assert_eq!(cs.orphan_branch_class([0x77u8; 32]), OrphanClass::NeedHeaders);
+        std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
         std::env::remove_var("IRIUM_NETWORK");
     }
 

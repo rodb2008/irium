@@ -2189,6 +2189,75 @@ async fn request_orphan_headers(
         guard.height.unwrap_or(local_height.saturating_add(1))
     };
 
+    // === Fix GAP A/B (gated behind fork_choice_hardening; mainnet hard-off; off => the legacy
+    // recovery below runs unchanged). Adoptability-aware orphan recovery: fetch a shallow
+    // competing sibling's BODIES (GetBlocks; GetData is tx-only), request headers for a legit
+    // ahead-peer whose ancestors we lack, and refuse to chase / storm-restart from genesis for
+    // a foreign chain forking below the reorg cap (sync-hijack prevention), preserving honest
+    // orphans during a flood. ===
+    if crate::poawx_proposer::fork_choice_hardening_active(local_height) {
+        // GAP B2: under an orphan storm, prune ONLY un-adoptable (foreign/deep) orphans; keep
+        // shallow honest-sibling orphans and do NOT restart header-sync from genesis.
+        if note_orphan_and_check_storm().await {
+            let pruned = chain
+                .as_ref()
+                .and_then(|c| c.lock().ok().map(|mut g| g.prune_unadoptable_orphans()))
+                .unwrap_or(0);
+            P2PNode::log_event(
+                "warn",
+                "sync",
+                format!(
+                    "orphan storm: pruned {} un-adoptable orphans (honest/shallow kept)",
+                    pruned
+                ),
+            );
+        }
+        let class = chain
+            .as_ref()
+            .and_then(|c| c.lock().ok().map(|g| g.orphan_branch_class(prev_hash)));
+        match class {
+            Some(crate::chain::OrphanClass::Adoptable { anchor, count }) => {
+                // GAP B1: fetch the competing sibling branch BODIES (rate-limited).
+                if sync_request_allowed_for(sync_requests, addr.ip(), local_height, peer_height)
+                    .await
+                {
+                    let get_blocks = GetBlocksPayload {
+                        start_hash: anchor.to_vec(),
+                        count: count.min(MAX_BLOCKS_PER_REQUEST),
+                    };
+                    if let Ok(msg) = get_blocks.to_message() {
+                        let _ = send_message(writer, msg, addr).await;
+                    }
+                    peer_state.lock().await.last_headers_request = Some(Instant::now());
+                }
+            }
+            Some(crate::chain::OrphanClass::NeedHeaders) | None => {
+                // Legitimate catch-up: ancestors unknown -> header-first sync.
+                if sync_request_allowed_for(sync_requests, addr.ip(), local_height, peer_height)
+                    .await
+                {
+                    let get_headers = GetHeadersPayload {
+                        start_hash: vec![0u8; 32],
+                        count: MAX_HEADERS_PER_REQUEST,
+                    };
+                    if let Ok(msg) = get_headers.to_message() {
+                        let _ = send_message(writer, msg, addr).await;
+                    }
+                    let mut guard = peer_state.lock().await;
+                    guard.last_headers_request = Some(Instant::now());
+                    guard.last_headers_start = Some([0u8; 32]);
+                    guard.headers_inflight = true;
+                }
+            }
+            Some(crate::chain::OrphanClass::Foreign) => {
+                // GAP A: foreign chain forking below the reorg cap -> score the peer down; do
+                // NOT chase it and do NOT restart header-sync from genesis.
+                peer_mark_header_event(addr.ip(), false, 1).await;
+            }
+        }
+        return;
+    }
+
     if prev_hash != [0u8; 32] && !prev_known {
         let prev = hex::encode(prev_hash);
         let prev_short = prev.get(0..12).unwrap_or(&prev);
@@ -5695,7 +5764,12 @@ impl P2PNode {
 
                                 let request = {
                                     let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                    if let Some(best) = guard.best_header_if_better() {
+                                    let __best_adoptable = if crate::poawx_proposer::fork_choice_hardening_active(guard.tip_height()) {
+                                        guard.best_adoptable_header_if_better()
+                                    } else {
+                                        guard.best_header_if_better()
+                                    };
+                                    if let Some(best) = __best_adoptable {
                                         if let Some(path) = guard.header_path_to_known(
                                             best.header.hash_for_height(best.height),
                                         ) {
@@ -8299,7 +8373,12 @@ async fn handle_incoming_with_sybil(
                             let request = {
                                 let guard =
                                     chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Some(best) = guard.best_header_if_better() {
+                                let __best_adoptable = if crate::poawx_proposer::fork_choice_hardening_active(guard.tip_height()) {
+                                    guard.best_adoptable_header_if_better()
+                                } else {
+                                    guard.best_header_if_better()
+                                };
+                                if let Some(best) = __best_adoptable {
                                     if let Some(path) = guard.header_path_to_known(
                                         best.header.hash_for_height(best.height),
                                     ) {
