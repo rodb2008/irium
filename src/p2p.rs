@@ -5257,13 +5257,16 @@ impl P2PNode {
                                         target.copy_from_slice(&payload.start_hash);
                                         start_hash_non_zero = target.iter().any(|b| *b != 0);
                                         if start_hash_non_zero {
-                                            if let Some((pos, _)) =
-                                                guard.chain.iter().enumerate().find(|(idx, b)| {
-                                                    b.header.hash_for_height(*idx as u64) == target
-                                                })
-                                            {
-                                                start_idx = pos.saturating_add(1);
-                                                start_found = true;
+                                            // Fix #12: O(1) height-index lookup instead of an O(chain) scan, so a peer
+                                            // spraying random/missing start hashes cannot pin the chain lock with full
+                                            // scans (CPU-DoS). Verify the indexed block is on the active chain.
+                                            if let Some(&hpos) = guard.heights.get(&target) {
+                                                if (hpos as usize) < guard.chain.len()
+                                                    && guard.chain[hpos as usize].header.hash_for_height(hpos) == target
+                                                {
+                                                    start_idx = (hpos as usize).saturating_add(1);
+                                                    start_found = true;
+                                                }
                                             }
                                         }
                                     }
@@ -5327,6 +5330,26 @@ impl P2PNode {
                                                     ),
                                                 );
                                             }
+                                        }
+                                        // Fix #13 (audit-gated): solicit the announcing peer's chain via a
+                                        // genesis-locator GetHeaders so a competing sibling fork can be
+                                        // fetched + resolved, instead of only dropping the announcement.
+                                        // send_message_detached does not await (peer_state guard not held
+                                        // across an await); rate-limited via last_headers_request. Off => drop.
+                                        let lh = chain_for_sync
+                                            .as_ref()
+                                            .and_then(|c| c.lock().ok().map(|g| g.tip_height()))
+                                            .unwrap_or(0);
+                                        if crate::poawx_proposer::audit_hardening_active(lh) {
+                                            let gh = GetHeadersPayload {
+                                                start_hash: vec![0u8; 32],
+                                                count: MAX_HEADERS_PER_REQUEST,
+                                            };
+                                            if let Ok(m) = gh.to_message() {
+                                                send_message_detached(&writer, m, addr);
+                                            }
+                                            state.last_headers_request = Some(now);
+                                            state.headers_inflight = true;
                                         }
                                         continue;
                                     }
@@ -7827,13 +7850,16 @@ async fn handle_incoming_with_sybil(
                                     target.copy_from_slice(&start_hash);
                                     start_hash_non_zero = target.iter().any(|b| *b != 0);
                                     if start_hash_non_zero {
-                                        if let Some((pos, _)) =
-                                            guard.chain.iter().enumerate().find(|(idx, b)| {
-                                                b.header.hash_for_height(*idx as u64) == target
-                                            })
-                                        {
-                                            start_idx = pos.saturating_add(1);
-                                            start_found = true;
+                                        // Fix #12: O(1) height-index lookup instead of an O(chain) scan, so a peer
+                                        // spraying random/missing start hashes cannot pin the chain lock with full
+                                        // scans (CPU-DoS). Verify the indexed block is on the active chain.
+                                        if let Some(&hpos) = guard.heights.get(&target) {
+                                            if (hpos as usize) < guard.chain.len()
+                                                && guard.chain[hpos as usize].header.hash_for_height(hpos) == target
+                                            {
+                                                start_idx = (hpos as usize).saturating_add(1);
+                                                start_found = true;
+                                            }
                                         }
                                     }
                                 }
@@ -8569,6 +8595,8 @@ async fn handle_incoming_with_sybil(
                         let mempool2 = mempool.clone();
                         let directory2 = directory.clone();
                         let reputation2 = reputation.clone();
+                        let peer_state_blk = peer_state.clone();
+                        let chain_blk = chain_arc.clone();
 
                         let permit = match inbound_bulk_queue().acquire_owned().await {
                             Ok(p) => p,
@@ -8717,6 +8745,23 @@ async fn handle_incoming_with_sybil(
                                 };
                             drop(permit_guard);
                             let connect_ms = connect_started.elapsed().as_millis();
+
+                            // Fix #3 (audit-gated): the INBOUND block-gossip path now refreshes
+                            // the peer tip too (the outbound path did this in v0.1.9; this closes
+                            // the missing direction). An equal-height competing fork delivered via
+                            // an inbound connection is then seen as a tip mismatch by the periodic
+                            // maybe_request_sync and fetched at shallow depth. Mainnet hard-off.
+                            {
+                                let local_h = chain_blk
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .tip_height();
+                                if crate::poawx_proposer::audit_hardening_active(local_h)
+                                    && block_height >= local_h
+                                {
+                                    peer_state_blk.lock().await.tip = Some(bhash);
+                                }
+                            }
 
                             for (height, b) in persist_blocks {
                                 let h = b.header.hash_for_height(height);

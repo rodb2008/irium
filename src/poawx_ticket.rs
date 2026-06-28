@@ -527,6 +527,14 @@ impl TicketProof {
         if self.target_height != height {
             return Err("ticket proof: height mismatch".to_string());
         }
+        // Fix #7 (audit-gated): bind the epoch to the height so it is not a free field. The
+        // builder sets epoch = height = target_height; this rejects any ticket whose epoch is
+        // not the height it claims, closing the "any epoch passes" sybil-window gap. Mainnet off.
+        if crate::poawx_proposer::audit_hardening_active(height)
+            && self.epoch != self.target_height
+        {
+            return Err("ticket proof: epoch not bound to height (audit)".to_string());
+        }
         if self.role_id != role_id {
             return Err("ticket proof: role mismatch".to_string());
         }
@@ -717,6 +725,54 @@ mod tests {
         // validate() already enforces mainnet hard-off via expected_network==0:
         let t = mk(1, 10, 100);
         assert!(t.validate(0, 50, 0).is_err(), "validate mainnet hard-off");
+    }
+
+    #[test]
+    fn audit_ticket_rejects_epoch_not_bound_to_height() {
+        use crate::poawx::ROLE_VERIFY_CONTRIBUTOR;
+        // Fix #7: when the audit gate is active a ticket's epoch must equal its target_height
+        // (closes the "any epoch passes" sybil-window gap). Mainnet hard-off.
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let net = crate::activation::network_id_byte();
+        let solver = [0xC7u8; 20];
+        let apk = [0x02u8; 33];
+        let height = 5u64;
+        let bound = TicketProof::new(
+            net, height, [0u8; 32], ROLE_VERIFY_CONTRIBUTOR, solver, height, 100, apk,
+            [0x44u8; 32], 0,
+        );
+        let unbound = TicketProof::new(
+            net, height, [0u8; 32], ROLE_VERIFY_CONTRIBUTOR, solver, 2, 100, apk,
+            [0x44u8; 32], 0,
+        );
+        // gate OFF => both validate (legacy: epoch is free).
+        std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
+        assert!(bound
+            .validate(net, height, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .is_ok());
+        assert!(
+            unbound
+                .validate(net, height, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+                .is_ok(),
+            "epoch free when gate off"
+        );
+        // gate ON => bound ok, unbound rejected.
+        std::env::set_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT", "1");
+        assert!(
+            bound
+                .validate(net, height, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+                .is_ok(),
+            "bound ok gate on"
+        );
+        let err = unbound
+            .validate(net, height, &[0u8; 32], ROLE_VERIFY_CONTRIBUTOR, &solver, 0, false)
+            .expect_err("unbound rejected");
+        assert!(err.contains("epoch not bound"), "got: {err}");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
     }
 
     #[test]

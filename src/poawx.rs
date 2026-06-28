@@ -111,9 +111,12 @@ impl RoleReward {
     }
 
     pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
-        if raw.len() < Self::WIRE_SIZE {
+        // Fix #11: RoleReward is always decoded from an exact WIRE_SIZE slice; reject any other
+        // length (incl. trailing bytes) for canonical-encoding hardening, matching Fix-D for role
+        // claims. (Delegation / PoawxBlockReceipt are prefix readers and keep `<` by design.)
+        if raw.len() != Self::WIRE_SIZE {
             return Err(format!(
-                "role reward too short: {} < {}",
+                "role reward bad length: {} != {}",
                 raw.len(),
                 Self::WIRE_SIZE
             ));
@@ -1676,6 +1679,52 @@ pub fn irx1_root_from_block_receipts(receipts: &[PoawxBlockReceipt]) -> [u8; 32]
 /// and non-production caller — the result is **byte-identical** to the Phase 13-A /
 /// 18B root (the extension is ignored, exactly as the wrapper above). The inner
 /// hash field order mirrors `compute_poawx_receipts_root_gated` in iriumd.rs.
+// Fix #1 (audit-gated): deterministic, collision-proof receipts root. Audit OFF => delegates
+// to the legacy `_gated` root (byte-identical). Audit ON => the root is built from receipts
+// sorted by their FULL inner hash (a total order over [u8;32]), so a block carrying receipts
+// that collide on (height,lane,worker_pkh,commitment_nonce) can no longer yield a node-
+// dependent root via `sort_unstable_by`'s undefined order on equal keys. For single-receipt
+// blocks (every honest block) the result is identical to legacy either way.
+pub fn irx1_root_from_block_receipts_audit(
+    receipts: &[PoawxBlockReceipt],
+    phase20_active: bool,
+    audit_active: bool,
+) -> [u8; 32] {
+    if !audit_active {
+        return irx1_root_from_block_receipts_gated(receipts, phase20_active);
+    }
+    let mut inners: Vec<[u8; 32]> = receipts
+        .iter()
+        .map(|r| {
+            let mut inner = Sha256::new();
+            inner.update(r.height.to_le_bytes());
+            inner.update([r.lane]);
+            inner.update(r.worker_pkh);
+            // Fix #5: bind signer pubkey + signature so the receipt signature is consensus-
+            // committed (no block-hash-stable wire variants from a different valid sig).
+            inner.update(r.worker_pubkey);
+            inner.update(r.worker_sig);
+            inner.update(r.solution);
+            inner.update(r.commitment_nonce);
+            if let Some(d) = &r.delegation {
+                inner.update(d.digest());
+            }
+            if phase20_active {
+                if let Some(e) = &r.phase20_ext {
+                    inner.update(e.digest());
+                }
+            }
+            inner.finalize().into()
+        })
+        .collect();
+    inners.sort_unstable();
+    let mut outer = Sha256::new();
+    for h in &inners {
+        outer.update(h);
+    }
+    outer.finalize().into()
+}
+
 pub fn irx1_root_from_block_receipts_gated(
     receipts: &[PoawxBlockReceipt],
     phase20_active: bool,
@@ -1855,6 +1904,39 @@ mod tests {
             delegation: None,
             phase20_ext: None,
         }
+    }
+
+    #[test]
+    fn audit_receipts_root_deterministic_under_colliding_keys() {
+        // Fix #1: two receipts that collide on the legacy sort key (height, lane, worker_pkh,
+        // commitment_nonce) but differ in `solution` produce an order-INDEPENDENT audit root
+        // (sorted by full inner hash), eliminating sort_unstable's undefined tie order -- a
+        // chain-split risk with adversarial multi-receipt blocks.
+        let mut a = make_test_receipt(7);
+        let mut b = make_test_receipt(7);
+        a.solution = [0x44u8; 8];
+        b.solution = [0x77u8; 8];
+        assert_eq!(a.height, b.height);
+        assert_eq!(a.lane, b.lane);
+        assert_eq!(a.worker_pkh, b.worker_pkh);
+        assert_eq!(a.commitment_nonce, b.commitment_nonce);
+        let fwd = irx1_root_from_block_receipts_audit(&[a.clone(), b.clone()], true, true);
+        let rev = irx1_root_from_block_receipts_audit(&[b.clone(), a.clone()], true, true);
+        assert_eq!(fwd, rev, "audit root order-independent for colliding keys");
+        // a 3-element shuffle is also invariant.
+        let c = make_test_receipt(8);
+        let r1 = irx1_root_from_block_receipts_audit(&[a.clone(), b.clone(), c.clone()], true, true);
+        let r2 = irx1_root_from_block_receipts_audit(&[c.clone(), a.clone(), b.clone()], true, true);
+        let r3 = irx1_root_from_block_receipts_audit(&[b.clone(), c.clone(), a.clone()], true, true);
+        assert_eq!(r1, r2);
+        assert_eq!(r1, r3);
+        // gate OFF delegates to the legacy gated root (byte-identical when off).
+        let one = make_test_receipt(9);
+        assert_eq!(
+            irx1_root_from_block_receipts_audit(&[one.clone()], true, false),
+            irx1_root_from_block_receipts_gated(&[one.clone()], true),
+            "audit=false is byte-identical to legacy gated root"
+        );
     }
 
     #[test]

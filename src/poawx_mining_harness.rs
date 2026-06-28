@@ -867,7 +867,13 @@ fn build_all_gates_block_with(
     // Canonical 0%-fee multi-role coinbase + the gated (ext-bound) irx1 root.
     let total = block_reward(height);
     let a = multi_role_amounts(total);
-    let irx1_root = irx1_root_from_block_receipts_gated(std::slice::from_ref(&receipt), true);
+    // Fix #5/#1: build the gated (deterministic, sig-bound) audit root so the miner's root
+    // matches connect_block's validator when the audit gate is active. Gate off => byte-identical.
+    let irx1_root = crate::poawx::irx1_root_from_block_receipts_audit(
+        std::slice::from_ref(&receipt),
+        true,
+        crate::poawx_proposer::audit_hardening_active(height),
+    );
     let mut irx1_script = vec![0x6a, 0x24u8];
     irx1_script.extend_from_slice(b"irx1");
     irx1_script.extend_from_slice(&irx1_root);

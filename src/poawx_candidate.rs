@@ -790,6 +790,20 @@ impl AssignmentProofV2 {
         if out != self.vrf_output {
             return Err("assignment v2: vrf output mismatch".to_string());
         }
+        // Fix #4 (audit-gated): bind the solver identity to the VRF key. The VRF message
+        // commits to solver_pkh, so without this an attacker could grind solver_pkh (free,
+        // no new keys) for a favorable priority on any path that calls validate() without
+        // chain.rs's separate binding (role/candidate assignment). chain.rs already enforces
+        // this on the proposer path; this protects every caller. Mainnet hard-off.
+        if crate::poawx_proposer::audit_hardening_active(target_height) {
+            let mut expect_pkh = [0u8; 20];
+            expect_pkh.copy_from_slice(&Ripemd160::digest(Sha256::digest(self.assignment_public_key)));
+            if self.solver_pkh != expect_pkh {
+                return Err(
+                    "assignment v2: solver pkh not derived from vrf key (audit)".to_string(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -887,6 +901,40 @@ mod tests {
 
     fn apk() -> [u8; 33] {
         [0x02u8; 33]
+    }
+
+    #[test]
+    fn audit_assignment_rejects_forged_solver_pkh() {
+        // Fix #4: AssignmentProofV2::validate binds solver_pkh == hash160(vrf key) when the
+        // audit gate is active, so solver_pkh cannot be ground for priority. Mainnet hard-off.
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let net = crate::activation::network_id_byte();
+        let secret = [7u8; 32];
+        let height = 5u64;
+        let seed = [0x9au8; 32];
+        let good =
+            AssignmentProofV2::prove_self_solver(&secret, net, height, 1, [0u8; 32], seed)
+                .expect("prove self solver");
+        // forged: a real VRF proof whose carried solver_pkh != hash160(vrf key).
+        let forged =
+            AssignmentProofV2::prove(&secret, net, height, 1, [0xABu8; 20], [0u8; 32], seed)
+                .expect("prove forged solver");
+        // gate OFF => forged still passes (byte-identical legacy).
+        std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
+        assert!(good.validate(net, height).is_ok(), "genuine ok, gate off");
+        assert!(forged.validate(net, height).is_ok(), "forged passes when gate off");
+        // gate ON => genuine still ok, forged rejected.
+        std::env::set_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT", "1");
+        assert!(good.validate(net, height).is_ok(), "genuine ok, gate on");
+        let err = forged
+            .validate(net, height)
+            .expect_err("forged rejected when gate on");
+        assert!(err.contains("solver pkh not derived"), "got: {err}");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
     }
 
     #[test]

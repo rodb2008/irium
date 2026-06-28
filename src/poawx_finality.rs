@@ -675,6 +675,27 @@ impl NodeFinalityVoteCache {
             }
             return GossipOutcome::Duplicate;
         }
+        // Fix #6 (audit-gated): equivocation detection. The per-key dedup above only catches a
+        // member double-signing the SAME block; this catches a member casting a Commit vote for a
+        // DIFFERENT block at the same height (the two-fork double-sign used to finalize competing
+        // chains). Reject the equivocating vote so the cache cannot assemble two conflicting
+        // finality proofs. Mainnet hard-off (gate false on network_id 0).
+        if crate::poawx_proposer::audit_hardening_active(v.target_height)
+            && v.vote_type == FinalityVoteType::Commit.id()
+        {
+            for ((h, bh, vt, m), _) in map.iter() {
+                if *h == v.target_height
+                    && *m == v.member_pkh
+                    && *vt == v.vote_type
+                    && *bh != v.block_hash
+                {
+                    return GossipOutcome::Rejected(
+                        "equivocating finality vote: member voted two blocks at one height"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         map.insert(key, v.clone());
         drop(map);
         self.mark_seen(d);
@@ -979,6 +1000,77 @@ mod tests {
         assert_eq!(p.required_votes(1), 1); // clamp >=1
         let p2 = FinalityProofV1::new(1, 10, [0u8; 32], [0u8; 32], 0, 1, 1);
         assert_eq!(p2.required_votes(4), 4); // unanimous
+    }
+
+    #[test]
+    fn audit_finality_cache_rejects_equivocation() {
+        // Fix #6: a member casting a Commit vote for a DIFFERENT block at the same height is
+        // rejected by the gossip cache when the audit gate is active, so two conflicting
+        // finality proofs cannot be assembled. Mainnet hard-off.
+        let _g = crate::poawx::poawx_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_FINALITY_GOSSIP_ACTIVATION_HEIGHT", "1");
+        let net = network_id_byte();
+        let h = 10u64;
+        let bh1 = [0x11u8; 32];
+        let bh2 = [0x22u8; 32];
+        let mk = |bh: [u8; 32]| {
+            FinalityVoteV1::signed(
+                &key(0xA1),
+                net,
+                h,
+                bh,
+                [0u8; 32],
+                0,
+                [0x33u8; 32],
+                FinalityVoteType::Commit,
+            )
+        };
+        // gate OFF => same member voting two blocks is accepted (legacy).
+        std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
+        let c0 = NodeFinalityVoteCache::new();
+        c0.set_tip(h);
+        assert_eq!(
+            c0.ingest_bytes(&mk(bh1).serialize()),
+            GossipOutcome::AcceptedNew
+        );
+        assert_eq!(
+            c0.ingest_bytes(&mk(bh2).serialize()),
+            GossipOutcome::AcceptedNew,
+            "legacy allows equivocation"
+        );
+        // gate ON => the second (conflicting) vote is rejected.
+        std::env::set_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT", "1");
+        let c1 = NodeFinalityVoteCache::new();
+        c1.set_tip(h);
+        assert_eq!(
+            c1.ingest_bytes(&mk(bh1).serialize()),
+            GossipOutcome::AcceptedNew
+        );
+        match c1.ingest_bytes(&mk(bh2).serialize()) {
+            GossipOutcome::Rejected(e) => assert!(e.contains("equivocating"), "got: {e}"),
+            other => panic!("expected equivocation rejection, got {other:?}"),
+        }
+        // a non-conflicting different member is still accepted.
+        let other_member = FinalityVoteV1::signed(
+            &key(0xB2),
+            net,
+            h,
+            bh1,
+            [0u8; 32],
+            0,
+            [0x33u8; 32],
+            FinalityVoteType::Commit,
+        );
+        assert_eq!(
+            c1.ingest_bytes(&other_member.serialize()),
+            GossipOutcome::AcceptedNew
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_GOSSIP_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
     }
 
     #[test]

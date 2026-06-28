@@ -1196,6 +1196,19 @@ impl ChainState {
                 return Err("phase21h: finality threshold mismatch".to_string());
             }
             fp.validate(net, height, &block.header.prev_hash, &committee)?;
+            // Fix #2 (audit-gated): the proof's block_hash already pins the finalized block
+            // (a block hash commits to its own parent), so the parent_hash field is redundant;
+            // this rejects a proof that bundles votes carrying inconsistent parent_hash, as
+            // defense-in-depth against malformed/forged finality aggregation. Mainnet hard-off.
+            if crate::poawx_proposer::audit_hardening_active(height) {
+                for v in &fp.votes {
+                    if v.parent_hash != fp.parent_hash {
+                        return Err(
+                            "phase21h: finality vote parent_hash mismatch (audit)".to_string(),
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1354,7 +1367,21 @@ impl ChainState {
                     .proposer_registry
                     .is_eligible(&pa.proof.assignment_public_key, height)
             {
-                return Err("proposer: vrf key not eligible (not frozen-registered)".to_string());
+                // Fix #9: surface the registered-key mismatch. List the eligible proposer
+                // pkhs so an operator can immediately see that their miner is signing with a
+                // key that is not in the frozen-registered set (the silent 0-yield cause).
+                let eligible: Vec<String> = self
+                    .proposer_registry
+                    .eligible_pkhs(height)
+                    .iter()
+                    .map(hex::encode)
+                    .collect();
+                return Err(format!(
+                    "proposer: vrf key (pkh {}) not eligible / not frozen-registered at height {}; eligible proposer pkhs = {:?} -- the miner is likely signing with a key different from its registered proposer key",
+                    hex::encode(pa.proof.solver_pkh),
+                    height,
+                    eligible
+                ));
             }
             // VRF sortition: priority must cross the cascade threshold for its round.
             let priority = crate::poawx_proposer::proposer_priority(&pa.proof.vrf_output);
@@ -3917,7 +3944,11 @@ fn validate_poawx_block_receipts(
     // (in addition to the explicit production validator below). Mainnet-off: the
     // gate is false on mainnet, so the root is byte-identical to Phase 13-A/18B.
     let phase20_active = phase20_production_active(height);
-    let computed_root = crate::poawx::irx1_root_from_block_receipts_gated(receipts, phase20_active);
+    let computed_root = crate::poawx::irx1_root_from_block_receipts_audit(
+        receipts,
+        phase20_active,
+        crate::poawx_proposer::audit_hardening_active(height),
+    );
     if computed_root != coinbase_root {
         return Err(format!(
             "connect_block: irx1 root mismatch at height {} coinbase={} computed={}",
@@ -3925,6 +3956,19 @@ fn validate_poawx_block_receipts(
             hex::encode(coinbase_root),
             hex::encode(computed_root),
         ));
+    }
+    // Fix #10 (audit-gated): the receipt `lane` is bound into the consensus root, so reject any
+    // non-canonical lane value -- otherwise it is attacker-free-form bytes inside the block hash.
+    // The builder emits lane b'A' on every receipt. Mainnet hard-off.
+    if crate::poawx_proposer::audit_hardening_active(height) {
+        for r in receipts {
+            if r.lane != b'A' {
+                return Err(format!(
+                    "connect_block: non-canonical receipt lane {} at height {} (audit)",
+                    r.lane, height
+                ));
+            }
+        }
     }
 
     // Derive deterministic seed and nonce from the parent block.
@@ -4007,6 +4051,16 @@ fn validate_poawx_block_receipts(
                             i, height
                         )
                     })?;
+                    // Fix #5 (audit-gated): require canonical low-S ECDSA so a high-S twin of the
+                    // same signature cannot yield a distinct wire-block with the same block hash.
+                    if crate::poawx_proposer::audit_hardening_active(height)
+                        && sig.normalize_s().is_some()
+                    {
+                        return Err(format!(
+                            "connect_block: receipt[{}] non-canonical (high-S) worker_sig at height {}",
+                            i, height
+                        ));
+                    }
                     vk.verify_prehash(&challenge, &sig).map_err(|_| {
                         format!(
                             "connect_block: receipt[{}] worker_sig verification failed at height {}",
@@ -4092,6 +4146,14 @@ fn validate_poawx_block_receipts(
                             i, height
                         )
                     })?;
+                    if crate::poawx_proposer::audit_hardening_active(height)
+                        && sig.normalize_s().is_some()
+                    {
+                        return Err(format!(
+                            "connect_block: receipt[{}] non-canonical (high-S) signer sig at height {}",
+                            i, height
+                        ));
+                    }
                     vk.verify_prehash(&challenge, &sig).map_err(|_| {
                         format!(
                             "connect_block: receipt[{}] signer sig verification failed at height {}",
@@ -12203,6 +12265,117 @@ mod tests {
     }
 
     #[test]
+    fn audit_finality_rejects_parent_hash_mismatch() {
+        use crate::poawx::ROLE_SUPPORT_CONTRIBUTOR;
+        use crate::poawx_candidate::{CandidateSet, RoleCandidate};
+        use crate::poawx_finality::{FinalityProofV1, FinalityVoteType, FinalityVoteV1};
+        use crate::poawx_penalty::PenaltyStatus;
+        // Fix #2: every vote in a finality proof must share the proof's parent_hash when the
+        // audit gate is active (defense-in-depth on finality aggregation). Mainnet hard-off.
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED", "1");
+        std::env::set_var("IRIUM_POAWX_FINALITY_THRESHOLD_NUM", "2");
+        std::env::set_var("IRIUM_POAWX_FINALITY_THRESHOLD_DEN", "3");
+        let net = crate::activation::network_id_byte();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let sk = signing_key(0x41);
+        let base_ext = p20_ext(net, height, &parent_hash, 0, [0u8; 20]);
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        let members = [signing_key(0xA1), signing_key(0xB2), signing_key(0xC3)];
+        let mut cs = CandidateSet::new(net, height, parent_hash);
+        for (i, m) in members.iter().enumerate() {
+            cs.push(RoleCandidate::build(
+                net,
+                height,
+                &parent_hash,
+                ROLE_SUPPORT_CONTRIBUTOR,
+                key_hash(m),
+                [0x02u8; 33],
+                [(0x30 + i as u8); 32],
+                PenaltyStatus::Clean.id(),
+                1000,
+                [(0x40 + i as u8); 32],
+            ));
+        }
+        cs.sort_canonical();
+        // 2-of-3 proof; `bad` flips the first vote's parent_hash off the proof parent ([0;32]).
+        let mk_proof = |bad: bool| -> FinalityProofV1 {
+            let mut p = FinalityProofV1::new(net, height, parent_hash, [0u8; 32], 0, 2, 3);
+            for (i, m) in members.iter().take(2).enumerate() {
+                let ph = if bad && i == 0 { [0x99u8; 32] } else { [0u8; 32] };
+                p.push(FinalityVoteV1::signed(
+                    m,
+                    net,
+                    height,
+                    parent_hash,
+                    ph,
+                    0,
+                    [0x11u8; 32],
+                    FinalityVoteType::Commit,
+                ));
+            }
+            p.sort_canonical();
+            p
+        };
+        let blk = |proof: FinalityProofV1| -> Block {
+            let mut ext = base_ext.clone();
+            ext.candidate_set = Some(cs.clone());
+            ext.finality_proof = Some(proof);
+            let mut r = receipt.clone();
+            r.phase20_ext = Some(ext);
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![],
+                auxpow: None,
+                poawx_receipts: Some(vec![r]),
+            }
+        };
+        let st = base_chain(None);
+        // gate OFF: a parent-mismatched vote is tolerated (block_hash alone pins lineage).
+        std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
+        assert!(
+            st.validate_block_finality(&blk(mk_proof(false)), height)
+                .is_ok(),
+            "consistent proof ok (gate off)"
+        );
+        assert!(
+            st.validate_block_finality(&blk(mk_proof(true)), height)
+                .is_ok(),
+            "mismatch tolerated when gate off"
+        );
+        // gate ON: a parent-mismatched vote is rejected; consistent proof still passes.
+        std::env::set_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT", "1");
+        assert!(
+            st.validate_block_finality(&blk(mk_proof(false)), height)
+                .is_ok(),
+            "consistent proof ok (gate on)"
+        );
+        let err = st
+            .validate_block_finality(&blk(mk_proof(true)), height)
+            .expect_err("parent mismatch rejected");
+        assert!(err.contains("parent_hash mismatch"), "got: {err}");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_THRESHOLD_NUM");
+        std::env::remove_var("IRIUM_POAWX_FINALITY_THRESHOLD_DEN");
+        std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
     fn phase21h_finality_enforcement() {
         use crate::poawx::ROLE_SUPPORT_CONTRIBUTOR;
         use crate::poawx_candidate::{CandidateSet, RoleCandidate};
@@ -14031,6 +14204,50 @@ mod proposer_consensus_tests {
             cs.proposer_rank_chain_better(cpu_hash).expect("compare"),
             "round-0 CPU must beat round-1 ASIC regardless of PoW"
         );
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn proposer_rejected_when_registered_key_mismatches() {
+        // Fix #9: with a non-empty eligible registry, a block whose proposer key is not the
+        // registered one is rejected and the diagnostic lists the eligible proposer pkhs (the
+        // silent "miner signs with the wrong key" 0-yield cause). Not gate-dependent.
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        std::env::set_var("IRIUM_POAWX_PROPOSER_FREEZE_DEPTH", "2");
+        let net = crate::activation::network_id_byte();
+        let height = 2u64;
+        let prev_hash = [0x55u8; 32];
+        let seed = expected_epoch_seed(height, prev_hash, None);
+        let secret = secret_n(1);
+        let proof = prove(&secret, net, height, seed);
+        let block_key = proof.assignment_public_key;
+        let block_pkh = proof.solver_pkh;
+        let tmpl = ext_skeleton(net);
+        let block = block_with_proof(&tmpl, prev_hash, height, proof, 0, 5_000);
+        // register only a DIFFERENT key => n=1, block key not eligible => reject w/ diagnostic.
+        let mut cs = base_chain();
+        let mut other_key = [0u8; 33];
+        other_key[0] = 0x02;
+        other_key[1] = 0xEE;
+        cs.proposer_registry.register(other_key, [0x7Au8; 20], 0);
+        assert_eq!(cs.proposer_registry.eligible_count(height), 1);
+        let err = cs
+            .validate_block_proposer(&block, height, None)
+            .expect_err("mismatched proposer key must be rejected");
+        assert!(
+            err.contains("not eligible") && err.contains("eligible proposer pkhs"),
+            "got: {err}"
+        );
+        // sanity: registering the block's own key makes it eligible => accepted.
+        let proof2 = prove(&secret, net, height, seed);
+        let block2 = block_with_proof(&tmpl, prev_hash, height, proof2, 0, 5_000);
+        let mut cs2 = base_chain();
+        cs2.proposer_registry.register(block_key, block_pkh, 0);
+        assert_eq!(cs2.proposer_registry.eligible_count(height), 1);
+        cs2.validate_block_proposer(&block2, height, None)
+            .expect("registered proposer key accepted");
+        std::env::remove_var("IRIUM_POAWX_PROPOSER_FREEZE_DEPTH");
         std::env::remove_var("IRIUM_NETWORK");
     }
 

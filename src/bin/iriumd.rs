@@ -14013,6 +14013,53 @@ fn compute_poawx_receipts_root_gated(
     receipts: &[PoawxPendingReceipt],
     phase20_active: bool,
 ) -> [u8; 32] {
+    // Fix #5/#1 (audit-gated): mirror irx1_root_from_block_receipts_audit so a pool-submitted
+    // block's root matches connect_block when the audit gate is active. Self-gated from the
+    // receipt height; gate off => the legacy path below (byte-identical). Field order MUST match
+    // poawx.rs: height,lane,worker_pkh,worker_pubkey,worker_sig,solution,commitment_nonce,[deleg],[ext].
+    let audit = receipts
+        .first()
+        .map(|r| irium_node_rs::poawx_proposer::audit_hardening_active(r.height))
+        .unwrap_or(false);
+    if audit {
+        let mut inners: Vec<[u8; 32]> = receipts
+            .iter()
+            .map(|r| {
+                let mut inner = Sha256::new();
+                let lane_byte = r.lane.bytes().next().unwrap_or(b'A');
+                inner.update(r.height.to_le_bytes());
+                inner.update([lane_byte]);
+                inner.update(hex::decode(&r.worker_pkh).unwrap_or_default());
+                inner.update(hex::decode(&r.worker_pubkey).unwrap_or_default());
+                inner.update(hex::decode(&r.worker_sig).unwrap_or_default());
+                inner.update(hex::decode(&r.solution).unwrap_or_default());
+                inner.update(hex::decode(&r.commitment_nonce).unwrap_or_default());
+                if !r.delegation.is_empty() {
+                    if let Ok(b) = hex::decode(&r.delegation) {
+                        let mut dh = Sha256::new();
+                        dh.update(&b);
+                        let dd: [u8; 32] = dh.finalize().into();
+                        inner.update(dd);
+                    }
+                }
+                if phase20_active && !r.phase20_ext.is_empty() {
+                    if let Ok(b) = hex::decode(&r.phase20_ext) {
+                        let mut eh = Sha256::new();
+                        eh.update(&b);
+                        let ed: [u8; 32] = eh.finalize().into();
+                        inner.update(ed);
+                    }
+                }
+                inner.finalize().into()
+            })
+            .collect();
+        inners.sort_unstable();
+        let mut outer = Sha256::new();
+        for h in &inners {
+            outer.update(h);
+        }
+        return outer.finalize().into();
+    }
     let mut sorted: Vec<&PoawxPendingReceipt> = receipts.iter().collect();
     sorted.sort_unstable_by(|a, b| {
         a.height

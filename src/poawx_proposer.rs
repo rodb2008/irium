@@ -307,6 +307,24 @@ impl ProposerEligibilityRegistry {
     }
 
     /// Whether this VRF key has ANY on-chain registration (regardless of freeze).
+    /// Fix #9: all proposer pkhs eligible at `target_height` (the frozen-registered set).
+    /// Diagnostic so an operator can see whether their miner's key is actually registered.
+    /// Deterministic (BTreeMap order).
+    pub fn eligible_pkhs(&self, target_height: u64) -> Vec<[u8; 20]> {
+        self.eligible_pkhs_with(target_height, proposer_freeze_depth(), proposer_expiry_window())
+    }
+    pub fn eligible_pkhs_with(&self, target_height: u64, fd: u64, ew: u64) -> Vec<[u8; 20]> {
+        match Self::frozen_window_with(fd, ew, target_height) {
+            None => Vec::new(),
+            Some((lo, hi)) => self
+                .keys
+                .values()
+                .filter(|r| Self::record_in_window(r, lo, hi))
+                .map(|r| r.pkh)
+                .collect(),
+        }
+    }
+
     pub fn is_registered(&self, vrf_pubkey: &[u8; 33]) -> bool {
         self.keys.contains_key(vrf_pubkey)
     }
@@ -351,6 +369,31 @@ pub fn fork_choice_hardening_active(height: u64) -> bool {
     fork_choice_hardening_gate(
         network_id_byte(),
         fork_choice_hardening_activation_height(),
+        height,
+    )
+}
+
+// ââ audit hardening (pre-mainnet audit fixes): deterministic receipts root, finality
+// parent/equivocation checks, VRF binding defense-in-depth, sig coverage, lane validation,
+// strict leaf decoding, ticket epoch binding, role distinctness (>=3 candidates). One
+// activation gate; network_id == 0 (mainnet) hard-off; off => byte-identical to pre-audit.
+pub fn audit_hardening_activation_height() -> Option<u64> {
+    std::env::var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+pub fn audit_hardening_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
+    if network_id == 0 {
+        return false;
+    }
+    matches!(activation, Some(h) if height >= h)
+}
+
+pub fn audit_hardening_active(height: u64) -> bool {
+    audit_hardening_gate(
+        network_id_byte(),
+        audit_hardening_activation_height(),
         height,
     )
 }
@@ -448,6 +491,18 @@ impl NodeProposerRegistrationPool {
 
     /// Local submit (RPC path): store + return the wire bytes to gossip.
     pub fn submit(&self, reg: crate::poawx::ProposerRegistrationV1) -> Vec<u8> {
+        // Fix #14: re-validate before inserting into the local pool so the RPC path cannot inject
+        // an unsigned / insufficient-sybil-work registration that the block builder would then
+        // offer as an announce candidate (self-built invalid block). Mirrors ingest_bytes; an
+        // invalid submission returns empty bytes (nothing is pooled or rebroadcast).
+        let net = crate::activation::network_id_byte();
+        if !crate::poawx_ticket::meets_sybil_target(
+            &reg.sybil_digest,
+            crate::poawx_ticket::effective_sybil_bits(),
+        ) || !reg.signature_ok(net)
+        {
+            return Vec::new();
+        }
         let bytes = reg.serialize();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.insert(reg.vrf_pubkey, reg);
