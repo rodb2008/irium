@@ -790,12 +790,18 @@ impl AssignmentProofV2 {
         if out != self.vrf_output {
             return Err("assignment v2: vrf output mismatch".to_string());
         }
-        // Fix #4 (audit-gated): bind the solver identity to the VRF key. The VRF message
-        // commits to solver_pkh, so without this an attacker could grind solver_pkh (free,
-        // no new keys) for a favorable priority on any path that calls validate() without
-        // chain.rs's separate binding (role/candidate assignment). chain.rs already enforces
-        // this on the proposer path; this protects every caller. Mainnet hard-off.
-        if crate::poawx_proposer::audit_hardening_active(target_height) {
+        // Fix #4 (audit-gated, proposer-scoped): bind the PROPOSER's solver identity to its
+        // VRF key. The VRF message commits to solver_pkh, so this stops a proposer grinding
+        // solver_pkh (free, no new keys) for a favorable priority. Role assignments
+        // (COMPUTE/VERIFY/SUPPORT) are intentionally EXEMPT: a block's proposer legitimately
+        // fills all roles of its own block, so a role solver is the miner payout identity, not
+        // hash160(per-role vrf key) -- enforcing the binding there would reject every honest
+        // block (Option A; role distinctness is a documented protocol property, not a validity
+        // rule). chain.rs validate_block_proposer enforces the same proposer binding ungated;
+        // this is belt-and-suspenders for any caller. Mainnet hard-off.
+        if crate::poawx_proposer::audit_hardening_active(target_height)
+            && self.role_id == crate::poawx_proposer::ROLE_PROPOSER
+        {
             let mut expect_pkh = [0u8; 20];
             expect_pkh.copy_from_slice(&Ripemd160::digest(Sha256::digest(self.assignment_public_key)));
             if self.solver_pkh != expect_pkh {
@@ -905,8 +911,11 @@ mod tests {
 
     #[test]
     fn audit_assignment_rejects_forged_solver_pkh() {
-        // Fix #4: AssignmentProofV2::validate binds solver_pkh == hash160(vrf key) when the
-        // audit gate is active, so solver_pkh cannot be ground for priority. Mainnet hard-off.
+        use crate::poawx_proposer::ROLE_PROPOSER;
+        // Fix #4 (proposer-scoped): AssignmentProofV2::validate binds solver_pkh ==
+        // hash160(vrf key) for ROLE_PROPOSER when the audit gate is active, so a proposer
+        // cannot grind solver_pkh for priority. Role assignments are intentionally EXEMPT
+        // (Option A: role solver = miner payout identity). Mainnet hard-off.
         let _g = crate::poawx::poawx_test_env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -915,24 +924,34 @@ mod tests {
         let secret = [7u8; 32];
         let height = 5u64;
         let seed = [0x9au8; 32];
-        let good =
-            AssignmentProofV2::prove_self_solver(&secret, net, height, 1, [0u8; 32], seed)
-                .expect("prove self solver");
-        // forged: a real VRF proof whose carried solver_pkh != hash160(vrf key).
-        let forged =
+        let good = AssignmentProofV2::prove_self_solver(
+            &secret, net, height, ROLE_PROPOSER, [0u8; 32], seed,
+        )
+        .expect("prove self solver");
+        // forged PROPOSER proof: real VRF proof whose solver_pkh != hash160(vrf key).
+        let forged = AssignmentProofV2::prove(
+            &secret, net, height, ROLE_PROPOSER, [0xABu8; 20], [0u8; 32], seed,
+        )
+        .expect("prove forged solver");
+        // a forged ROLE (non-proposer) assignment: solver intentionally not the vrf key.
+        let role_forged =
             AssignmentProofV2::prove(&secret, net, height, 1, [0xABu8; 20], [0u8; 32], seed)
-                .expect("prove forged solver");
-        // gate OFF => forged still passes (byte-identical legacy).
+                .expect("prove role solver");
+        // gate OFF => everything passes (byte-identical legacy).
         std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
         assert!(good.validate(net, height).is_ok(), "genuine ok, gate off");
         assert!(forged.validate(net, height).is_ok(), "forged passes when gate off");
-        // gate ON => genuine still ok, forged rejected.
+        // gate ON => genuine proposer ok; forged proposer rejected; role assignment exempt.
         std::env::set_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT", "1");
-        assert!(good.validate(net, height).is_ok(), "genuine ok, gate on");
+        assert!(good.validate(net, height).is_ok(), "genuine proposer ok, gate on");
         let err = forged
             .validate(net, height)
-            .expect_err("forged rejected when gate on");
+            .expect_err("forged proposer rejected when gate on");
         assert!(err.contains("solver pkh not derived"), "got: {err}");
+        assert!(
+            role_forged.validate(net, height).is_ok(),
+            "role assignment not bound to vrf key (Option A exemption)"
+        );
         std::env::remove_var("IRIUM_NETWORK");
         std::env::remove_var("IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT");
     }

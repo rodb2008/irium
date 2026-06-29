@@ -11,8 +11,11 @@ when off; the gate activates from block 1 on a freshly-wiped devnet/testnet.
 2. Finality parent_hash binding: every vote in a proof must share the proof's parent lineage.
 3. Finality equivocation detection: a member casting a Commit vote for a different block at the
    same height is rejected by the gossip cache (cannot assemble two conflicting proofs).
-4. VRF identity binding: `AssignmentProofV2::validate` now enforces
-   `solver_pkh == hash160(assignment_public_key)`, so solver_pkh cannot be ground for priority.
+4. VRF proposer identity binding: `AssignmentProofV2::validate` enforces
+   `solver_pkh == hash160(assignment_public_key)` for ROLE_PROPOSER only, so a proposer cannot
+   grind solver_pkh for priority. Role assignments (COMPUTE/VERIFY/SUPPORT) are intentionally
+   exempt -- their solver is the miner payout identity (see #8 / Option A) -- and chain.rs
+   validate_block_proposer already enforces the same proposer binding ungated.
 5. Receipt signature coverage: `worker_pubkey`/`worker_sig` are bound into the receipts root and
    canonical low-S ECDSA is required (no block-hash-stable wire variants).
 6. Inbound sibling delivery: the inbound block-gossip path refreshes the peer tip so an
