@@ -15,10 +15,12 @@
 //! Integer/fixed-point only; no floats; no LWMA/PoW interaction.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -96,6 +98,95 @@ pub fn candidate_admission_enforced(height: u64) -> bool {
 /// Whether this node ingests/gossips admissions (testnet/devnet + gate configured).
 pub fn candidate_admission_gossip_enabled() -> bool {
     network_id_byte() != 0 && candidate_admission_activation_height().is_some()
+}
+
+// ---- Fix 1: per-source candidate-admission flood limiter (anti-DoS) ----
+// The candidate-admission path is mainnet hard-off (candidate_admission_gossip_enabled =>
+// network_id != 0), so this runs ONLY on devnet/testnet. It gates admission INGEST/rebroadcast
+// per SOURCE IP and nothing else: it never disconnects, bans, or touches peer reputation, and
+// never affects any other message type -> it cannot impact honest miners (whose rate is far
+// below the limit) or mainnet peers. A reject-retry flood (~14/s of fresh, dedup-evading
+// admissions) is dropped, and a SUSTAINED flood puts that source in a drop-cooldown.
+struct AdmissionRate {
+    window_start: Instant,
+    count: u32,
+    strikes: u32,
+    cooldown_until: Option<Instant>,
+}
+
+pub fn admission_rate_window_secs() -> u64 {
+    std::env::var("IRIUM_POAWX_ADMISSION_RATE_WINDOW_SECS")
+        .ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(10).clamp(1, 3600)
+}
+pub fn admission_rate_max() -> u32 {
+    std::env::var("IRIUM_POAWX_ADMISSION_RATE_MAX")
+        .ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(50).clamp(4, 1_000_000)
+}
+pub fn admission_flood_cooldown_secs() -> u64 {
+    std::env::var("IRIUM_POAWX_ADMISSION_COOLDOWN_SECS")
+        .ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(300).clamp(0, 86400)
+}
+
+fn admission_rate_map() -> &'static Mutex<HashMap<IpAddr, AdmissionRate>> {
+    static M: OnceLock<Mutex<HashMap<IpAddr, AdmissionRate>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// True if `src` may ingest/propagate one more candidate admission now; false => DROP it.
+/// Per-source sliding window (max per window) + escalating drop-cooldown for a sustained flood.
+/// Honest miners (a few admissions per block, per source) never reach the default limit. This is
+/// DROP-ONLY: it never disconnects/bans the peer or affects any other traffic.
+pub fn admission_rate_allowed(src: IpAddr) -> bool {
+    let now = Instant::now();
+    let window = Duration::from_secs(admission_rate_window_secs());
+    let max = admission_rate_max();
+    let cooldown = Duration::from_secs(admission_flood_cooldown_secs());
+    let mut map = admission_rate_map().lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > 8192 {
+        map.retain(|_, r| {
+            r.cooldown_until.map(|t| t > now).unwrap_or(false)
+                || now.duration_since(r.window_start) < window
+        });
+    }
+    let e = map.entry(src).or_insert(AdmissionRate {
+        window_start: now,
+        count: 0,
+        strikes: 0,
+        cooldown_until: None,
+    });
+    if let Some(until) = e.cooldown_until {
+        if until > now {
+            return false;
+        }
+        e.cooldown_until = None;
+        e.window_start = now;
+        e.count = 0;
+        e.strikes = 0;
+    }
+    if now.duration_since(e.window_start) >= window {
+        if e.count <= max {
+            e.strikes = 0; // forgive a clean prior window
+        }
+        e.window_start = now;
+        e.count = 0;
+    }
+    e.count = e.count.saturating_add(1);
+    if e.count > max {
+        e.strikes = e.strikes.saturating_add(1);
+        if e.strikes >= 3 && cooldown.as_secs() > 0 {
+            e.cooldown_until = Some(now + cooldown);
+        }
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+pub fn admission_rate_reset_for_test() {
+    admission_rate_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// One admitted candidate, bound to its `(network, height, role, seed)` context.
@@ -589,6 +680,34 @@ pub fn global_admission_cache() -> &'static NodeCandidateAdmissionCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_rate_limiter_passes_honest_drops_flood() {
+        use std::net::{IpAddr, Ipv4Addr};
+        std::env::set_var("IRIUM_POAWX_ADMISSION_RATE_WINDOW_SECS", "10");
+        std::env::set_var("IRIUM_POAWX_ADMISSION_RATE_MAX", "50");
+        std::env::set_var("IRIUM_POAWX_ADMISSION_COOLDOWN_SECS", "300");
+        admission_rate_reset_for_test();
+        // Honest source: a few admissions per block, well under the per-window limit -> all pass.
+        let honest = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        for _ in 0..40 {
+            assert!(admission_rate_allowed(honest), "honest rate must never be blocked");
+        }
+        // Flood source: ~hundreds in the window -> capped near the window max, then cooled down.
+        let flood = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let (mut allowed, mut dropped) = (0u32, 0u32);
+        for _ in 0..600 {
+            if admission_rate_allowed(flood) { allowed += 1; } else { dropped += 1; }
+        }
+        assert!(allowed <= 55, "flood capped near window max, allowed={allowed}");
+        assert!(dropped >= 540, "flood overwhelmingly dropped, dropped={dropped}");
+        // The flooder must NOT affect the honest source (per-source isolation).
+        assert!(admission_rate_allowed(honest), "honest unaffected by a separate flooder");
+        admission_rate_reset_for_test();
+        std::env::remove_var("IRIUM_POAWX_ADMISSION_RATE_WINDOW_SECS");
+        std::env::remove_var("IRIUM_POAWX_ADMISSION_RATE_MAX");
+        std::env::remove_var("IRIUM_POAWX_ADMISSION_COOLDOWN_SECS");
+    }
     use crate::poawx_penalty::PenaltyStatus;
 
     fn cand(role: u8, solver: [u8; 20], tag: u8, seed: &[u8; 32]) -> RoleCandidate {

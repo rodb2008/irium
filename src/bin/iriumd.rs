@@ -14631,6 +14631,12 @@ async fn poawx_candidate_admission_post(
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, StatusCode> {
     candidate_admission_bridge_guard(&addr)?;
+    // Fix 1: per-source flood protection (loopback miner included) so a misconfigured local
+    // miner cannot make this node gossip a candidate-admission flood. Honest miners (a few
+    // admissions per block) are far below the limit.
+    if !irium_node_rs::poawx_admission::admission_rate_allowed(addr.ip()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     let cache = irium_node_rs::poawx_admission::global_admission_cache();
     cache.prune(state.status_height_cache.load(Ordering::Relaxed));
     match cache.ingest_bytes(body.as_ref()) {
@@ -17855,7 +17861,7 @@ async fn main() {
 
                     if stalled_ticks >= 6 {
                         eprintln!(
-                            "[{}] [🔁 sync] WARN stalled (local={}, best_header={}, best_peer={}, headers_inflight={}, getblocks_inflight={}); clearing sync throttles and reconnecting",
+                            "[{}] [🔁 sync] WARN stalled (local={}, best_header={}, best_peer={}, headers_inflight={}, getblocks_inflight={}); resuming sync from local tip",
                             Utc::now().format("%H:%M:%S"),
                             local_height,
                             sync_target_height,
@@ -17863,10 +17869,21 @@ async fn main() {
                             dbg.sync_requests,
                             dbg.getblocks_inflight
                         );
+                        // Fix 2: resume IBD from the LOCAL TIP instead of nuking all headers and
+                        // restarting from genesis. clear_transient_headers() wiped the valid header
+                        // chain, forcing a from-genesis re-request that the serve-side getblocks /
+                        // genesis throttles rejected -> a single flapping peer could never complete
+                        // IBD. Re-requesting blocks from the current tip (a known, advancing start
+                        // hash) lets sync progress to completion; clear_sync_throttles() first so the
+                        // resume request is not cooldown-blocked.
                         let stalled_node = node_clone.clone();
+                        let resume_tip = {
+                            let guard = chain_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.tip_hash()
+                        };
                         tokio::spawn(async move {
                             stalled_node.clear_sync_throttles().await;
-                            stalled_node.clear_transient_headers().await;
+                            let _ = stalled_node.force_sync_burst_from_tip(resume_tip).await;
                             let _ = tokio::time::timeout(
                                 std::time::Duration::from_secs(5),
                                 stalled_node.connect_known_peers(5),

@@ -6641,9 +6641,10 @@ impl P2PNode {
                             if let Ok(p) =
                                 crate::protocol::PoawxCandidateAdmissionPayload::from_message(&msg)
                             {
-                                if crate::poawx_admission::global_admission_cache()
-                                    .ingest_bytes(&p.admission_bytes)
-                                    .should_rebroadcast()
+                                if crate::poawx_admission::admission_rate_allowed(addr.ip())
+                                    && crate::poawx_admission::global_admission_cache()
+                                        .ingest_bytes(&p.admission_bytes)
+                                        .should_rebroadcast()
                                 {
                                     let bytes = crate::protocol::PoawxCandidateAdmissionPayload {
                                         admission_bytes: p.admission_bytes,
