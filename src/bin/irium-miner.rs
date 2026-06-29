@@ -664,6 +664,8 @@ struct BlockTemplate {
     #[serde(default)]
     poawx_hidden_precommit_active: Option<bool>,
     #[serde(default)]
+    poawx_audit_hardening_active: Option<bool>,
+    #[serde(default)]
     poawx_tickets_active: Option<bool>,
     #[serde(default)]
     poawx_multisource_seed_active: Option<bool>,
@@ -3515,6 +3517,11 @@ fn run_poawx_solo() -> Result<(), String> {
                     penalty_state_active: pn,
                     puzzle_anchor_bits: pb,
                     effective_sybil_bits: sb,
+                    // Node-authoritative audit flag; fall back to env if an older node
+                    // does not advertise it in the template.
+                    audit_hardening_active: tmpl.poawx_audit_hardening_active.unwrap_or_else(
+                        || irium_node_rs::poawx_proposer::audit_hardening_active(height),
+                    ),
                 })
             }
             _ => None,

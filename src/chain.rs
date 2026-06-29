@@ -11012,6 +11012,7 @@ mod tests {
             penalty_state_active: true,
             puzzle_anchor_bits: 1,
             effective_sybil_bits: 1,
+            audit_hardening_active: false,
         };
         let proof = build_solo_poawx_block_with_parent_and_dominance(
             &secret, net, 1, genesis_hash, None, 0x207fffff,
@@ -11043,6 +11044,7 @@ mod tests {
             penalty_state_active: false,
             puzzle_anchor_bits: 1,
             effective_sybil_bits: 0,
+            audit_hardening_active: false,
         };
         let proof_off = build_solo_poawx_block_with_parent_and_dominance(
             &secret, net, 1, genesis_hash, None, 0x207fffff,
@@ -11056,6 +11058,47 @@ mod tests {
         assert!(
             ext_off.precommit_root.is_none(),
             "node OFF => no precommit_root"
+        );
+
+        // Fix: the audit-hardening flag is sourced from the node template (NodeGateFlags),
+        // NOT the miner's local env. Build two blocks differing ONLY in that flag; the
+        // receipts root must flip (Fix #5 binds worker_pubkey/worker_sig into the audit
+        // root) -- proving the node flag, not the env (OFF here), drives the root.
+        assert!(
+            !crate::poawx_proposer::audit_hardening_active(1),
+            "local env: audit-hardening OFF"
+        );
+        let g_audit_on = NodeGateFlags {
+            hidden_precommit_active: true,
+            tickets_active: true,
+            multisource_seed_active: true,
+            penalty_state_active: true,
+            puzzle_anchor_bits: 1,
+            effective_sybil_bits: 1,
+            audit_hardening_active: true,
+        };
+        let g_audit_off = NodeGateFlags {
+            hidden_precommit_active: true,
+            tickets_active: true,
+            multisource_seed_active: true,
+            penalty_state_active: true,
+            puzzle_anchor_bits: 1,
+            effective_sybil_bits: 1,
+            audit_hardening_active: false,
+        };
+        let p_audit_on = build_solo_poawx_block_with_parent_and_dominance(
+            &secret, net, 1, genesis_hash, None, 0x207fffff,
+            genesis.header.time + 1, 1, ([0u8; 32], [0u8; 32]), &dom, Some(&g_audit_on),
+        )
+        .expect("build audit ON");
+        let p_audit_off = build_solo_poawx_block_with_parent_and_dominance(
+            &secret, net, 1, genesis_hash, None, 0x207fffff,
+            genesis.header.time + 1, 1, ([0u8; 32], [0u8; 32]), &dom, Some(&g_audit_off),
+        )
+        .expect("build audit OFF");
+        assert_ne!(
+            p_audit_on.irx1_root, p_audit_off.irx1_root,
+            "audit flag (node template) flips the receipts root, overriding local env"
         );
 
         for (k, _) in gates {

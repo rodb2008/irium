@@ -443,6 +443,10 @@ pub struct NodeGateFlags {
     pub penalty_state_active: bool,
     pub puzzle_anchor_bits: u32,
     pub effective_sybil_bits: u32,
+    /// Audit-hardening gate for this height (node-authoritative). Drives the deterministic,
+    /// signature-bound receipts root (Fix #5/#1) so the miner builds exactly what the node
+    /// validates, instead of relying on the miner's local env.
+    pub audit_hardening_active: bool,
 }
 
 /// Phase 31: the miner's already-built proposer-VRF assignment, threaded into the
@@ -869,10 +873,15 @@ fn build_all_gates_block_with(
     let a = multi_role_amounts(total);
     // Fix #5/#1: build the gated (deterministic, sig-bound) audit root so the miner's root
     // matches connect_block's validator when the audit gate is active. Gate off => byte-identical.
+    // Audit flag is node-authoritative (from the template via NodeGateFlags); fall back to
+    // local env only when no node flags were supplied (node-internal builds / older callers).
+    let audit_active = node_gates
+        .map(|g| g.audit_hardening_active)
+        .unwrap_or_else(|| crate::poawx_proposer::audit_hardening_active(height));
     let irx1_root = crate::poawx::irx1_root_from_block_receipts_audit(
         std::slice::from_ref(&receipt),
         true,
-        crate::poawx_proposer::audit_hardening_active(height),
+        audit_active,
     );
     let mut irx1_script = vec![0x6a, 0x24u8];
     irx1_script.extend_from_slice(b"irx1");

@@ -1599,6 +1599,8 @@ struct BlockTemplateResponse {
     #[serde(default)]
     poawx_hidden_precommit_active: bool,
     #[serde(default)]
+    poawx_audit_hardening_active: bool,
+    #[serde(default)]
     poawx_tickets_active: bool,
     #[serde(default)]
     poawx_multisource_seed_active: bool,
@@ -13919,6 +13921,7 @@ async fn get_block_template(
         poawx_pending_receipts: poawx_receipts_for_template,
         receipts_root: receipts_root_str,
         poawx_hidden_precommit_active: irium_node_rs::chain::hidden_precommit_active(height),
+        poawx_audit_hardening_active: irium_node_rs::poawx_proposer::audit_hardening_active(height),
         poawx_tickets_active: irium_node_rs::poawx_ticket::tickets_active(height),
         poawx_multisource_seed_active:
             irium_node_rs::poawx_committed_admission::multisource_seed_active(height),
