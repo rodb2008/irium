@@ -1,8 +1,12 @@
 use crate::pow::sha256d;
+use crate::template::PoawxPendingReceipt;
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 
 pub fn parse_address_to_pkh(addr: &str) -> Result<[u8; 20]> {
-    let decoded = bs58::decode(addr).into_vec().map_err(|e| anyhow!("base58 decode: {e}"))?;
+    let decoded = bs58::decode(addr)
+        .into_vec()
+        .map_err(|e| anyhow!("base58 decode: {e}"))?;
     if decoded.len() != 25 {
         return Err(anyhow!("invalid address length"));
     }
@@ -32,7 +36,6 @@ fn put_varint(v: usize, out: &mut Vec<u8>) {
 }
 
 fn p2pkh_script(pkh: &[u8; 20]) -> Vec<u8> {
-
     let mut s = Vec::with_capacity(25);
     s.push(0x76);
     s.push(0xa9);
@@ -42,7 +45,6 @@ fn p2pkh_script(pkh: &[u8; 20]) -> Vec<u8> {
     s.push(0xac);
     s
 }
-
 
 fn encode_bip34_height(height: u64) -> Vec<u8> {
     let mut n = height;
@@ -194,7 +196,15 @@ pub fn solo_coinbase_prefix_suffix(
     bip34_height: bool,
 ) -> (Vec<u8>, Vec<u8>) {
     let marker: [u8; 8] = [0xfa, 0xce, 0xb0, 0x0c, 0x1c, 0xab, 0xad, 0x1d];
-    let full = build_solo_coinbase_tx(height, reward, worker_pkh, pool_pkh, fee_bps, &marker, bip34_height);
+    let full = build_solo_coinbase_tx(
+        height,
+        reward,
+        worker_pkh,
+        pool_pkh,
+        fee_bps,
+        &marker,
+        bip34_height,
+    );
     let pos = full
         .windows(marker.len())
         .position(|w| w == marker)
@@ -213,7 +223,11 @@ pub fn build_merkle_branches(template_tx_hex: &[String]) -> Result<Vec<[u8; 32]>
     let mut idx = 0usize;
     while level.len() > 1 {
         let sibling = if idx % 2 == 0 {
-            if idx + 1 < level.len() { level[idx + 1] } else { level[idx] }
+            if idx + 1 < level.len() {
+                level[idx + 1]
+            } else {
+                level[idx]
+            }
         } else {
             level[idx - 1]
         };
@@ -260,7 +274,264 @@ pub fn parse_u32_hex(s: &str) -> Result<u32> {
     Ok(u32::from_str_radix(t, 16).map_err(|e| anyhow!("hex parse: {e}"))?)
 }
 
-pub fn header_bytes(version: u32, prev_hash: [u8; 32], merkle_root: [u8; 32], ntime: u32, nbits: u32, nonce: u32) -> [u8; 80] {
+/// Phase 10-D: compute receipts root for PoAW-X irx1 commitment.
+/// Algorithm: SHA256(concat(SHA256(receipt_fields) for each receipt)).
+/// Phase 11-B: sort canonically by (height, lane, worker_pkh, commitment_nonce)
+/// so the root is deterministic regardless of receipt insertion order.
+pub fn compute_receipts_root_from_pending(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
+    compute_receipts_root_from_pending_gated(receipts, false)
+}
+
+/// Phase 20: gated variant mirroring `irium_node_rs::poawx::irx1_root_from_block_receipts_gated`
+/// / iriumd `compute_poawx_receipts_root_gated`. When `phase20_active`, binds
+/// `SHA256(phase20_ext bytes)` into the inner hash AFTER the optional mode-1
+/// delegation digest. The pending `phase20_ext` hex is exactly the serialized
+/// extension, so this digest equals the node's `Phase20ReceiptExt::digest()` and
+/// the pool root matches connect_block / submit_block_extended. Inactive/absent
+/// => byte-identical to the Phase 10-D / 18B root.
+pub fn compute_receipts_root_from_pending_gated(
+    receipts: &[PoawxPendingReceipt],
+    phase20_active: bool,
+) -> [u8; 32] {
+    let mut sorted: Vec<&PoawxPendingReceipt> = receipts.iter().collect();
+    sorted.sort_unstable_by(|a, b| {
+        a.height
+            .cmp(&b.height)
+            .then_with(|| {
+                let la = a.lane.bytes().next().unwrap_or(b'A');
+                let lb = b.lane.bytes().next().unwrap_or(b'A');
+                la.cmp(&lb)
+            })
+            .then_with(|| a.worker_pkh.as_bytes().cmp(b.worker_pkh.as_bytes()))
+            .then_with(|| {
+                a.commitment_nonce
+                    .as_bytes()
+                    .cmp(b.commitment_nonce.as_bytes())
+            })
+    });
+    let mut outer = Sha256::new();
+    for r in sorted {
+        let mut inner = Sha256::new();
+        inner.update(r.height.to_le_bytes());
+        // Canonicalize lane to its first byte to match iriumd's root.
+        inner.update([r.lane.bytes().next().unwrap_or(b'A')]);
+        inner.update(hex::decode(&r.worker_pkh).unwrap_or_default());
+        inner.update(hex::decode(&r.solution).unwrap_or_default());
+        inner.update(hex::decode(&r.commitment_nonce).unwrap_or_default());
+        // Phase 18B: mode-1 mixes the delegation digest (SHA256 of the 226-byte
+        // delegation) to match the node's irx1_root_from_block_receipts. Mode-0
+        // (empty delegation) is byte-identical to Phase 10-D.
+        if !r.delegation.is_empty() {
+            if let Ok(deleg_bytes) = hex::decode(&r.delegation) {
+                let mut dh = Sha256::new();
+                dh.update(&deleg_bytes);
+                let digest: [u8; 32] = dh.finalize().into();
+                inner.update(digest);
+            }
+        }
+        // Phase 20: bind the production-extension digest (gated) to match the
+        // node. The hex IS the serialized ext, so SHA256(bytes) == digest().
+        if phase20_active && !r.phase20_ext.is_empty() {
+            if let Ok(ext_bytes) = hex::decode(&r.phase20_ext) {
+                let mut eh = Sha256::new();
+                eh.update(&ext_bytes);
+                let digest: [u8; 32] = eh.finalize().into();
+                inner.update(digest);
+            }
+        }
+        outer.update(inner.finalize());
+    }
+    outer.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::template::PoawxPendingReceipt;
+
+    fn mkr(height: u64, lane: &str, pkh: &str, sol: &str, nonce: &str) -> PoawxPendingReceipt {
+        PoawxPendingReceipt {
+            height,
+            lane: lane.to_string(),
+            worker_pkh: pkh.to_string(),
+            solution: sol.to_string(),
+            commitment_nonce: nonce.to_string(),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
+            delegation: String::new(),
+            phase20_ext: String::new(),
+        }
+    }
+
+    #[test]
+    fn single_receipt_stable() {
+        let r = mkr(1, "cpu", "aabb", "dead", "cafe");
+        assert_eq!(
+            compute_receipts_root_from_pending(&[r.clone()]),
+            compute_receipts_root_from_pending(&[r])
+        );
+    }
+
+    #[test]
+    fn two_receipts_order_independent() {
+        let r1 = mkr(1, "cpu", "aaaa", "0001", "0011");
+        let r2 = mkr(1, "cpu", "bbbb", "0002", "0022");
+        assert_eq!(
+            compute_receipts_root_from_pending(&[r1.clone(), r2.clone()]),
+            compute_receipts_root_from_pending(&[r2, r1]),
+            "root must not depend on insertion order"
+        );
+    }
+
+    #[test]
+    fn many_receipts_shuffled_same_root() {
+        let receipts: Vec<PoawxPendingReceipt> = (0u64..5)
+            .map(|i| {
+                mkr(
+                    1,
+                    "cpu",
+                    &format!("{:04x}", i * 17),
+                    &format!("{:04x}", i),
+                    &format!("{:04x}", i + 100),
+                )
+            })
+            .collect();
+        let mut rev = receipts.clone();
+        rev.reverse();
+        assert_eq!(
+            compute_receipts_root_from_pending(&receipts),
+            compute_receipts_root_from_pending(&rev)
+        );
+    }
+
+    #[test]
+    fn different_heights_different_root() {
+        let r1 = mkr(1, "cpu", "aaaa", "0001", "0011");
+        let r2 = mkr(2, "cpu", "aaaa", "0001", "0011");
+        assert_ne!(
+            compute_receipts_root_from_pending(&[r1]),
+            compute_receipts_root_from_pending(&[r2])
+        );
+    }
+
+    #[test]
+    fn lane_canonicalized_to_first_byte() {
+        // iriumd canonicalizes lane to its first byte; multi-char lanes sharing
+        // a first byte must produce the same root (regression for lane="cpu").
+        let a = mkr(1, "cpu", "aabb", "dead", "cafe");
+        let b = mkr(1, "c", "aabb", "dead", "cafe");
+        assert_eq!(
+            compute_receipts_root_from_pending(&[a]),
+            compute_receipts_root_from_pending(&[b])
+        );
+        // different first byte -> different root.
+        let c = mkr(1, "cpu", "aabb", "dead", "cafe");
+        let d = mkr(1, "gpu", "aabb", "dead", "cafe");
+        assert_ne!(
+            compute_receipts_root_from_pending(&[c]),
+            compute_receipts_root_from_pending(&[d])
+        );
+    }
+
+    #[test]
+    fn phase20_gated_root_byte_identity_and_node_parity() {
+        // A node Phase20ReceiptExt, attached (as hex) to a pool pending receipt.
+        let claim = |role: u8| irium_node_rs::poawx::PoawxRoleClaim {
+            role_id: role,
+            lane_id: irium_node_rs::poawx::LANE_CPU_FRIENDLY,
+            solver_pkh: [role; 20],
+            nonce: [1u8; 32],
+            secret: [2u8; 32],
+            claim_digest: [3u8; 32],
+            commitment_hash: None,
+        };
+        let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
+            role_reward: irium_node_rs::poawx::RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: claim(irium_node_rs::poawx::ROLE_COMPUTE_CONTRIBUTOR),
+            verify_claim: claim(irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR),
+            support_claim: claim(irium_node_rs::poawx::ROLE_SUPPORT_CONTRIBUTOR),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            precommit_root: None,
+            role_ticket_proofs: None,
+            role_dominance_weights: None,
+            candidate_set: None,
+            role_puzzle_proofs: None,
+            finality_proof: None,
+            committed_admission: None,
+            role_assignment_v2: None,
+        };
+        let worker_pkh = [0xabu8; 20];
+        let sol = [0x01u8; 8];
+        let nonce = [0xcdu8; 32];
+        let mut r = mkr(
+            7,
+            "cpu",
+            &hex::encode(worker_pkh),
+            &hex::encode(sol),
+            &hex::encode(nonce),
+        );
+        r.phase20_ext = hex::encode(node_ext.serialize());
+
+        // Gate OFF: wrapper == gated(false); the extension is ignored.
+        assert_eq!(
+            compute_receipts_root_from_pending_gated(std::slice::from_ref(&r), false),
+            compute_receipts_root_from_pending(std::slice::from_ref(&r)),
+            "gate off must equal legacy wrapper"
+        );
+        // Gate ON: differs and is deterministic.
+        let pool_on = compute_receipts_root_from_pending_gated(std::slice::from_ref(&r), true);
+        assert_ne!(
+            pool_on,
+            compute_receipts_root_from_pending(std::slice::from_ref(&r)),
+            "gate on must change the root"
+        );
+        // Node parity: pool gated-on root == node gated-on root for the same receipt.
+        let block_rec = irium_node_rs::poawx::PoawxBlockReceipt {
+            height: 7,
+            lane: b'c',
+            worker_pkh,
+            worker_pubkey: [0u8; 33],
+            worker_sig: [0u8; 64],
+            solution: sol,
+            commitment_nonce: nonce,
+            delegation: None,
+            phase20_ext: Some(node_ext),
+        };
+        let node_on = irium_node_rs::poawx::irx1_root_from_block_receipts_gated(
+            std::slice::from_ref(&block_rec),
+            true,
+        );
+        assert_eq!(
+            pool_on, node_on,
+            "pool gated root must equal node gated root"
+        );
+    }
+}
+
+/// Phase 10-D: build irx1 OP_RETURN script for coinbase.
+/// Format: 0x6a 0x24 "irx1" <32-byte receipts_root> = 38 bytes.
+pub fn build_irx1_commitment_script(receipts_root: &[u8; 32]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(38);
+    s.push(0x6a); // OP_RETURN
+    s.push(0x24); // PUSH 36 bytes
+    s.extend_from_slice(b"irx1");
+    s.extend_from_slice(receipts_root);
+    s
+}
+
+pub fn header_bytes(
+    version: u32,
+    prev_hash: [u8; 32],
+    merkle_root: [u8; 32],
+    ntime: u32,
+    nbits: u32,
+    nonce: u32,
+) -> [u8; 80] {
     let mut h = [0u8; 80];
     h[0..4].copy_from_slice(&version.to_le_bytes());
     h[4..36].copy_from_slice(&prev_hash);

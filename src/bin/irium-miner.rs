@@ -26,7 +26,8 @@ use sha2::{Digest, Sha256};
 
 use irium_node_rs::activation::{
     network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
-    resolved_lwma_v2_activation_height, resolved_mpsov1_activation_height, runtime_lwma_env_override,
+    resolved_lwma_v2_activation_height, resolved_mpsov1_activation_height,
+    runtime_lwma_env_override,
 };
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -248,7 +249,10 @@ fn advertise_peer_output() -> Option<TxOutput> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_coinbase, build_coinbase_with_pkh, extract_height_from_coinbase1_hex, script_from_relay_address};
+    use super::{
+        build_coinbase, build_coinbase_with_pkh, extract_height_from_coinbase1_hex,
+        script_from_relay_address,
+    };
     use irium_node_rs::activation::{resolved_htlcv1_activation_height, NetworkKind};
     use irium_node_rs::activation::{
         resolved_lwma_v2_activation_height, MAINNET_LWMA_V2_ACTIVATION_HEIGHT,
@@ -371,48 +375,61 @@ mod tests {
 
     #[test]
     fn build_coinbase_returns_error_when_address_unset() {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         let _guard = ENV_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap();
-        let saved_addr  = std::env::var("IRIUM_MINER_ADDRESS").ok();
+        let saved_addr = std::env::var("IRIUM_MINER_ADDRESS").ok();
         let saved_relay = std::env::var("IRIUM_RELAY_ADDRESS").ok();
-        let saved_pkh   = std::env::var("IRIUM_MINER_PKH").ok();
+        let saved_pkh = std::env::var("IRIUM_MINER_PKH").ok();
         std::env::remove_var("IRIUM_MINER_ADDRESS");
         std::env::remove_var("IRIUM_RELAY_ADDRESS");
         std::env::remove_var("IRIUM_MINER_PKH");
         let result = build_coinbase(1, 5_000_000_000);
-        if let Some(v) = saved_addr  { std::env::set_var("IRIUM_MINER_ADDRESS", v); }
-        if let Some(v) = saved_relay { std::env::set_var("IRIUM_RELAY_ADDRESS", v); }
-        if let Some(v) = saved_pkh   { std::env::set_var("IRIUM_MINER_PKH", v); }
+        if let Some(v) = saved_addr {
+            std::env::set_var("IRIUM_MINER_ADDRESS", v);
+        }
+        if let Some(v) = saved_relay {
+            std::env::set_var("IRIUM_RELAY_ADDRESS", v);
+        }
+        if let Some(v) = saved_pkh {
+            std::env::set_var("IRIUM_MINER_PKH", v);
+        }
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("missing or invalid miner payout address"),
+            result
+                .unwrap_err()
+                .contains("missing or invalid miner payout address"),
             "error message must name the problem"
         );
     }
 
     #[test]
     fn build_coinbase_returns_error_for_invalid_base58_address() {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         let _guard = ENV_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap();
-        let saved_addr  = std::env::var("IRIUM_MINER_ADDRESS").ok();
+        let saved_addr = std::env::var("IRIUM_MINER_ADDRESS").ok();
         let saved_relay = std::env::var("IRIUM_RELAY_ADDRESS").ok();
-        let saved_pkh   = std::env::var("IRIUM_MINER_PKH").ok();
+        let saved_pkh = std::env::var("IRIUM_MINER_PKH").ok();
         std::env::set_var("IRIUM_MINER_ADDRESS", "not_a_valid_address_!!!");
         std::env::remove_var("IRIUM_RELAY_ADDRESS");
         std::env::remove_var("IRIUM_MINER_PKH");
         let result = build_coinbase(1, 5_000_000_000);
-        if let Some(v) = saved_addr  { std::env::set_var("IRIUM_MINER_ADDRESS", v); }
-            else { std::env::remove_var("IRIUM_MINER_ADDRESS"); }
-        if let Some(v) = saved_relay { std::env::set_var("IRIUM_RELAY_ADDRESS", v); }
-        if let Some(v) = saved_pkh   { std::env::set_var("IRIUM_MINER_PKH", v); }
+        if let Some(v) = saved_addr {
+            std::env::set_var("IRIUM_MINER_ADDRESS", v);
+        } else {
+            std::env::remove_var("IRIUM_MINER_ADDRESS");
+        }
+        if let Some(v) = saved_relay {
+            std::env::set_var("IRIUM_RELAY_ADDRESS", v);
+        }
+        if let Some(v) = saved_pkh {
+            std::env::set_var("IRIUM_MINER_PKH", v);
+        }
         assert!(result.is_err(), "invalid address must be rejected");
     }
 
@@ -420,16 +437,16 @@ mod tests {
     fn extract_height_from_coinbase1_bip34() {
         // BIP34 mode: height 22656 = 0x5880 -> 2 LE bytes [0x80, 0x58]
         let mut tx: Vec<u8> = Vec::new();
-        tx.extend_from_slice(&1u32.to_le_bytes());            // version
-        tx.push(0x01);                                        // tx_in count varint
-        tx.extend_from_slice(&[0u8; 32]);                     // prev_txid
-        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());  // prev_index
+        tx.extend_from_slice(&1u32.to_le_bytes()); // version
+        tx.push(0x01); // tx_in count varint
+        tx.extend_from_slice(&[0u8; 32]); // prev_txid
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prev_index
         let script_sig: Vec<u8> = {
             let mut s = vec![0x02u8, 0x80, 0x58]; // BIP34 push: len=2, height LE
             s.extend_from_slice(b"Irium");
             s
         };
-        tx.push(script_sig.len() as u8);                      // script_sig length varint
+        tx.push(script_sig.len() as u8); // script_sig length varint
         tx.extend_from_slice(&script_sig);
         let hex_str = hex::encode(&tx);
         assert_eq!(extract_height_from_coinbase1_hex(&hex_str), Some(22_656));
@@ -506,11 +523,7 @@ fn miner_pubkey_hash() -> Option<Vec<u8>> {
     miner_address_info().map(|(_, pkh)| pkh)
 }
 
-fn build_coinbase_with_pkh(
-    reward: u64,
-    payout_pkh: &[u8],
-    script_sig: Vec<u8>,
-) -> Transaction {
+fn build_coinbase_with_pkh(reward: u64, payout_pkh: &[u8], script_sig: Vec<u8>) -> Transaction {
     let coinbase_input = TxInput {
         prev_txid: [0u8; 32],
         prev_index: 0xffff_ffff,
@@ -580,7 +593,11 @@ fn extract_height_from_coinbase1_hex(coinbase1_hex: &str) -> Option<u64> {
             o += 1;
             saw_digit = true;
         }
-        if saw_digit { Some(h) } else { None }
+        if saw_digit {
+            Some(h)
+        } else {
+            None
+        }
     } else {
         let push_n = bytes[o] as usize;
         o += 1;
@@ -604,7 +621,11 @@ fn coinbase_tag() -> Option<&'static str> {
             eprintln!("[warn] IRIUM_COINBASE_TAG must be non-empty ASCII; ignoring");
             return None;
         }
-        Some(if tag.len() > 20 { tag[..20].to_string() } else { tag })
+        Some(if tag.len() > 20 {
+            tag[..20].to_string()
+        } else {
+            tag
+        })
     })
     .as_deref()
 }
@@ -640,6 +661,46 @@ struct BlockTemplate {
     bits: String,
     time: u32,
     txs: Vec<TemplateTx>,
+    #[serde(default)]
+    poawx_hidden_precommit_active: Option<bool>,
+    #[serde(default)]
+    poawx_audit_hardening_active: Option<bool>,
+    #[serde(default)]
+    poawx_tickets_active: Option<bool>,
+    #[serde(default)]
+    poawx_multisource_seed_active: Option<bool>,
+    #[serde(default)]
+    poawx_penalty_state_active: Option<bool>,
+    #[serde(default)]
+    poawx_puzzle_anchor_bits: Option<u32>,
+    #[serde(default)]
+    poawx_effective_sybil_bits: Option<u32>,
+    // Phase 31 proposer-VRF fields (None on older nodes => proposer mining off).
+    #[serde(default)]
+    poawx_proposer_vrf_active: Option<bool>,
+    #[serde(default)]
+    poawx_proposer_seed: Option<String>,
+    #[serde(default)]
+    poawx_proposer_eligible_count: Option<u64>,
+    #[serde(default)]
+    poawx_proposer_round_interval: Option<u64>,
+    #[serde(default)]
+    poawx_proposer_freeze_height: Option<u64>,
+    #[serde(default)]
+    poawx_proposer_max_allowed_round: Option<u32>,
+    // Phase 31R proposer-registration fields (None on older nodes).
+    #[serde(default)]
+    poawx_reg_active: Option<bool>,
+    #[serde(default)]
+    poawx_reg_anchor_height: Option<u64>,
+    #[serde(default)]
+    poawx_reg_anchor_hash: Option<String>,
+    #[serde(default)]
+    poawx_reg_required_sybil_bits: Option<u32>,
+    #[serde(default)]
+    poawx_reg_activations: Option<Vec<String>>,
+    #[serde(default)]
+    poawx_reg_announces: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1129,6 +1190,7 @@ fn load_persisted_blocks(state: &mut ChainState) {
                     },
                     transactions: txs,
                     auxpow: None,
+                    poawx_receipts: None,
                 };
                 // Recompute merkle to be safe.
                 block.header.merkle_root = block.merkle_root();
@@ -1477,6 +1539,7 @@ fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Res
         },
         transactions: txs,
         auxpow: None,
+        poawx_receipts: None,
     };
     block.header.merkle_root = block.merkle_root();
     state.connect_block(block).map(|_| ())
@@ -1597,7 +1660,10 @@ fn reconcile_with_template(
                 }
             }
             Err(e) => {
-                eprintln!("[warn] Miner failed to download blocks {}..+{}: {}", h, want, e);
+                eprintln!(
+                    "[warn] Miner failed to download blocks {}..+{}: {}",
+                    h, want, e
+                );
                 break 'sync;
             }
         };
@@ -1846,6 +1912,7 @@ fn mine_once(
         header,
         transactions: txs.clone(),
         auxpow: None,
+        poawx_receipts: None,
     };
     let merkle = block.merkle_root();
     block.header.merkle_root = merkle;
@@ -2234,19 +2301,14 @@ fn stratum_reader(
             // count accepted vs rejected shares.
             _ => {
                 if msg.get("id").is_some() && method.is_none() {
-                    let accepted = msg.get("result")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                    let accepted = msg.get("result").and_then(|v| v.as_bool()).unwrap_or(false);
                     if accepted {
                         println!("[stratum] share accepted");
                     } else {
                         // Stratum error is typically [code, "message", traceback].
-                        let reason = msg.get("error")
-                            .and_then(|e| {
-                                e.get(1)
-                                    .and_then(|v| v.as_str())
-                                    .or_else(|| e.as_str())
-                            })
+                        let reason = msg
+                            .get("error")
+                            .and_then(|e| e.get(1).and_then(|v| v.as_str()).or_else(|| e.as_str()))
                             .unwrap_or("unknown reason");
                         eprintln!("[stratum] share rejected: {}", reason);
                     }
@@ -2523,7 +2585,9 @@ fn solo_stratum_listen_addr() -> Option<String> {
 
     if enabled {
         if listen.is_none() {
-            eprintln!("Error: IRIUM_SOLO_STRATUM_LISTEN must be set when --solo-stratum is enabled");
+            eprintln!(
+                "Error: IRIUM_SOLO_STRATUM_LISTEN must be set when --solo-stratum is enabled"
+            );
             std::process::exit(1);
         }
         listen
@@ -2930,6 +2994,7 @@ fn submit_solo_share(
             header,
             transactions: txs,
             auxpow: None,
+            poawx_receipts: None,
         };
         if block.merkle_root() != merkle_root {
             return Err("submitted share merkle mismatch".to_string());
@@ -3182,7 +3247,448 @@ fn run_solo_stratum_server(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── Gap 12: solo PoAW-X mining (--poawx) ─────────────────────────────────────
+//
+// Build a complete all-gates PoAW-X block where the miner's own key plays every
+// role, then ingest its candidate admissions and submit via the node's extended
+// RPC. Devnet/testnet only (mainnet hard-off). Requires the gate env to match the
+// target node (same IRIUM_POAWX_* activation/required vars) and the miner secret
+// in IRIUM_POAWX_MINER_SECRET_HEX (64 hex chars). The block validity proof for
+// this builder is the lib test chain::tests::gap12_solo_poawx_builder_connect_block;
+// this function is the (not unit-testable) live node round-trip.
+
+fn poawx_miner_secret() -> Result<[u8; 32], String> {
+    let hexs = env::var("IRIUM_POAWX_MINER_SECRET_HEX").map_err(|_| {
+        "solo PoAW-X mining requires IRIUM_POAWX_MINER_SECRET_HEX (64 hex chars)".to_string()
+    })?;
+    let bytes =
+        hex::decode(hexs.trim()).map_err(|e| format!("bad IRIUM_POAWX_MINER_SECRET_HEX: {e}"))?;
+    if bytes.len() != 32 {
+        return Err("IRIUM_POAWX_MINER_SECRET_HEX must be 32 bytes (64 hex chars)".to_string());
+    }
+    let mut o = [0u8; 32];
+    o.copy_from_slice(&bytes);
+    Ok(o)
+}
+
+fn poawx_decode_hash32(s: &str) -> Result<[u8; 32], String> {
+    let b = hex::decode(s.trim()).map_err(|e| format!("bad hash hex: {e}"))?;
+    if b.len() != 32 {
+        return Err(format!("hash must be 32 bytes, got {}", b.len()));
+    }
+    let mut o = [0u8; 32];
+    o.copy_from_slice(&b);
+    Ok(o)
+}
+
+fn poawx_receipt_difficulty_bits() -> u32 {
+    if irium_node_rs::activation::network_id_byte() == 0 {
+        return 20; // mainnet configured puzzle difficulty (bits)
+    }
+    env::var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(4)
+}
+
+/// Seconds the solo --poawx miner waits between block-production attempts.
+/// `IRIUM_POAWX_MINER_INTERVAL_SECS` (devnet/testnet only); default 2 (unchanged
+/// legacy cadence). Raising it (e.g. 30) slows block production so remote testnet
+/// nodes can stay synced via gossip. Clamped to a minimum of 1s.
+fn poawx_miner_interval_secs() -> u64 {
+    env::var("IRIUM_POAWX_MINER_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+/// Build the `/rpc/submit_block_extended` JSON request from a built proof (public
+/// block data only; no secret key material). Mirrors the live-proof harness shape.
+fn build_poawx_submit_request(
+    proof: &irium_node_rs::poawx_mining_harness::AllGatesProof,
+) -> Result<serde_json::Value, String> {
+    let block = &proof.block;
+    let coinbase = block
+        .transactions
+        .first()
+        .ok_or("missing coinbase in built block")?;
+    let receipt = block
+        .poawx_receipts
+        .as_ref()
+        .and_then(|r| r.first())
+        .ok_or("missing receipt in built block")?;
+    let ext_hex = receipt
+        .phase20_ext
+        .as_ref()
+        .map(|e: &irium_node_rs::poawx::Phase20ReceiptExt| hex::encode(e.serialize()))
+        .unwrap_or_default();
+    let header = &block.header;
+    Ok(json!({
+        "height": proof.height,
+        "header": {
+            "version": header.version,
+            "prev_hash": hex::encode(header.prev_hash),
+            "merkle_root": hex::encode(header.merkle_root),
+            "time": header.time,
+            "bits": format!("{:08x}", header.bits),
+            "nonce": header.nonce,
+            "hash": hex::encode(proof.block_hash),
+        },
+        "tx_hex": [hex::encode(coinbase.serialize())],
+        "submit_source": "irium-miner-poawx",
+        "poawx_receipts": [{
+            "height": receipt.height,
+            "lane": (receipt.lane as char).to_string(),
+            "worker_pkh": hex::encode(receipt.worker_pkh),
+            "solution": hex::encode(receipt.solution),
+            "commitment_nonce": hex::encode(receipt.commitment_nonce),
+            "worker_pubkey": hex::encode(receipt.worker_pubkey),
+            "worker_sig": hex::encode(receipt.worker_sig),
+            "phase20_ext": ext_hex,
+        }],
+        "poawx_receipts_root": hex::encode(proof.irx1_root),
+    }))
+}
+
+type PoawxParentInfo = (Option<[u8; 32]>, ([u8; 32], [u8; 32]));
+
+/// Fetch the parent (H-1) block prev_hash PLUS its PoAW-X multi-source seed
+/// components (finality-proof digest, precommit root). For height <= 1 the parent is
+/// genesis: prev_hash None and zero components. The components feed the multi-source
+/// assignment seed so blocks at height >= 2 validate once that gate is active.
+fn poawx_fetch_parent_info(client: &Client, height: u64) -> Result<PoawxParentInfo, String> {
+    if height <= 1 {
+        return Ok((None, ([0u8; 32], [0u8; 32])));
+    }
+    with_rpc_base(|base| {
+        let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/'), height - 1);
+        let mut req = client.get(&url);
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("get parent block: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("get parent block", resp.status()));
+        }
+        let v: serde_json::Value = resp.json().map_err(|e| format!("parent parse: {e}"))?;
+        let prev = v
+            .get("header")
+            .and_then(|h| h.get("prev_hash"))
+            .and_then(|x| x.as_str())
+            .ok_or("parent block missing header.prev_hash")?;
+        let comp = |key: &str| -> Result<[u8; 32], String> {
+            match v.get(key).and_then(|x| x.as_str()) {
+                Some(s) => poawx_decode_hash32(s),
+                None => Ok([0u8; 32]),
+            }
+        };
+        let fin = comp("poawx_finality_digest")?;
+        let pre = comp("poawx_precommit_root")?;
+        Ok((Some(poawx_decode_hash32(prev)?), (fin, pre)))
+    })
+}
+
+fn poawx_fetch_dominance(
+    client: &Client,
+) -> Result<irium_node_rs::poawx_dominance::PersistentDominance, String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/rpc/poawx_dominance", base.trim_end_matches('/'));
+        let mut req = client.get(&url);
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("get dominance: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("get dominance", resp.status()));
+        }
+        let v: serde_json::Value = resp.json().map_err(|e| format!("dominance parse: {e}"))?;
+        let hexs = v
+            .get("hex")
+            .and_then(|x| x.as_str())
+            .ok_or("dominance response missing hex")?;
+        let bytes = hex::decode(hexs.trim()).map_err(|e| format!("dominance hex decode: {e}"))?;
+        irium_node_rs::poawx_dominance::PersistentDominance::from_bytes(&bytes)
+    })
+}
+
+fn poawx_post_admission(client: &Client, adm: &[u8]) -> Result<(), String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/poawx/candidate-admission", base.trim_end_matches('/'));
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(adm.to_vec());
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("post admission: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("post admission", resp.status()));
+        }
+        Ok(())
+    })
+}
+
+fn poawx_submit_registration(client: &Client, reg: &[u8]) -> Result<(), String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/poawx/registration", base.trim_end_matches('/'));
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(reg.to_vec());
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("post registration: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("post registration", resp.status()));
+        }
+        Ok(())
+    })
+}
+
+fn poawx_submit_extended(client: &Client, req_body: &serde_json::Value) -> Result<(), String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/rpc/submit_block_extended", base.trim_end_matches('/'));
+        let mut req = client.post(&url).json(req_body);
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("submit_block_extended: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("submit_block_extended rejected: HTTP {status} body={body}"));
+        }
+        Ok(())
+    })
+}
+
+/// Solo PoAW-X mining loop: fetch template -> build all-gates block with the
+/// miner key -> ingest admissions -> submit extended. Devnet/testnet only.
+fn run_poawx_solo() -> Result<(), String> {
+    let net = irium_node_rs::activation::network_id_byte();
+    // PoAW-X mining is permitted on mainnet from the consensus activation height
+    // (50_000); before then the node assignment/submit RPCs return 503 and this loop
+    // idles until activation. Non-mainnet is gated by the node env as before.
+    let secret = poawx_miner_secret()?;
+    let client = rpc_client()?;
+    let diff = poawx_receipt_difficulty_bits();
+    let interval = poawx_miner_interval_secs();
+    println!("[poawx] solo PoAW-X mining started (net={net}, interval={interval}s); building all-gates blocks with the miner key");
+    let mut last_reg_submit: u64 = 0;
+    loop {
+        let tmpl = match fetch_block_template(&client, false) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[poawx] template fetch failed: {e}; retrying");
+                thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+        };
+        let height = tmpl.height;
+        let prev_hash = poawx_decode_hash32(&tmpl.prev_hash)?;
+        let bits = u32::from_str_radix(tmpl.bits.trim_start_matches("0x"), 16)
+            .map_err(|e| format!("bad template bits {}: {e}", tmpl.bits))?;
+        let (parent_prev_hash, parent_seed_components) =
+            poawx_fetch_parent_info(&client, height)?;
+        let dominance = match poawx_fetch_dominance(&client) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[poawx] dominance fetch failed: {e}; retrying");
+                thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+        };
+
+        // Gate flags from the node template (authoritative). When the node provides
+        // them, build per the node; otherwise (older node) fall back to env.
+        let node_gates = match (
+            tmpl.poawx_hidden_precommit_active,
+            tmpl.poawx_tickets_active,
+            tmpl.poawx_multisource_seed_active,
+            tmpl.poawx_penalty_state_active,
+            tmpl.poawx_puzzle_anchor_bits,
+            tmpl.poawx_effective_sybil_bits,
+        ) {
+            (Some(hp), Some(tk), Some(ms), Some(pn), Some(pb), Some(sb)) => {
+                Some(irium_node_rs::poawx_mining_harness::NodeGateFlags {
+                    hidden_precommit_active: hp,
+                    tickets_active: tk,
+                    multisource_seed_active: ms,
+                    penalty_state_active: pn,
+                    puzzle_anchor_bits: pb,
+                    effective_sybil_bits: sb,
+                    // Node-authoritative audit flag; fall back to env if an older node
+                    // does not advertise it in the template.
+                    audit_hardening_active: tmpl.poawx_audit_hardening_active.unwrap_or_else(
+                        || irium_node_rs::poawx_proposer::audit_hardening_active(height),
+                    ),
+                })
+            }
+            _ => None,
+        };
+
+        // Phase 31: private proposer-VRF sortition. When the node advertises the
+        // proposer gate as active, prove our VRF over the committee seed and only
+        // build if we are selected at some cascade round the elapsed time allows;
+        // otherwise wait (a later round, or accrued registrations, may admit us).
+        // Phase 31R: keep our proposer VRF key registered on-chain so we can become
+        // eligible (fixes the onboarding chicken-and-egg). Submit (throttled) to our node,
+        // which gossips it; a producer announces it, and we are eligible FREEZE_DEPTH
+        // blocks later. Harmless if already known (deduped by the pool / connect_block).
+        if tmpl.poawx_reg_active.unwrap_or(false)
+            && (last_reg_submit == 0 || height.saturating_sub(last_reg_submit) >= 20)
+        {
+            if let Some(a_hash_hex) = tmpl.poawx_reg_anchor_hash.clone() {
+                if let Ok(a_hash) = poawx_decode_hash32(&a_hash_hex) {
+                    let a_h = tmpl.poawx_reg_anchor_height.unwrap_or(0);
+                    let bits = tmpl.poawx_reg_required_sybil_bits.unwrap_or(0);
+                    match irium_node_rs::poawx::ProposerRegistrationV1::build_signed(
+                        &secret, net, a_h, &a_hash, bits,
+                    ) {
+                        Ok(reg) => match poawx_submit_registration(&client, &reg.serialize()) {
+                            Ok(()) => {
+                                println!("[poawx] submitted proposer registration (anchor={a_h})");
+                                last_reg_submit = height;
+                            }
+                            Err(e) => eprintln!("[poawx] registration submit failed: {e}"),
+                        },
+                        Err(e) => eprintln!("[poawx] registration build failed: {e}"),
+                    }
+                }
+            }
+        }
+
+        let proposer_ctx = if tmpl.poawx_proposer_vrf_active.unwrap_or(false) {
+            let seed = match tmpl.poawx_proposer_seed.as_deref() {
+                Some(s) => match poawx_decode_hash32(s) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[poawx] bad proposer seed: {e}; retrying");
+                        thread::sleep(Duration::from_secs(3));
+                        continue;
+                    }
+                },
+                None => {
+                    eprintln!("[poawx] proposer active but template carried no seed; retrying");
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+            };
+            let eligible = tmpl.poawx_proposer_eligible_count.unwrap_or(0);
+            let max_round = tmpl.poawx_proposer_max_allowed_round.unwrap_or(0);
+            let proof = match irium_node_rs::poawx_candidate::AssignmentProofV2::prove_self_solver(
+                &secret,
+                net,
+                height,
+                irium_node_rs::poawx_proposer::ROLE_PROPOSER,
+                [0u8; 32],
+                seed,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[poawx] proposer proof failed: {e}; retrying");
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+            };
+            let priority = irium_node_rs::poawx_proposer::proposer_priority(&proof.vrf_output);
+            let round = (0..=max_round)
+                .find(|r| irium_node_rs::poawx_proposer::is_selected(priority, eligible, *r));
+            match round {
+                Some(r) => {
+                    println!(
+                        "[poawx] proposer SELECTED height={height} round={r} priority={priority} eligible={eligible}"
+                    );
+                    Some(irium_node_rs::poawx_mining_harness::ProposerCtx {
+                        assignment: irium_node_rs::poawx::ProposerAssignmentV1 {
+                            round: r,
+                            proof,
+                        },
+                    })
+                }
+                None => {
+                    println!(
+                        "[poawx] not proposer this slot height={height} (priority={priority} eligible={eligible} max_round={max_round}); waiting"
+                    );
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Phase 31R: the producer must force-drain the node's queue head (activations)
+        // and may announce pool candidates; assemble the section from the template.
+        let registration_section = {
+            let parse = |v: &Option<Vec<String>>| -> Vec<irium_node_rs::poawx::ProposerRegistrationV1> {
+                v.as_ref()
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(|h| hex::decode(h).ok())
+                            .filter_map(|b| {
+                                irium_node_rs::poawx::ProposerRegistrationV1::deserialize(&b).ok()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let activations = parse(&tmpl.poawx_reg_activations);
+            let announces = parse(&tmpl.poawx_reg_announces);
+            if tmpl.poawx_reg_active.unwrap_or(false)
+                && (!activations.is_empty() || !announces.is_empty())
+            {
+                Some(irium_node_rs::poawx::ProposerRegistrationSection {
+                    announces,
+                    activations,
+                })
+            } else {
+                None
+            }
+        };
+
+        let proof = match irium_node_rs::poawx_mining_harness::build_solo_poawx_block_with_proposer(
+            &secret, net, height, prev_hash, parent_prev_hash, bits, tmpl.time, diff,
+            parent_seed_components, &dominance, node_gates.as_ref(), proposer_ctx.as_ref(),
+            registration_section.as_ref(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[poawx] build failed at height {height}: {e}; retrying");
+                thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+        };
+
+        // Candidate-admission gossip is best-effort: with committed-admission
+        // (phase22a) enforced the node skips the phase21e admission-cache check, so a
+        // rejected/failed gossip post must NOT block block submission.
+        for (i, adm) in proof.admissions.iter().enumerate() {
+            if let Err(e) = poawx_post_admission(&client, adm) {
+                eprintln!("[poawx] admission[{i}] gossip post failed (non-fatal): {e}");
+            }
+        }
+        let req = build_poawx_submit_request(&proof)?;
+        match poawx_submit_extended(&client, &req) {
+            Ok(()) => println!("[poawx] submitted all-gates block height={height}"),
+            Err(e) => eprintln!("[poawx] submit failed at height {height}: {e}"),
+        }
+        thread::sleep(Duration::from_secs(interval));
+    }
+}
+
 fn main() {
+    if env::args().any(|a| a == "--poawx") {
+        load_env_file("/etc/irium/miner.env");
+        if let Err(e) = run_poawx_solo() {
+            eprintln!("[poawx] solo mining error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let loaded_env = load_env_file("/etc/irium/miner.env");
     if loaded_env {
         if json_log_enabled() {
@@ -3234,21 +3740,23 @@ fn main() {
         mpsov1_activation_height: resolved_mpsov1_activation_height(network),
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
-        auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
-            btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
-            ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
-            htlc_btc_swap_v1_activation_height:
-                irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
-            btc_swap_bech32_payment_activation_height:
-                irium_node_rs::activation::resolved_btc_swap_bech32_payment_activation_height(network),
-            htlc_ltc_swap_v1_activation_height:
-                irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
-            swap_order_v1_activation_height:
-                irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
-            ltc_swap_order_v1_activation_height:
-                irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
-            coinbase_header_batch_activation_height:
-                irium_node_rs::activation::resolved_coinbase_header_batch_activation_height(network),
+        auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(
+            network,
+        ),
+        btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
+        ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
+        htlc_btc_swap_v1_activation_height:
+            irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+        btc_swap_bech32_payment_activation_height:
+            irium_node_rs::activation::resolved_btc_swap_bech32_payment_activation_height(network),
+        htlc_ltc_swap_v1_activation_height:
+            irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
+        swap_order_v1_activation_height:
+            irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
+        ltc_swap_order_v1_activation_height:
+            irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
+        coinbase_header_batch_activation_height:
+            irium_node_rs::activation::resolved_coinbase_header_batch_activation_height(network),
     };
 
     let mut state = ChainState::new(params.clone());
@@ -3279,16 +3787,17 @@ fn main() {
     }
 
     match std::env::var("IRIUM_ADVERTISE_ADDR") {
-        Ok(ref v) if !v.trim().is_empty() => {
-            match v.trim().parse::<std::net::SocketAddr>() {
-                Ok(sa) if sa.port() != 0 => {
-                    eprintln!("[advertise] embedding peer address {} in coinbase outputs", sa);
-                }
-                _ => {
-                    eprintln!("[advertise] IRIUM_ADVERTISE_ADDR={} is not a valid ip:port — peer embedding disabled", v.trim());
-                }
+        Ok(ref v) if !v.trim().is_empty() => match v.trim().parse::<std::net::SocketAddr>() {
+            Ok(sa) if sa.port() != 0 => {
+                eprintln!(
+                    "[advertise] embedding peer address {} in coinbase outputs",
+                    sa
+                );
             }
-        }
+            _ => {
+                eprintln!("[advertise] IRIUM_ADVERTISE_ADDR={} is not a valid ip:port — peer embedding disabled", v.trim());
+            }
+        },
         _ => {
             eprintln!("[advertise] IRIUM_ADVERTISE_ADDR not set — peer embedding disabled");
         }

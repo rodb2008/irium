@@ -1,4 +1,5 @@
 mod block;
+mod delegation;
 mod events;
 mod pow;
 mod stratum;
@@ -28,7 +29,8 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(16.0);
-    let default_diff = default_diff_raw.max(1.0);
+    let default_diff =
+        stratum::resolved_default_diff(default_diff_raw, stratum::is_non_mainnet_network());
     let extranonce1_size = env::var("STRATUM_EXTRANONCE1_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -43,9 +45,11 @@ async fn main() -> Result<()> {
             .ok()
             .filter(|v| {
                 let t = v.trim();
-                t.starts_with("127.0.0.1:") || t.starts_with("localhost:") || t.starts_with("[::1]:")
+                t.starts_with("127.0.0.1:")
+                    || t.starts_with("localhost:")
+                    || t.starts_with("[::1]:")
             })
-            .unwrap_or_else(|| "127.0.0.1:3334".to_string())
+            .unwrap_or_else(|| "127.0.0.1:3334".to_string()),
     );
 
     let max_template_age_seconds = env::var("IRIUM_TEMPLATE_MAX_AGE_SECONDS")
@@ -152,10 +156,34 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(300);
 
-    if default_diff_raw < 1.0 {
+    let poawx_enabled = env::var("IRIUM_STRATUM_POAWX")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if poawx_enabled {
+        warn!("[poawx] IRIUM_STRATUM_POAWX=1: PoAW-X receipt path enabled");
+    } else {
+        warn!("[poawx] IRIUM_STRATUM_POAWX unset: PoAW-X receipt path disabled (legacy submit)");
+    }
+
+    // Phase 18B step-3: load the shared PoAW-X producer (delegate key + delegation
+    // registry) only when the receipt path is enabled. None on mainnet or when
+    // disabled — no key/store files are created and behaviour is unchanged.
+    let poawx_producer = if poawx_enabled {
+        delegation::load_producer().map(std::sync::Arc::new)
+    } else {
+        None
+    };
+
+    if default_diff_raw < default_diff {
         warn!(
-            "[config] STRATUM_DEFAULT_DIFF={} below diff1; clamped to 1",
-            default_diff_raw
+            "[config] STRATUM_DEFAULT_DIFF={} below active floor; clamped to {}",
+            default_diff_raw, default_diff
+        );
+    }
+    if default_diff < 1.0 {
+        warn!(
+            "[config] sub-1 difficulty floor active (devnet/testnet, non-mainnet gate only): default_diff={}",
+            default_diff
         );
     }
     if vardiff_min_diff_raw < 1.0 {
@@ -167,8 +195,7 @@ async fn main() -> Result<()> {
     if vardiff_max_diff_raw < vardiff_min_diff {
         warn!(
             "[config] IRIUM_STRATUM_VARDIFF_MAX_DIFF={} below min {}; clamped",
-            vardiff_max_diff_raw,
-            vardiff_min_diff
+            vardiff_max_diff_raw, vardiff_min_diff
         );
     }
 
@@ -202,7 +229,16 @@ async fn main() -> Result<()> {
         conn_window_secs,
         ban_threshold,
         ban_duration_secs,
+        poawx_enabled,
+        poawx_producer: poawx_producer.clone(),
     };
+
+    // Phase 18B step-2/3: opt-in PoAW-X delegation registration server. Disabled
+    // unless IRIUM_POAWX_DELEGATION_BIND is set; refuses non-loopback binds; no
+    // public exposure by default. Mainnet context returns 503. Shares the
+    // producer (store+key) with the receipt path. Runs as a separate task; the
+    // stratum TCP/metrics paths are unaffected.
+    delegation::maybe_spawn(poawx_producer, cfg.rpc_base.clone(), cfg.rpc_token.clone());
 
     run(cfg).await
 }

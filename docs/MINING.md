@@ -77,6 +77,31 @@ before block 22,888 is mined; older nodes will fork off.
 
 ---
 
+## PoAW-X (block 50,000): miners run a full node
+
+At **block height 50,000**, Irium mainnet activates **PoAW-X**. From that height, **producing a
+valid block requires a full `iriumd` node** — a pool/stratum connection alone is no longer
+sufficient, because each block must carry a verifiable VRF proposer assignment and role receipts that
+only a full node can build and validate.
+
+What changes for miners at block 50,000:
+
+- **Run a full node.** Install and run `iriumd` v1.9.119 or later.
+- **Mine against your node.** Run the bundled miner with the PoAW-X flag:
+
+  ```
+  irium-miner --poawx
+  ```
+
+  The miner requests the current role assignment from your node, performs the role work, and submits
+  role receipts; your node assembles and validates the block.
+- **Rewards are split by role** — proposer 55% / compute 22% / verify 13% / support 10%. A solo
+  miner fills all four roles and receives the full reward.
+- **Pool operators** must run a full node and move workers to the full-node flow before block 50,000.
+
+Upgrade before block 50,000 — older miners/nodes will reject post-activation blocks. Full guide:
+[POAWX.md](POAWX.md).
+
 ## Pool endpoints (official pool)
 
 `pool.iriumlabs.org` is the DNS hostname for the official Irium pool.

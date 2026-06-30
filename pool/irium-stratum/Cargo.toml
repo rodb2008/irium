@@ -12,6 +12,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Phase 18B: minimal crypto for the stratum-local Delegation mirror + pool
+# delegate key. The full node crate (irium-node-rs) is intentionally NOT a
+# production dependency; it stays a dev-dependency for parity tests only.
+k256 = { version = "0.13", features = ["ecdsa"] }
+ripemd = "0.1"
+rand_core = { version = "0.6", features = ["getrandom"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
