@@ -66,6 +66,17 @@ participants.
    built in.
 3. Make sure you are upgraded **before** block 50,000.
 
+## Important — one-time re-validation on first start with v1.9.119
+
+The first time **v1.9.119** starts on a node that already has chain history, it performs a **one-time re-validation** of its stored chain. While this runs (usually a few minutes), your node may briefly show a **lower block height and then climb back** to the network tip. **This is normal and expected.**
+
+- It happens **once**, on the first start after upgrading — later restarts are fast.
+- **No data is lost.** Balances and wallets are unaffected; the node rejoins consensus automatically once it catches up.
+- Larger or older nodes take longer to re-validate. **Let it finish — do not stop the node while it is catching up.**
+- This does not change PoAW-X activation, which remains height-gated at block 50,000.
+
+*(A later release will remove this one-time step so upgrades resume instantly.)*
+
 ## Mining
 
 From block 50,000, **mining requires a full `iriumd` node** — a pool/stratum connection alone is no
