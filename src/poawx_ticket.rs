@@ -97,12 +97,15 @@ pub fn sybil_threshold_bits() -> u32 {
 /// assignment scores even if `IRIUM_POAWX_TICKET_SYBIL_BITS` is misconfigured low.
 pub const MIN_TICKET_SYBIL_BITS: u32 = 8;
 
+/// Mainnet production per-identity sybil-resistance cost (leading-zero bits).
+pub const MAINNET_TICKET_SYBIL_BITS: u32 = 20;
+
 /// Effective required sybil bits, used IDENTICALLY by the builder (to grind) and
 /// the validator (to check) so they never diverge. Mainnet hard-off (0). When
 /// tickets are required, the configured value is floored at `MIN_TICKET_SYBIL_BITS`.
 pub fn effective_sybil_bits() -> u32 {
     if network_id_byte() == 0 {
-        return 0;
+        return MAINNET_TICKET_SYBIL_BITS;
     }
     let configured = sybil_threshold_bits();
     if tickets_required() {
@@ -304,10 +307,7 @@ pub fn tickets_activation_height() -> Option<u64> {
 
 /// Pure gate logic (network 0 = mainnet hard-off); param-driven for race-free tests.
 pub fn tickets_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 
 /// Whether ticket validation is active at `height`. Mainnet hard-off.
@@ -318,7 +318,7 @@ pub fn tickets_active(height: u64) -> bool {
 /// Whether a valid ticket is REQUIRED (vs. advisory) — `IRIUM_POAWX_TICKETS_REQUIRED=1`.
 pub fn tickets_required() -> bool {
     if network_id_byte() == 0 {
-        return false;
+        return true; // mainnet: enforced once the gate is active (height-gated)
     }
     std::env::var("IRIUM_POAWX_TICKETS_REQUIRED")
         .map(|v| v.trim() == "1")

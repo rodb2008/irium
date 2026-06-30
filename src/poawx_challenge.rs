@@ -272,10 +272,7 @@ pub fn fraud_proof_activation_height() -> Option<u64> {
 
 /// Pure gate logic (network 0 = mainnet hard-off); param-driven for race-free tests.
 pub fn fraud_proof_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false; // mainnet hard-off
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 
 /// Whether fraud-proof handling is active at `height`. Mainnet hard-off.
@@ -287,7 +284,7 @@ pub fn fraud_proof_active(height: u64) -> bool {
 /// Mainnet hard-off.
 pub fn fraud_proof_required() -> bool {
     if network_id_byte() == 0 {
-        return false;
+        return true; // mainnet: enforced once the gate is active (height-gated)
     }
     std::env::var("IRIUM_POAWX_FRAUD_PROOF_REQUIRED")
         .map(|v| v.trim() == "1")

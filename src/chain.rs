@@ -3342,29 +3342,13 @@ impl ChainState {
 }
 
 fn validate_poawx_coinbase(block: &Block, height: u64) -> Result<(), String> {
-    let act_h = match std::env::var("IRIUM_POAWX_ACTIVATION_HEIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        Some(h) => h,
-        None => return Ok(()),
-    };
-    if !std::env::var("IRIUM_POAWX_MODE")
-        .map(|v| v.trim() == "active")
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
-        return Ok(());
-    }
-    if height < act_h {
+    if !crate::activation::poawx_consensus_active(height) {
         return Ok(());
     }
     if !crate::poawx::block_has_irx1_commitment(block) {
         return Err(format!(
-            "connect_block: poawx irx1 commitment missing at height {} (active from {})",
-            height, act_h
+            "connect_block: poawx irx1 commitment missing at height {}",
+            height
         ));
     }
     Ok(())
@@ -3372,6 +3356,9 @@ fn validate_poawx_coinbase(block: &Block, height: u64) -> Result<(), String> {
 
 /// Reads IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS. Semantics match iriumd.rs.
 fn poawx_block_difficulty_bits() -> u32 {
+    if crate::activation::network_id_byte() == 0 {
+        return 20; // mainnet configured puzzle difficulty (bits)
+    }
     const DEFAULT: u32 = 8;
     const MAX: u32 = 24;
     match std::env::var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS")
@@ -3407,13 +3394,13 @@ fn poawx_delegation_active(height: u64) -> bool {
 /// `IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT`. Before activation the
 /// existing reward behavior (10%/receipt to worker) is unchanged.
 pub fn multi_role_reward_active(height: u64) -> bool {
-    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
-        return false;
-    }
-    match crate::activation::poawx_multi_role_reward_activation_height() {
-        Some(h) => height >= h,
-        None => false,
-    }
+    matches!(
+        crate::activation::poawx_effective_activation(
+            crate::activation::network_id_byte(),
+            crate::activation::poawx_multi_role_reward_activation_height(),
+        ),
+        Some(h) if height >= h
+    )
 }
 
 /// Phase 20: true when the CPU/GPU/ASIC fairness matrix primitives are active for
@@ -3423,13 +3410,13 @@ pub fn multi_role_reward_active(height: u64) -> bool {
 /// assignment/role-claim primitives by future role-claim validation; does not
 /// change chain difficulty (LWMA-144) or existing block validation.
 pub fn fairness_matrix_active(height: u64) -> bool {
-    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
-        return false;
-    }
-    match crate::activation::poawx_fairness_matrix_activation_height() {
-        Some(h) => height >= h,
-        None => false,
-    }
+    matches!(
+        crate::activation::poawx_effective_activation(
+            crate::activation::network_id_byte(),
+            crate::activation::poawx_fairness_matrix_activation_height(),
+        ),
+        Some(h) if height >= h
+    )
 }
 
 /// Phase 20: whether the third-party pool fee is active for `height`. **Mainnet
@@ -3466,13 +3453,13 @@ pub fn third_party_pool_mode_enabled() -> bool {
 /// the parent block's `precommit_root` (one transition-block grace at the exact
 /// activation height, whose parent predates activation).
 pub fn hidden_precommit_active(height: u64) -> bool {
-    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
-        return false;
-    }
-    match crate::activation::poawx_hidden_precommit_activation_height() {
-        Some(h) => height >= h,
-        None => false,
-    }
+    matches!(
+        crate::activation::poawx_effective_activation(
+            crate::activation::network_id_byte(),
+            crate::activation::poawx_hidden_precommit_activation_height(),
+        ),
+        Some(h) if height >= h
+    )
 }
 
 /// Phase 20: parse a standard 25-byte P2PKH script `76 a9 14 <20> 88 ac` to its pkh.
@@ -3992,24 +3979,10 @@ fn validate_poawx_block_receipts(
         }
     }
 
-    // Activation gate — identical conditions to validate_poawx_coinbase.
-    let act_h = match std::env::var("IRIUM_POAWX_ACTIVATION_HEIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        Some(h) => h,
-        None => return Ok(()),
-    };
-    if !std::env::var("IRIUM_POAWX_MODE")
-        .map(|v| v.trim() == "active")
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
-        return Ok(());
-    }
-    if height < act_h {
+    // Activation gate — mainnet uses the fixed code height (50_000); testnet/devnet
+    // use the IRIUM_POAWX_MODE + IRIUM_POAWX_ACTIVATION_HEIGHT env master-switch.
+    // (The mainnet mode-1 delegation rejection above is unconditional and stays.)
+    if !crate::activation::poawx_consensus_active(height) {
         return Ok(());
     }
 
@@ -4018,8 +3991,8 @@ fn validate_poawx_block_receipts(
         Some(r) => r.as_slice(),
         None => {
             return Err(format!(
-                "connect_block: poawx receipts missing or empty at height {} (active from {})",
-                height, act_h
+                "connect_block: poawx receipts missing or empty at height {}",
+                height
             ))
         }
     };
@@ -15281,5 +15254,178 @@ mod proposer_consensus_tests {
         );
         std::env::remove_var("IRIUM_POAWX_MAX_REORG_DEPTH");
         clear_sib_env();
+    }
+}
+
+#[cfg(test)]
+mod poawx_mainnet_activation_tests {
+    use super::*;
+
+    /// Force a clean mainnet context: mainnet network id (0) and NO `IRIUM_POAWX_*`
+    /// env, so the ONLY thing that can activate PoAW-X is the consensus height 50_000.
+    fn mainnet_no_poawx_env() {
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        for k in [
+            "IRIUM_POAWX_MODE",
+            "IRIUM_POAWX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_HIDDEN_PRECOMMIT_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_THIRD_PARTY_POOL_MODE",
+            "IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PROPOSER_VRF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PROPOSER_VRF_REQUIRED",
+            "IRIUM_POAWX_PROPOSER_REGISTRATION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TICKETS_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TICKETS_REQUIRED",
+            "IRIUM_POAWX_TICKET_SYBIL_BITS",
+            "IRIUM_POAWX_PUZZLE_WORK_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PUZZLE_WORK_REQUIRED",
+            "IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS",
+            "IRIUM_POAWX_CANDIDATE_SET_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_SET_REQUIRED",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED",
+            "IRIUM_POAWX_TRUE_VRF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_TRUE_VRF_REQUIRED",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_MULTISOURCE_SEED_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED",
+            "IRIUM_POAWX_FINALITY_GOSSIP_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_ANTI_DOMINATION_REQUIRED",
+            "IRIUM_POAWX_FRAUD_PROOF_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_FRAUD_PROOF_REQUIRED",
+            "IRIUM_POAWX_ADAPTIVE_MODE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PENALTY_STATE_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_PENALTY_STATE_REQUIRED",
+            "IRIUM_POAWX_FORKCHOICE_HARDENING_ACTIVATION_HEIGHT",
+            "IRIUM_POAWX_AUDIT_HARDENING_ACTIVATION_HEIGHT",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// THE correctness anchor for the mainnet PoAW-X activation at block 50_000.
+    /// Before 50_000 every gate is OFF (byte-identical to pre-activation mainnet);
+    /// at 50_000 every soak-validated gate is ON, the 12 REQUIRED gates are enforced,
+    /// and the deliberately-excluded features stay OFF. Mainnet production params.
+    #[test]
+    fn poawx_mainnet_gates_off_before_50000_on_at_50000() {
+        mainnet_no_poawx_env();
+        let before = 49_999u64;
+        let at = 50_000u64;
+
+        macro_rules! off {
+            ($e:expr) => {
+                assert!(!$e, concat!("expected OFF before 50000: ", stringify!($e)));
+            };
+        }
+        macro_rules! on {
+            ($e:expr) => {
+                assert!($e, concat!("expected ON at 50000: ", stringify!($e)));
+            };
+        }
+
+        // ── active gates: OFF before, ON at activation ──────────────────────────
+        off!(crate::poawx_proposer::proposer_vrf_active(before));
+        on!(crate::poawx_proposer::proposer_vrf_active(at));
+        off!(crate::poawx_proposer::proposer_registration_active(before));
+        on!(crate::poawx_proposer::proposer_registration_active(at));
+        off!(crate::poawx_proposer::fork_choice_hardening_active(before));
+        on!(crate::poawx_proposer::fork_choice_hardening_active(at));
+        off!(crate::poawx_proposer::audit_hardening_active(before));
+        on!(crate::poawx_proposer::audit_hardening_active(at));
+        off!(crate::poawx_ticket::tickets_active(before));
+        on!(crate::poawx_ticket::tickets_active(at));
+        off!(crate::poawx_puzzle::puzzle_work_active(before));
+        on!(crate::poawx_puzzle::puzzle_work_active(at));
+        off!(crate::poawx_candidate::candidate_set_active(before));
+        on!(crate::poawx_candidate::candidate_set_active(at));
+        off!(crate::poawx_candidate::assignment_proof_active(before));
+        on!(crate::poawx_candidate::assignment_proof_active(at));
+        off!(crate::poawx_candidate::true_vrf_active(before));
+        on!(crate::poawx_candidate::true_vrf_active(at));
+        off!(crate::poawx_committed_admission::committed_admission_active(before));
+        on!(crate::poawx_committed_admission::committed_admission_active(at));
+        off!(crate::poawx_committed_admission::multisource_seed_active(before));
+        on!(crate::poawx_committed_admission::multisource_seed_active(at));
+        off!(crate::poawx_admission::candidate_admission_active(before));
+        on!(crate::poawx_admission::candidate_admission_active(at));
+        off!(crate::poawx_finality::finality_committee_active(before));
+        on!(crate::poawx_finality::finality_committee_active(at));
+        off!(crate::poawx_finality::finality_gossip_active(before));
+        on!(crate::poawx_finality::finality_gossip_active(at));
+        off!(crate::poawx_dominance::anti_domination_active(before));
+        on!(crate::poawx_dominance::anti_domination_active(at));
+        off!(crate::poawx_challenge::fraud_proof_active(before));
+        on!(crate::poawx_challenge::fraud_proof_active(at));
+        off!(crate::poawx_adaptive::adaptive_mode_active(before));
+        on!(crate::poawx_adaptive::adaptive_mode_active(at));
+        off!(crate::poawx_penalty::penalty_state_active(before));
+        on!(crate::poawx_penalty::penalty_state_active(at));
+        off!(multi_role_reward_active(before));
+        on!(multi_role_reward_active(at));
+        off!(fairness_matrix_active(before));
+        on!(fairness_matrix_active(at));
+        off!(hidden_precommit_active(before));
+        on!(hidden_precommit_active(at));
+
+        // ── the 12 REQUIRED gates: enforced OFF before, ON at activation ────────
+        off!(crate::poawx_proposer::proposer_vrf_enforced(before));
+        on!(crate::poawx_proposer::proposer_vrf_enforced(at));
+        off!(crate::poawx_ticket::tickets_enforced(before));
+        on!(crate::poawx_ticket::tickets_enforced(at));
+        off!(crate::poawx_puzzle::puzzle_work_enforced(before));
+        on!(crate::poawx_puzzle::puzzle_work_enforced(at));
+        off!(crate::poawx_candidate::candidate_set_enforced(before));
+        on!(crate::poawx_candidate::candidate_set_enforced(at));
+        off!(crate::poawx_candidate::assignment_proof_enforced(before));
+        on!(crate::poawx_candidate::assignment_proof_enforced(at));
+        off!(crate::poawx_candidate::true_vrf_enforced(before));
+        on!(crate::poawx_candidate::true_vrf_enforced(at));
+        off!(crate::poawx_committed_admission::committed_admission_enforced(before));
+        on!(crate::poawx_committed_admission::committed_admission_enforced(at));
+        off!(crate::poawx_admission::candidate_admission_enforced(before));
+        on!(crate::poawx_admission::candidate_admission_enforced(at));
+        off!(crate::poawx_finality::finality_committee_enforced(before));
+        on!(crate::poawx_finality::finality_committee_enforced(at));
+        off!(crate::poawx_dominance::anti_domination_enforced(before));
+        on!(crate::poawx_dominance::anti_domination_enforced(at));
+        off!(crate::poawx_challenge::fraud_proof_enforced(before));
+        on!(crate::poawx_challenge::fraud_proof_enforced(at));
+        off!(crate::poawx_penalty::penalty_state_enforced(before));
+        on!(crate::poawx_penalty::penalty_state_enforced(at));
+
+        // ── deliberately-excluded features: OFF at BOTH heights ─────────────────
+        assert!(
+            !third_party_fee_active(before) && !third_party_fee_active(at),
+            "third_party_fee must stay OFF on mainnet"
+        );
+        assert!(
+            !third_party_pool_mode_enabled(),
+            "third_party_pool_mode must stay OFF on mainnet"
+        );
+        assert!(
+            !poawx_delegation_active(before) && !poawx_delegation_active(at),
+            "mode-1 delegation must stay OFF on mainnet"
+        );
+
+        // ── mainnet production parameters ───────────────────────────────────────
+        assert_eq!(
+            crate::poawx_ticket::effective_sybil_bits(),
+            20,
+            "mainnet ticket sybil bits must be 20"
+        );
+        assert_eq!(
+            crate::poawx_proposer::min_finality_committee(),
+            16,
+            "mainnet finality committee min must be 16"
+        );
     }
 }

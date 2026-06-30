@@ -156,10 +156,7 @@ pub fn adaptive_mode_activation_height() -> Option<u64> {
 
 /// Pure gate logic (network 0 = mainnet hard-off); param-driven for race-free tests.
 pub fn adaptive_mode_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 
 /// Whether adaptive-mode policy is active at `height`. Mainnet hard-off.

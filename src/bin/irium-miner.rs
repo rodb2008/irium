@@ -3282,6 +3282,9 @@ fn poawx_decode_hash32(s: &str) -> Result<[u8; 32], String> {
 }
 
 fn poawx_receipt_difficulty_bits() -> u32 {
+    if irium_node_rs::activation::network_id_byte() == 0 {
+        return 20; // mainnet configured puzzle difficulty (bits)
+    }
     env::var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
@@ -3466,9 +3469,9 @@ fn poawx_submit_extended(client: &Client, req_body: &serde_json::Value) -> Resul
 /// miner key -> ingest admissions -> submit extended. Devnet/testnet only.
 fn run_poawx_solo() -> Result<(), String> {
     let net = irium_node_rs::activation::network_id_byte();
-    if net == 0 {
-        return Err("solo PoAW-X mining is devnet/testnet only (mainnet hard-off)".to_string());
-    }
+    // PoAW-X mining is permitted on mainnet from the consensus activation height
+    // (50_000); before then the node assignment/submit RPCs return 503 and this loop
+    // idles until activation. Non-mainnet is gated by the node env as before.
     let secret = poawx_miner_secret()?;
     let client = rpc_client()?;
     let diff = poawx_receipt_difficulty_bits();

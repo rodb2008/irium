@@ -472,15 +472,15 @@ pub fn puzzle_work_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 pub fn puzzle_work_required() -> bool {
+    if crate::activation::network_id_byte() == 0 {
+        return true; // mainnet: enforced once the gate is active (height-gated)
+    }
     std::env::var("IRIUM_POAWX_PUZZLE_WORK_REQUIRED")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
 }
 pub fn puzzle_work_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 pub fn puzzle_work_enforced_gate(
     network_id: u8,

@@ -59,6 +59,9 @@ pub fn candidate_admission_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 pub fn candidate_admission_required() -> bool {
+    if crate::activation::network_id_byte() == 0 {
+        return true; // mainnet: enforced once the gate is active (height-gated)
+    }
     std::env::var("IRIUM_POAWX_CANDIDATE_ADMISSION_REQUIRED")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
@@ -66,10 +69,7 @@ pub fn candidate_admission_required() -> bool {
 
 /// Pure gate: network 0 (mainnet/unset) hard-off; else active at/after activation.
 pub fn candidate_admission_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 pub fn candidate_admission_enforced_gate(
     network_id: u8,
@@ -97,7 +97,8 @@ pub fn candidate_admission_enforced(height: u64) -> bool {
 }
 /// Whether this node ingests/gossips admissions (testnet/devnet + gate configured).
 pub fn candidate_admission_gossip_enabled() -> bool {
-    network_id_byte() != 0 && candidate_admission_activation_height().is_some()
+    crate::activation::poawx_effective_activation(network_id_byte(), candidate_admission_activation_height())
+        .is_some()
 }
 
 // ---- Fix 1: per-source candidate-admission flood limiter (anti-DoS) ----

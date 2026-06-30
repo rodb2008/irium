@@ -134,10 +134,7 @@ pub fn anti_domination_activation_height() -> Option<u64> {
 
 /// Pure gate logic (network 0 = mainnet hard-off); param-driven for race-free tests.
 pub fn anti_domination_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 
 /// Whether anti-domination weighting is active at `height`. Mainnet hard-off.
@@ -153,6 +150,9 @@ pub fn anti_domination_active(height: u64) -> bool {
 /// activation gate this turns on consensus validation of included dominance
 /// weights (Phase 21C).
 pub fn anti_domination_required() -> bool {
+    if crate::activation::network_id_byte() == 0 {
+        return true; // mainnet: enforced once the gate is active (height-gated)
+    }
     std::env::var("IRIUM_POAWX_ANTI_DOMINATION_REQUIRED")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)

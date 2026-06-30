@@ -245,6 +245,66 @@ pub fn network_kind_from_env() -> NetworkKind {
 /// `None` => delegated receipts are not yet active (mode-1 rejected). Read from
 /// `IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT`. Testnet/devnet only — mainnet
 /// hard-rejects mode-1 regardless of this value.
+/// Mainnet PoAW-X consensus activation height. Fixed in consensus code (NOT env /
+/// operator configurable). At and after this height, mainnet enforces the full
+/// PoAW-X gate set; before it, mainnet is byte-identical to pre-activation.
+pub const MAINNET_POAWX_ACTIVATION_HEIGHT: Option<u64> = Some(50_000);
+
+/// True when mainnet PoAW-X is active at `height` (mainnet network AND height past
+/// the fixed activation height). Always false on testnet/devnet.
+pub fn poawx_mainnet_active(height: u64) -> bool {
+    network_id_byte() == 0 && matches!(MAINNET_POAWX_ACTIVATION_HEIGHT, Some(h) if height >= h)
+}
+
+/// Effective per-gate activation height for `network_id`: the fixed mainnet height
+/// on mainnet (env ignored), else the supplied testnet/devnet env activation.
+/// Every PoAW-X gate routes its activation through this so 50_000 lives in ONE
+/// place. Param-driven (takes `network_id`) to preserve race-free gate unit tests.
+pub fn poawx_effective_activation(network_id: u8, env_activation: Option<u64>) -> Option<u64> {
+    if network_id == 0 {
+        MAINNET_POAWX_ACTIVATION_HEIGHT
+    } else {
+        env_activation
+    }
+}
+
+/// Whether PoAW-X consensus is active at `height`. Mainnet: the fixed code height,
+/// no env. Testnet/devnet: the env master-switch (`IRIUM_POAWX_MODE=active` AND
+/// `IRIUM_POAWX_ACTIVATION_HEIGHT` reached). Replaces the per-callsite env + "==
+/// Mainnet -> off" cascade in the validator and producer entry points.
+pub fn poawx_consensus_active(height: u64) -> bool {
+    if network_id_byte() == 0 {
+        return matches!(MAINNET_POAWX_ACTIVATION_HEIGHT, Some(h) if height >= h);
+    }
+    let mode_active = env::var("IRIUM_POAWX_MODE")
+        .map(|v| v.trim() == "active")
+        .unwrap_or(false);
+    if !mode_active {
+        return false;
+    }
+    match env::var("IRIUM_POAWX_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    }
+}
+
+/// Whether the PoAW-X producer/RPC layer should serve (assignment / receipt / template /
+/// submit) at `height`. Mainnet: gated by the fixed code activation height. Testnet/devnet:
+/// gated only by the `IRIUM_POAWX_MODE` master switch (height-independent), matching the
+/// pre-mainnet serving behavior. Distinct from `poawx_consensus_active`, which additionally
+/// height-gates devnet *validation* by the env activation height.
+pub fn poawx_serving_active(height: u64) -> bool {
+    if network_id_byte() == 0 {
+        return matches!(MAINNET_POAWX_ACTIVATION_HEIGHT, Some(h) if height >= h);
+    }
+    env::var("IRIUM_POAWX_MODE")
+        .map(|v| v.trim() == "active")
+        .unwrap_or(false)
+}
+
 pub fn poawx_delegation_activation_height() -> Option<u64> {
     env::var("IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT")
         .ok()

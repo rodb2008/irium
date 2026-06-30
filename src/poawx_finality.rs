@@ -481,6 +481,9 @@ pub fn finality_committee_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 pub fn finality_committee_required() -> bool {
+    if crate::activation::network_id_byte() == 0 {
+        return true; // mainnet: enforced once the gate is active (height-gated)
+    }
     std::env::var("IRIUM_POAWX_FINALITY_COMMITTEE_REQUIRED")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
@@ -508,10 +511,7 @@ pub fn finality_threshold() -> (u16, u16) {
     finality_threshold_values(num, den)
 }
 pub fn finality_committee_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 pub fn finality_committee_enforced_gate(
     network_id: u8,
@@ -561,10 +561,7 @@ pub fn finality_gossip_required() -> bool {
         .unwrap_or(false)
 }
 pub fn finality_gossip_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 pub fn finality_gossip_enforced_gate(
     network_id: u8,
@@ -591,7 +588,8 @@ pub fn finality_gossip_enforced(height: u64) -> bool {
 }
 /// Whether this node ingests/gossips finality votes (testnet/devnet + gate set).
 pub fn finality_gossip_enabled() -> bool {
-    network_id_byte() != 0 && finality_gossip_activation_height().is_some()
+    crate::activation::poawx_effective_activation(network_id_byte(), finality_gossip_activation_height())
+        .is_some()
 }
 
 /// Process-global node finality-vote cache (mirror of the admission cache).

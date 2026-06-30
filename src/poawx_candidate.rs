@@ -515,6 +515,9 @@ pub fn candidate_set_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 pub fn candidate_set_required() -> bool {
+    if crate::activation::network_id_byte() == 0 {
+        return true; // mainnet: enforced once the gate is active (height-gated)
+    }
     std::env::var("IRIUM_POAWX_CANDIDATE_SET_REQUIRED")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
@@ -525,6 +528,9 @@ pub fn assignment_proof_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 pub fn assignment_proof_required() -> bool {
+    if crate::activation::network_id_byte() == 0 {
+        return true; // mainnet: enforced once the gate is active (height-gated)
+    }
     std::env::var("IRIUM_POAWX_ASSIGNMENT_PROOF_REQUIRED")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
@@ -532,10 +538,7 @@ pub fn assignment_proof_required() -> bool {
 
 /// Pure gate: network 0 (mainnet/unset) hard-off; else active at/after activation.
 pub fn poawx_phase21d_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 /// Pure enforcement gate: active AND required.
 pub fn poawx_phase21d_enforced_gate(
@@ -885,6 +888,9 @@ pub fn true_vrf_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 pub fn true_vrf_required() -> bool {
+    if crate::activation::network_id_byte() == 0 {
+        return true; // mainnet: enforced once the gate is active (height-gated)
+    }
     std::env::var("IRIUM_POAWX_TRUE_VRF_REQUIRED")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)

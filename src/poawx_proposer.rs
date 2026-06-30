@@ -103,6 +103,9 @@ pub fn proposer_round_interval_secs() -> u64 {
 pub const DEFAULT_PROPOSER_ANTI_SPAM_BITS: u32 = 8;
 
 pub fn proposer_anti_spam_bits() -> u32 {
+    if network_id_byte() == 0 {
+        return 20; // mainnet anti-spam PoW floor (bits)
+    }
     std::env::var("IRIUM_POAWX_PROPOSER_ANTISPAM_BITS")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
@@ -139,6 +142,9 @@ pub fn proposer_vrf_activation_height() -> Option<u64> {
 }
 
 pub fn proposer_vrf_required() -> bool {
+    if crate::activation::network_id_byte() == 0 {
+        return true; // mainnet: enforced once the gate is active (height-gated)
+    }
     std::env::var("IRIUM_POAWX_PROPOSER_VRF_REQUIRED")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
@@ -146,10 +152,7 @@ pub fn proposer_vrf_required() -> bool {
 
 /// Pure gate (param-driven for race-free tests). `network_id == 0` (mainnet) hard-off.
 pub fn proposer_vrf_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 
 pub fn proposer_vrf_active(height: u64) -> bool {
@@ -197,7 +200,10 @@ pub fn proposer_registration_gate(vrf_active: bool, activation: Option<u64>, hei
 pub fn proposer_registration_active(height: u64) -> bool {
     proposer_registration_gate(
         proposer_vrf_active(height),
-        proposer_registration_activation_height(),
+        crate::activation::poawx_effective_activation(
+            crate::activation::network_id_byte(),
+            proposer_registration_activation_height(),
+        ),
         height,
     )
 }
@@ -359,10 +365,7 @@ pub fn fork_choice_hardening_activation_height() -> Option<u64> {
 
 /// Pure gate (param-driven for race-free tests). Mainnet (`network_id == 0`) hard-off.
 pub fn fork_choice_hardening_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 
 pub fn fork_choice_hardening_active(height: u64) -> bool {
@@ -384,10 +387,7 @@ pub fn audit_hardening_activation_height() -> Option<u64> {
 }
 
 pub fn audit_hardening_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 
 pub fn audit_hardening_active(height: u64) -> bool {
@@ -435,6 +435,7 @@ pub const PROPOSER_REG_POOL_MAX: usize = 1024;
 /// Whether proposer-registration gossip is enabled (non-mainnet only).
 pub fn proposer_registration_gossip_enabled() -> bool {
     crate::activation::network_id_byte() != 0
+        || crate::activation::MAINNET_POAWX_ACTIVATION_HEIGHT.is_some()
 }
 
 /// Node-local pool of gossiped proposer registrations awaiting on-chain announcement.
@@ -620,10 +621,13 @@ mod tests {
     }
 
     #[test]
-    fn gate_mainnet_hard_off() {
-        // network 0 (mainnet) is always off, even with activation + height set.
-        assert!(!proposer_vrf_gate(0, Some(1), 1_000_000));
-        // devnet/testnet: active at/after activation height.
+    fn gate_mainnet_activates_at_50000() {
+        // network 0 (mainnet) PoAW-X activates at the fixed code height (50_000),
+        // ignoring any env activation: off below it, on at/after it.
+        assert!(!proposer_vrf_gate(0, Some(1), 49_999)); // mainnet: off before activation
+        assert!(proposer_vrf_gate(0, Some(1), 50_000)); // mainnet: on at activation
+        assert!(proposer_vrf_gate(0, None, 1_000_000)); // mainnet ignores env -> on past 50_000
+        // devnet/testnet: active at/after the env activation height.
         assert!(proposer_vrf_gate(2, Some(1), 1));
         assert!(proposer_vrf_gate(1, Some(100), 100));
         assert!(!proposer_vrf_gate(2, Some(100), 99));

@@ -13885,11 +13885,7 @@ async fn get_block_template(
     };
 
     let (poawx_mode_str, poawx_receipts_for_template, receipts_root_str) = {
-        let is_active = std::env::var("IRIUM_POAWX_MODE")
-            .map(|v| v.trim() == "active")
-            .unwrap_or(false);
-        let is_non_mainnet = network_kind_from_env() != NetworkKind::Mainnet;
-        if is_active && is_non_mainnet {
+        if irium_node_rs::activation::poawx_serving_active(height) {
             let receipts = state
                 .poawx_pending_receipts
                 .lock()
@@ -14731,11 +14727,11 @@ async fn poawx_get_assignment(
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
-    let is_active = std::env::var("IRIUM_POAWX_MODE")
-        .map(|v| v.trim() == "active")
-        .unwrap_or(false);
-    let is_non_mainnet = network_kind_from_env() != NetworkKind::Mainnet;
-    if !is_active || !is_non_mainnet {
+    let poawx_h = state
+        .status_height_cache
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    if !irium_node_rs::activation::poawx_serving_active(poawx_h) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let (height, tip_hash_bytes, bits) = {
@@ -14785,11 +14781,11 @@ async fn poawx_post_receipt(
     AxumJson(req): AxumJson<PoawxReceiptRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
-    let is_active = std::env::var("IRIUM_POAWX_MODE")
-        .map(|v| v.trim() == "active")
-        .unwrap_or(false);
-    let is_non_mainnet = network_kind_from_env() != NetworkKind::Mainnet;
-    if !is_active || !is_non_mainnet {
+    let poawx_h = state
+        .status_height_cache
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    if !irium_node_rs::activation::poawx_serving_active(poawx_h) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let difficulty = poawx_puzzle_difficulty_bits();
@@ -14956,17 +14952,18 @@ async fn submit_block_extended(
     // O-2: mainnet must never accept PoAW-X receipt submissions.
     // C-3: when PoAW-X is active on testnet, receipts must be non-empty.
     {
-        let is_non_mainnet = network_kind_from_env() != NetworkKind::Mainnet;
-        if !is_non_mainnet && !req.poawx_receipts.is_empty() {
-            eprintln!("[submit_block_extended] reject: poawx receipts not accepted on mainnet");
+        let poawx_h = state
+            .status_height_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        let poawx_active = irium_node_rs::activation::poawx_serving_active(poawx_h);
+        if !poawx_active && !req.poawx_receipts.is_empty() {
+            eprintln!("[submit_block_extended] reject: poawx receipts not accepted (poawx inactive)");
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
-        let poawx_active = std::env::var("IRIUM_POAWX_MODE")
-            .map(|v| v.trim() == "active")
-            .unwrap_or(false);
-        if poawx_active && is_non_mainnet && req.poawx_receipts.is_empty() {
+        if poawx_active && req.poawx_receipts.is_empty() {
             eprintln!(
-                "[submit_block_extended] reject: poawx mode=active but receipts empty; include puzzle receipts"
+                "[submit_block_extended] reject: poawx active but receipts empty; include puzzle receipts"
             );
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -15601,12 +15598,13 @@ async fn submit_block(
     // C-2: when PoAW-X is active the legacy submit path is disabled.
     // Miners must use /rpc/submit_block_extended and include puzzle receipts.
     {
-        let poawx_active = std::env::var("IRIUM_POAWX_MODE")
-            .map(|v| v.trim() == "active")
-            .unwrap_or(false);
-        if poawx_active && network_kind_from_env() != NetworkKind::Mainnet {
+        let poawx_h = state
+            .status_height_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if irium_node_rs::activation::poawx_serving_active(poawx_h) {
             eprintln!(
-                "[submit_block] reject: poawx mode=active; use /rpc/submit_block_extended with puzzle receipts"
+                "[submit_block] reject: poawx active; use /rpc/submit_block_extended with puzzle receipts"
             );
             return Err(StatusCode::METHOD_NOT_ALLOWED);
         }

@@ -280,10 +280,7 @@ pub fn multisource_seed_activation_height() -> Option<u64> {
 
 /// Pure gate (network 0 = mainnet hard-off); param-driven for race-free tests.
 pub fn multisource_seed_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 
 /// Whether the multi-source assignment seed is active at `height`. Mainnet hard-off.
@@ -401,15 +398,15 @@ pub fn committed_admission_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 pub fn committed_admission_required() -> bool {
+    if crate::activation::network_id_byte() == 0 {
+        return true; // mainnet: enforced once the gate is active (height-gated)
+    }
     std::env::var("IRIUM_POAWX_COMMITTED_ADMISSION_REQUIRED")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
 }
 pub fn committed_admission_gate(network_id: u8, activation: Option<u64>, height: u64) -> bool {
-    if network_id == 0 {
-        return false;
-    }
-    matches!(activation, Some(h) if height >= h)
+    matches!(crate::activation::poawx_effective_activation(network_id, activation), Some(h) if height >= h)
 }
 pub fn committed_admission_enforced_gate(
     network_id: u8,
