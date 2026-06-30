@@ -64,6 +64,14 @@ correct chain.
 
 ---
 
+## Important — block 50,000 PoAW-X activation
+
+At **block 50,000**, Irium mainnet activates **PoAW-X** (VRF-selected block proposers, a
+55/22/13/10 multi-role reward split, and anti-domination). **Upgrade to iriumd v1.9.119 or later
+before block 50,000** — older nodes will reject post-activation blocks. From block 50,000, **mining
+needs a full iriumd node**: run `iriumd`, then run `irium-miner --poawx` against it — a pool
+connection alone is no longer sufficient. Full guide: [docs/POAWX.md](docs/POAWX.md).
+
 ## Two paths
 
 You can use Irium in one of two ways. Pick whichever you prefer — they manage the same wallet and the same chain:
