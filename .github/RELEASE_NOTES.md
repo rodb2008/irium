@@ -6,11 +6,13 @@ Below block 50,000, v1.9.119 validates the chain identically to prior releases; 
 
 ## What is PoAW-X
 
-PoAW-X replaces "first to find the proof of work wins" with **VRF-based leader election**: for each block the chain cryptographically and verifiably assigns proposer rights via a Verifiable Random Function (ECVRF, RFC 9381). Sortition is bound to a per-height seed and the proposer's on-chain-registered key, so **hashrate is irrelevant to who wins each block** — CPU, GPU, and ASIC miners compete as equals. PoAW-X also adds anti-domination weighting, a distributed finality committee, and sybil-resistant proposer registration.
+PoAW-X adds a block-proposer layer **on top of** Irium's existing **SHA-256d proof of work, which remains unchanged and fully merged-mining compatible**. For each block, an eligible proposer is selected by a Verifiable Random Function (ECVRF, RFC 9381), bound to a per-height seed and the proposer's on-chain-registered key, so the proposer assignment cannot be forged or predicted before the parent block. An **anti-domination engine** weights proposal rights over a rolling 2016-block window so that no single high-hashrate operator can dominate the chain. PoAW-X also adds a **distributed finality committee** and **sybil-resistant proposer registration**.
+
+The result is fairer, harder-to-dominate block production — proposal rights are distributed verifiably rather than won purely by raw hashrate concentration — while SHA-256d proof of work and merged mining are fully preserved.
 
 ## Activation height
 
-**Block 50,000.** Activation is a fixed consensus constant (`MAINNET_POAWX_ACTIVATION_HEIGHT = 50_000`). Estimate the date from the current block rate on any explorer — and **upgrade as soon as possible rather than wait.**
+**Block 50,000.** As of this release the mainnet tip is around block 46,700, advancing at roughly one block per minute, so activation is approximately **two days away (around 2 July 2026)**. This is an estimate from the current block rate and can move with hashrate — **upgrade as soon as possible rather than wait.**
 
 ## What changes for miners
 
@@ -22,7 +24,7 @@ From block 50,000, **mining requires a full `iriumd` node running alongside your
 
 ## Reward distribution
 
-Each block reward is split automatically across four contribution roles via the multi-role reward system:
+PoAW-X defines a four-role reward split as its canonical design:
 
 | Role | Share |
 |------|-------|
@@ -31,11 +33,11 @@ Each block reward is split automatically across four contribution roles via the 
 | Verify | 13% |
 | Support | 10% |
 
-In solo mining, one identity fills all four roles and receives the full reward.
+This is the design ratio. **At activation, a solo miner fills all four roles and receives the full block reward.** Automatic distribution to separate compute, verify, and support contributors is a future capability that remains gated pending a governance decision.
 
 ## Security
 
-Validated security properties of PoAW-X consensus:
+Security properties of PoAW-X consensus:
 
 - **VRF leader sortition** — ECVRF (RFC 9381); the proposer assignment proof verifies against the registered VRF key and per-height seed, and cannot be forged or predicted before the parent block.
 - **Sybil-resistant proposer registration** — on-chain VRF-key registration with a **20-bit per-identity ticket proof-of-work cost**, frozen below the tip so the per-height seed cannot be used to register a winning key after the fact.
@@ -43,11 +45,11 @@ Validated security properties of PoAW-X consensus:
 - **Anti-domination engine** — per-identity proposal weighting over a **rolling 2016-block window**.
 - **Hard reorg-depth cap** and **deterministic fork-choice tiebreaks**.
 
-These were validated end-to-end in a **2,123-block, 3-node adversarial soak test with zero consensus errors** before mainnet activation was scheduled.
+These were exercised in a multi-block, multi-node adversarial soak with zero consensus errors before mainnet activation was scheduled.
 
 ## Audit
 
-The PoAW-X implementation underwent a full internal security audit that identified and fixed **15 critical/high-severity issues** plus **2 chain-split root causes** before mainnet activation.
+PoAW-X underwent an **internal security review and a multi-item hardening pass**, and the two chain-split root causes found during pre-mainnet testing were fixed. The internal review reported no critical- or high-severity findings. **PoAW-X has not yet been independently audited;** an external audit is planned.
 
 ## Upgrade instructions
 
@@ -67,7 +69,7 @@ The PoAW-X implementation underwent a full internal security audit that identifi
 
 ### First start: one-time re-validation (expected)
 
-The first time v1.9.119 starts on a node that already has chain history, it performs a **one-time re-validation** of its stored chain. Your node may briefly show a **lower block height and then climb back** to the network tip over a few minutes — this is **normal and expected**, happens only **once** (on the first start after upgrading), and **loses no data**. Let it finish; subsequent restarts are fast. This does not affect the height-gated activation at block 50,000. *(A later release will remove this one-time step.)*
+The first time v1.9.119 starts on a node that already has chain history, it performs a **one-time re-validation** of its stored chain. Your node may briefly show a **lower block height and then climb back** to the network tip over a few minutes — this is **normal and expected**, happens only **once** (on the first start after upgrading), and **loses no data**. Let it finish; subsequent restarts are fast. This does not affect the height-gated activation at block 50,000.
 
 ## Assets & changelog
 
